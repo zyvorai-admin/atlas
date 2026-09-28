@@ -27,7 +27,7 @@ RUN cargo build --release -p atlas-gateway -p atlasctl \
     --features atlas-databridge/mongodb,atlas-databridge/sqlserver,atlas-databridge/oracle,atlas-databridge/kafka-lag
 
 # ---- helm (pinned, checksum-verified) — used only by the console's RustFS installer Job ----
-FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS helm
+FROM docker.io/library/debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS helm
 ARG HELM_VERSION=v3.19.0
 ARG HELM_SHA256=a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm && install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
 
 # ---- runtime ----
-FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
+FROM docker.io/library/debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 # ceph/rbd CLIs are only needed when ATLAS_CEPH_DRIVER_MODE=real against a real cluster.
 # zfsutils-linux (zpool/zfs) + util-linux (lsblk/wipefs/findmnt) are only exercised when
 # ATLAS_ZFS_DRIVER_MODE=real against a raw host disk (see docs/DISKS.md) — the container still
