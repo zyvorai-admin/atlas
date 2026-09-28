@@ -15,7 +15,7 @@
 # every MySQL/MariaDB/Oracle/SQL Server source connector (any engine using schema history) fails at
 # task startup with `NoSuchMethodError: KafkaConsumer.poll(long)`. 3.3.0.Final is the first line on
 # this base image's Kafka 4.3 that's actually built/tested against Kafka Connect 4.x.
-FROM quay.io/strimzi/kafka:latest-kafka-4.3.1@sha256:6914feebd66256ba77cf64f3982ac3359c6ed8dc72472a1021aba2232caf5fc4
+FROM quay.io/strimzi/kafka:latest-kafka-4.3.1@sha256:ed9cfb8f93a6e474a99c2f3cdbaac9729de9512cfdda6790ab14ddf91fadd500
 USER root
 
 ARG DEBEZIUM_VERSION=3.3.0.Final
