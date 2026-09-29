@@ -9,6 +9,16 @@ before `0.2.0` were not tracked here — see `git log` for that history.
 
 ## [Unreleased]
 
+### Added
+
+- **Observe-first storage I/O sensor** (`crates/atlas-io`, binary `atlas-io-agent`):
+  in-process bio pipeline (log2-µs histograms, cgroup/pid attribution, device→volume
+  map, deterministic RCA, time-limited write-freeze leases that fail open). Default
+  `ATLAS_IO_MODE=fake` so CI never needs `CAP_BPF`. Live mode reports programs as
+  missing until a CO-RE loader ships. Contract C sources live in
+  `crates/atlas-io/bpf/`. `atlasctl io health|summary|histograms|workloads|rca|coverage|leases`.
+  Optional DaemonSet: `deploy/k8s/atlas-io-agent.yaml`. See [docs/IO_EBPF.md](docs/IO_EBPF.md).
+
 ### Removed
 - First-party **RustFS** product integration: `atlas-driver-rustfs`, Storage → RustFS console,
   `/rustfs/*` admin proxy, drive/instance jobs, vendored Helm subchart, and `deploy/rustfs-lab`.

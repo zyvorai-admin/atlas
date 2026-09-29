@@ -237,50 +237,6 @@ async fn zfs_pool_destroy_requires_matching_confirmation_and_removes_the_pool() 
     );
 }
 
-#[tokio::test]
-async fn rustfs_drive_requires_confirm_and_fake_mode_only_accepts_the_fixture() {
-    let base = format!("http://{}/api/atlas/v1", spawn(true).await);
-    let c = reqwest::Client::new();
-    let no_confirm = c
-        .post(format!("{base}/rustfs/drives/from-device"))
-        .json(&json!({ "device_path": "/dev/vdz", "confirm": false }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(no_confirm.status(), reqwest::StatusCode::BAD_REQUEST);
-
-    let ok = c
-        .post(format!("{base}/rustfs/drives/from-device"))
-        .json(&json!({ "device_path": "/dev/vdz", "confirm": true }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), reqwest::StatusCode::ACCEPTED);
-    let accepted: Value = ok.json().await.unwrap();
-    let job = poll_job_to_terminal(&base, accepted["job_id"].as_str().unwrap()).await;
-    assert_eq!(job["state"], "succeeded", "job: {job}");
-
-    let other = c
-        .post(format!("{base}/rustfs/drives/from-device"))
-        .json(&json!({ "device_path": "/dev/vdy", "confirm": true }))
-        .send()
-        .await
-        .unwrap();
-    let accepted: Value = other.json().await.unwrap();
-    let job = poll_job_to_terminal(&base, accepted["job_id"].as_str().unwrap()).await;
-    assert_eq!(job["state"], "failed", "fake mode must refuse a non-fixture device: {job}");
-
-    let drives: Value = c
-        .get(format!("{base}/rustfs/drives"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(drives.as_array().unwrap().is_empty(), "no k8s in fake mode: {drives}");
-}
-
 /// Fake mode only ever "succeeds" against its one fixture device path — proving it never
 /// fabricates having formatted an arbitrary operator-supplied device it never actually touched.
 #[tokio::test]

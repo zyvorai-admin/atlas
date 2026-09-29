@@ -218,3 +218,14 @@ jobs:
           tags: atlas-gateway:ceph
           cache-from: type=gha,scope=ceph
           cache-to: type=gha,mode=max,scope=ceph
+      # atlas-io-agent (crates/atlas-io, docs/IO_EBPF.md) — a separate, much smaller image with no
+      # UI/optional-feature stages of its own.
+      - name: Build Dockerfile.io
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.io
+          push: false
+          tags: atlas-io-agent:ci
+          cache-from: type=gha,scope=io
+          cache-to: type=gha,mode=max,scope=io

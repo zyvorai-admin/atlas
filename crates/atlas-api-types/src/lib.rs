@@ -655,3 +655,141 @@ pub struct Cutover {
     pub created_at: Option<String>,
     pub completed_at: Option<String>,
 }
+
+/// Block I/O operation class recorded by the Atlas I/O sensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoOp {
+    Read,
+    Write,
+    Flush,
+    Discard,
+    Other,
+}
+
+impl IoOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IoOp::Read => "read",
+            IoOp::Write => "write",
+            IoOp::Flush => "flush",
+            IoOp::Discard => "discard",
+            IoOp::Other => "other",
+        }
+    }
+}
+
+/// One completed block I/O, after the kernel issue→complete pair is joined.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BioEvent {
+    pub issued_ns: u64,
+    pub completed_ns: u64,
+    pub queued_ns: u64,
+    pub bytes: u32,
+    pub op: IoOp,
+    pub major: u32,
+    pub minor: u32,
+    pub pid: u32,
+    pub cgroup_id: u64,
+    pub comm: String,
+}
+
+impl BioEvent {
+    pub fn latency_us(&self) -> u64 {
+        self.completed_ns.saturating_sub(self.issued_ns) / 1_000
+    }
+
+    pub fn queue_us(&self) -> u64 {
+        self.queued_ns / 1_000
+    }
+
+    pub fn dev_key(&self) -> u64 {
+        ((self.major as u64) << 32) | self.minor as u64
+    }
+}
+
+/// Histogram of I/O latency for one (device, op) pair. Buckets are log2 microseconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoHistogram {
+    pub device: String,
+    pub volume_id: Option<String>,
+    pub op: IoOp,
+    pub buckets: Vec<u64>,
+    pub count: u64,
+    pub sum_us: u64,
+    pub bytes: u64,
+}
+
+impl IoHistogram {
+    pub fn p99_us(&self) -> u64 {
+        percentile_us(&self.buckets, self.count, 99)
+    }
+
+    pub fn p50_us(&self) -> u64 {
+        percentile_us(&self.buckets, self.count, 50)
+    }
+}
+
+fn percentile_us(buckets: &[u64], count: u64, pct: u64) -> u64 {
+    if count == 0 || buckets.is_empty() {
+        return 0;
+    }
+    let target = count.saturating_mul(pct).div_ceil(100).max(1);
+    let mut acc = 0u64;
+    for (i, c) in buckets.iter().enumerate() {
+        acc = acc.saturating_add(*c);
+        if acc >= target {
+            return 1u64 << i.min(63);
+        }
+    }
+    1u64 << buckets.len().saturating_sub(1).min(63)
+}
+
+/// Workload attribution row (cgroup / pid → volume).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoWorkload {
+    pub cgroup_id: u64,
+    pub pid: u32,
+    pub comm: String,
+    pub device: String,
+    pub volume_id: Option<String>,
+    pub ops: u64,
+    pub bytes: u64,
+    pub sum_us: u64,
+}
+
+/// Observe-first I/O sensor health.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoSensorHealth {
+    pub mode: String,
+    pub programs_loaded: Vec<String>,
+    pub programs_missing: Vec<String>,
+    pub pin_dir: String,
+    pub events_seen: u64,
+    pub events_dropped: u64,
+    pub map_cardinality: u64,
+    pub cardinality_cap: u64,
+}
+
+/// Read-only RCA hint produced from histograms + attribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoRca {
+    pub volume_id: Option<String>,
+    pub device: String,
+    pub verdict: String,
+    pub p50_us: u64,
+    pub p99_us: u64,
+    pub hottest_comm: Option<String>,
+    pub notes: Vec<String>,
+}
+
+/// Time-limited write-freeze lease. Expired or agent-down ⇒ fail open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoLease {
+    pub id: String,
+    pub device: String,
+    pub volume_id: Option<String>,
+    pub action: String,
+    pub expires_unix: u64,
+    pub reason: String,
+}

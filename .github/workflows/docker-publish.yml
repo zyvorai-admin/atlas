@@ -28,8 +28,13 @@ jobs:
         include:
           - dockerfile: Dockerfile
             image: ghcr.io/zyvorai/atlas
+            name: atlas
           - dockerfile: Dockerfile.ceph
             image: ghcr.io/zyvorai/atlas-ceph
+            name: atlas-ceph
+          - dockerfile: Dockerfile.io
+            image: ghcr.io/zyvorai/atlas-io-agent
+            name: atlas-io-agent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -69,11 +74,11 @@ jobs:
         with:
           image: "${{ matrix.image }}:${{ steps.ver.outputs.version }}"
           format: cyclonedx-json
-          output-file: "sbom-${{ matrix.image == 'ghcr.io/zyvorai/atlas' && 'atlas' || 'atlas-ceph' }}.cdx.json"
+          output-file: "sbom-${{ matrix.name }}.cdx.json"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sbom-${{ matrix.image == 'ghcr.io/zyvorai/atlas' && 'atlas' || 'atlas-ceph' }}
+          name: sbom-${{ matrix.name }}
           path: "sbom-*.cdx.json"
           retention-days: 90
 

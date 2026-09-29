@@ -24,6 +24,7 @@ below is bank or enterprise GA.
 | DataBridge SQL Server and Oracle | discovery yes | discovery live | no | | full-load, CDC, validate, cutover, rollback; Oracle TCPS |
 | Cross-cluster DR (RBD mirror) | control plane yes; `dataplane_verified` is false | no | no | yes | two-site promote/demote drill |
 | Ops Advisor, incidents, what-if, anomalies, MCP | yes, read-only | console exercised on the lab gateway | no | | persisted findings; no execution |
+| eBPF storage I/O sensor (`atlas-io-agent`) | yes — fake source, histograms, attribution, RCA, fail-open leases, HTTP/Prom, `atlasctl io` | no | no | live attach (programs reported missing) | aya/CO-RE loader, NFS/ZFS/uring probes, Observatory heatmaps |
 | Product integrations beyond gRPC `Owner` | gRPC owner surface yes | | no | | Transiva import, Veyron, GuestKit, PacketWolf, then a small SDK |
 
 Transiva's owner id on the wire remains `hyper2kvm`. v0.4.0 does not rename it.

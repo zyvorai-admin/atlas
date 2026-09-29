@@ -7,6 +7,13 @@ Atlas follows the phased plan in `Zyvor_Ceph_Integration_Developer_Implementatio
 lab-verified, production-supported, experimental, or planned — is the short matrix in
 [STATUS.md](STATUS.md). This file is history; when the two disagree, STATUS.md wins.
 
+## 🟡 Slice — observe-first storage I/O (this tree)
+
+- `atlas-io` crate + `atlas-io-agent`: fake bio pipeline, device map, histograms,
+  workloads, RCA, leased write-freeze (fail open), `/metrics`.
+- BPF C contracts under `crates/atlas-io/bpf/` — not compiled in CI.
+- Next: CO-RE loader, real `block_rq_*` attach, Observatory UI, gateway proxy.
+
 ## ✅ Slice 1 — MVP foundation (done, verified)
 
 Read-only control plane + real Ceph lab.

@@ -1,0 +1,29 @@
+# Copyright (c) 2026 ZyvorAI Labs Private Limited.
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "atlas-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Observe-first eBPF storage I/O sensor for Atlas (bio latency, attribution, leased freeze)"
+
+[[bin]]
+name = "atlas-io-agent"
+path = "src/bin/atlas-io-agent.rs"
+
+[dependencies]
+atlas-api-types = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }

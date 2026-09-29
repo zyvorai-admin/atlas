@@ -16,6 +16,10 @@ struct Cli {
     #[arg(long, env = "ATLAS_TOKEN")]
     token: Option<String>,
 
+    /// Observe-first I/O agent base URL (`atlas-io-agent`, not the gateway).
+    #[arg(long, env = "ATLAS_IO_URL", default_value = "http://127.0.0.1:5111")]
+    io_url: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -457,6 +461,82 @@ enum Command {
     DatabridgePlans,
     /// POST /api/atlas/v1/databridge/plans/{id}/{stage} — stage ∈ assess|provision|full-load|cdc-start|cdc-stop|cdc-restart|validate|cutover|rollback
     DatabridgeStage { plan_id: String, stage: String },
+    /// Talk to atlas-io-agent (eBPF storage sensor)
+    Io {
+        #[command(subcommand)]
+        cmd: IoCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IoCommand {
+    /// GET /io/health
+    Health,
+    /// GET /io/summary
+    Summary,
+    /// GET /io/histograms
+    Histograms,
+    /// GET /io/workloads
+    Workloads,
+    /// GET /io/rca
+    Rca {
+        #[arg(long)]
+        volume: Option<String>,
+    },
+    /// GET /io/coverage
+    Coverage,
+    /// GET /io/leases
+    Leases,
+    /// GET /metrics
+    Metrics,
+}
+
+async fn io_request(
+    client: &reqwest::Client,
+    io_url: &str,
+    token: Option<&str>,
+    cmd: &IoCommand,
+) -> Result<()> {
+    let base = io_url.trim_end_matches('/');
+    let path = match cmd {
+        IoCommand::Health => "/io/health",
+        IoCommand::Summary => "/io/summary",
+        IoCommand::Histograms => "/io/histograms",
+        IoCommand::Workloads => "/io/workloads",
+        IoCommand::Rca { volume } => {
+            return get_print(
+                client,
+                token,
+                &match volume {
+                    Some(v) => format!("{base}/io/rca?volume={v}"),
+                    None => format!("{base}/io/rca"),
+                },
+            )
+            .await;
+        }
+        IoCommand::Coverage => "/io/coverage",
+        IoCommand::Leases => "/io/leases",
+        IoCommand::Metrics => "/metrics",
+    };
+    get_print(client, token, &format!("{base}{path}")).await
+}
+
+async fn get_print(client: &reqwest::Client, token: Option<&str>, url: &str) -> Result<()> {
+    let mut req = client.get(url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.with_context(|| format!("request to {url}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+        Err(_) => println!("{body}"),
+    }
+    if !status.is_success() {
+        anyhow::bail!("request failed: HTTP {status}");
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -464,6 +544,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = reqwest::Client::new();
     let base = cli.base_url.trim_end_matches('/');
+
+    if let Command::Io { cmd } = &cli.command {
+        return io_request(&client, &cli.io_url, cli.token.as_deref(), cmd).await;
+    }
 
     let (method, path, body): (&str, String, Option<serde_json::Value>) = match &cli.command {
         Command::Health => ("GET", "/health".to_string(), None),
@@ -923,6 +1007,7 @@ async fn main() -> Result<()> {
         }
         Command::DatabridgeSources => ("GET", "/api/atlas/v1/databridge/sources".to_string(), None),
         Command::DatabridgePlans => ("GET", "/api/atlas/v1/databridge/plans".to_string(), None),
+        Command::Io { .. } => unreachable!("io handled above"),
         Command::DatabridgeStage { plan_id, stage } => {
             let path = match stage.as_str() {
                 "assess" => format!("/api/atlas/v1/databridge/plans/{plan_id}/assess"),

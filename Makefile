@@ -1,6 +1,6 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
 # SPDX-License-Identifier: Apache-2.0
-.PHONY: dev build release test lint fmt fmt-check run run-databridge cli clean ui ui-dev \
+.PHONY: dev build release test lint fmt fmt-check run run-databridge run-io cli clean ui ui-dev \
 	features docker-smoke ci audit headers help status deploy-remote deploy-ceph
 
 dev: lint test ## Clippy, then tests
@@ -58,6 +58,9 @@ run: ui ## Gateway with the fake Ceph driver
 # lag drains and the migration pipeline runs end-to-end with no cloud/k8s. See docs/DATABRIDGE.md.
 run-databridge: ui ## DataBridge demo: fake Ceph, reconciler every 5s
 	ATLAS_CEPH_DRIVER_MODE=fake ATLAS_DATABRIDGE_RECONCILE_SECS=5 cargo run -p atlas-gateway
+
+run-io: ## Observe-first I/O agent (fake bio source, :5111)
+	ATLAS_IO_MODE=fake cargo run -p atlas-io --bin atlas-io-agent
 
 # Build the React Storage Center UI into crates/atlas-gateway/ui/dist (embedded by the gateway).
 # Matches h2kvm- `web/Makefile` frontend target: npm ci + vite build.

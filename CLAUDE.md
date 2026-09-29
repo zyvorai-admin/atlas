@@ -78,6 +78,15 @@ QoS), DataBridge CDC self-heal, upgrade pre-flight + rollback, k6 load/performan
 (read-path + write-path), and cross-cluster DR **scaffolding** (RBD-mirroring
 peers/mirrors/failover API + jobs).
 
+**Observe-first storage I/O sensor** (`docs/IO_EBPF.md`): `atlas-io` is a separate, optional node
+agent (`atlas-io-agent`, own Dockerfile.io/DaemonSet, `deploy/k8s/atlas-io-agent.yaml`) — kept out of
+`atlas-gateway` specifically so the main gateway never needs `CAP_BPF`/`CAP_PERFMON`. Fake bio source
+by default (zero external dependency, same fake-first pattern as the storage drivers); device-map
+attribution, log2-µs histograms, per-cgroup/pid workload accounting, RCA verdicts, and fail-open
+leased write-freezes are all live-verified over HTTP/`/metrics` and `atlasctl io`. Real CO-RE
+attach (`crates/atlas-io/bpf/*.bpf.c` C contracts) is not yet wired up — live mode reports the
+programs as missing rather than fabricating data.
+
 **Licensed** under the [Apache License 2.0](LICENSE) (`Apache-2.0`; relicensed from the Zyvor
 Production License v1.0 at the maintainer's explicit request — history in
 [`docs/LICENSING.md`](docs/LICENSING.md)). Don't weaken or remove license notices,
@@ -102,6 +111,9 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   jobs) was removed — see `docs/RUSTFS.md`.
 - `crates/atlas-databridge` — DataBridge: source connectors, assessment, CNPG/Percona CR builders,
   pipeline stages, reconciler (cloud-to-edge DB migration; `migrations/0011`, `/api/atlas/v1/databridge/*`).
+- `crates/atlas-io` — optional node sensor (bin `atlas-io-agent`): fake/live bio source, device-map
+  attribution, histograms, workload accounting, RCA, fail-open leases; own HTTP API + `/metrics`,
+  not embedded in `atlas-gateway` (see `docs/IO_EBPF.md`).
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
   DB-backed rate-limit counters (`rate_limit.rs`).
