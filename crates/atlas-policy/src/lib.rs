@@ -81,7 +81,7 @@ pub fn find(intent: &str) -> Option<&'static Policy> {
 /// volume-mode placement for PVC-shaped provisioning, none of which apply to an S3 bucket. This is
 /// the one thing bucket creation actually needs resolved with an explicit-override-wins default,
 /// so the choice lives in one named, testable place instead of a route-handler literal.
-pub const DEFAULT_OBJECT_BACKEND: &str = "bkd_rustfs_lab";
+pub const DEFAULT_OBJECT_BACKEND: &str = "bkd_ceph_lab";
 
 /// Resolve which backend provisions a new bucket: an explicit `backend_id` always wins; otherwise
 /// [`DEFAULT_OBJECT_BACKEND`].
@@ -210,8 +210,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_backend_defaults_to_rustfs() {
+    fn resolve_object_backend_defaults_to_ceph_rgw() {
         assert_eq!(resolve_object_backend(None), DEFAULT_OBJECT_BACKEND);
-        assert_eq!(DEFAULT_OBJECT_BACKEND, "bkd_rustfs_lab");
+        assert_eq!(DEFAULT_OBJECT_BACKEND, "bkd_ceph_lab");
     }
 }

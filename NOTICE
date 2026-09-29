@@ -16,5 +16,5 @@ Rust workspace is enforced by deny.toml (cargo-deny). Frontend dependencies
 are declared in crates/atlas-gateway/ui/package-lock.json.
 
 The gateway container images additionally bundle, under their own terms:
-Helm (Apache-2.0), the RustFS Helm chart (Apache-2.0), and the Oracle Instant
-Client (Oracle's redistributable Basic Lite license; see Dockerfile).
+the Oracle Instant Client (Oracle's redistributable Basic Lite license; see
+Dockerfile).

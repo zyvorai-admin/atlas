@@ -15,9 +15,11 @@ Before Atlas, storage logic was scattered: `hyper2kvm` shipped its own ceph-csi 
 Atlas centralizes it:
 
 - **One API** — products never talk to Ceph directly.
-- **Pluggable drivers** — Ceph, NFS, ZFS, Longhorn, and RustFS, each with a fake (fixture,
+- **Pluggable drivers** — Ceph, NFS, ZFS, and Longhorn, each with a fake (fixture,
   zero-dependency default) and real mode where applicable; SAN/cloud backends later, with no
-  product changes.
+  product changes. Object storage defaults to Ceph RGW; any S3-compatible endpoint is usable as a
+  bring-your-own backend via `atlas-driver-rgw` (Atlas dropped its first-party RustFS integration —
+  see `docs/RUSTFS.md`).
 - **Backend-agnostic model** — a `StorageVolume` may be backed by RBD now and SAN tomorrow.
 - **Ownership + audit** — every volume maps to product/resource/tenant/policy/pool/cluster.
 - **Explainable AI Ops Advisor** — deterministic risk scoring, incident correlation, what-if
@@ -93,8 +95,7 @@ purely additive.
 | Fake NFS | `atlas-driver-nfs` | Deterministic fixtures | `ATLAS_NFS_DRIVER_MODE=fake` (default). |
 | Real ZFS | `atlas-driver-zfs` | `zpool list -Hp`/`zfs list -Hp` **locally**, on whatever host the gateway process itself runs on | `ATLAS_ZFS_DRIVER_MODE=real`. No remote/SSH support yet — ZFS has no remote query protocol the way `ceph`/`rbd` does. Never fabricates. Needs `zfsutils-linux`. Also the target of `POST /zfs/pools/from-device` (raw-disk provisioning, see `docs/DISKS.md`). |
 | Fake ZFS | `atlas-driver-zfs` | Deterministic fixtures | `ATLAS_ZFS_DRIVER_MODE=fake` (default). |
-| Real RustFS | `atlas-driver-rustfs` | SigV4-signed `GET /` (S3 `ListBuckets`) + health check for discovery (anonymous fallback when no credential is set) | `ATLAS_RUSTFS_DRIVER_MODE=real`. Discovery is SigV4-signed when `ATLAS_RUSTFS_ACCESS_KEY`/`SECRET_KEY` are set (anonymous otherwise); the bucket/object **write path** (create/delete bucket, object PUT/GET/DELETE/presigned-URLs) lives in `atlas-gateway`/`atlas-jobs` via the shared, generic `atlas_driver_rgw::S3Target`, not in this driver crate — see `docs/RUSTFS.md`. This is the default backend for `POST /buckets`. |
-| Fake RustFS | `atlas-driver-rustfs` | Deterministic fixtures | `ATLAS_RUSTFS_DRIVER_MODE=fake` (default). |
+| Ceph RGW (object) | `atlas-driver-rgw` | Generic SigV4 S3 client (`S3Target`) for bucket/object CRUD, presigned URLs | Default backend for `POST /buckets` (`bkd_ceph_lab`, via Rook `ObjectBucketClaim`). Also used for any bring-your-own S3-compatible endpoint (MinIO, Garage, AWS, a customer-run RustFS) — see `docs/RUSTFS.md` for the history of Atlas's now-removed first-party RustFS integration. |
 | Longhorn | `atlas-driver-longhorn` | Read-only, over Longhorn's Kubernetes v1beta2 CRDs (`nodes`/`volumes`) | `ATLAS_LONGHORN_ENABLE=1`. No native write path — PVC provisioning goes through the Kubernetes StorageClass path, not this driver. See `docs/LONGHORN.md`. |
 | Kubernetes | `atlas-driver-k8s` | Lists StorageClasses / PVCs / PVs via `kube-rs`; tags Ceph-backed classes | Always live when a cluster is reachable. Also the mechanism behind `POST /ceph/devices` (patches the `CephCluster` CR for raw-disk-to-OSD provisioning, see `docs/DISKS.md`). |
 
@@ -171,15 +172,13 @@ secret-redacting `Debug`:
 | `ATLAS_BIND_ADDR` | `127.0.0.1:5110` | Gateway listen address |
 | `ATLAS_DATABASE_URL` | `sqlite://atlas.db?mode=rwc` | SQLite URL (WAL + FK on), or `postgres://...` for HA/multi-replica — see [HA.md](HA.md) |
 | `ATLAS_CEPH_DRIVER_MODE` | `fake` | `real` (ceph/rbd CLI) or `fake` (fixtures) |
-| `ATLAS_NFS_DRIVER_MODE` / `ATLAS_ZFS_DRIVER_MODE` / `ATLAS_RUSTFS_DRIVER_MODE` | `fake` | `real` (live `showmount`/`zpool`/`zfs`/RustFS discovery) or `fake` (fixtures) |
-| `ATLAS_RUSTFS_CREDENTIALS_NAMESPACE` | `zyvor-system` | Namespace of the k8s Secret holding the RustFS backend's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (referenced by `StorageBackend.connection_ref`) |
-| `ATLAS_RUSTFS_CREDENTIALS_SECRET` | `rustfs-credentials` | Name of that Secret — set as the RustFS backend's `connection_ref` at registration (unset it was `None`, which made every RustFS bucket write fail) |
-| `ATLAS_RUSTFS_ACCESS_KEY` / `ATLAS_RUSTFS_SECRET_KEY` / `ATLAS_RUSTFS_REGION` | *(unset)* / *(unset)* / `us-east-1` | Service credential for SigV4-signed RustFS discovery (`ListBuckets`); both keys unset = anonymous discovery |
+| `ATLAS_NFS_DRIVER_MODE` / `ATLAS_ZFS_DRIVER_MODE` | `fake` | `real` (live `showmount`/`zpool`/`zfs` discovery) or `fake` (fixtures) |
+| `ATLAS_S3_CA_CERT` | *(unset)* | Path to a mounted CA cert to additionally trust for any S3-compatible endpoint (private CA / self-signed) — never disables verification, only adds one root |
 | `ATLAS_LONGHORN_ENABLE` | `0` | Register the read-only Longhorn backend (see `docs/LONGHORN.md`) |
 | `ATLAS_HOST_MOUNTINFO_PATH` | *(unset)* | Path to a hostPath-mounted `/proc/1/mountinfo` (e.g. `/host-mountinfo`) so the ZFS root/boot-disk safety check can see the *host's* real mount table from inside a container, not just its own mount namespace — see `docs/DISKS.md` |
 | `ATLAS_RATE_LIMIT_RPM` | `600` | Per-actor per-minute request budget |
 | `ATLAS_RATE_LIMIT_SYNC_SECS` | `2` | Cross-replica rate-limit counter sync interval (Postgres only) |
-| `ATLAS_STATE_BACKUP_SECS` | *(unset)* | Interval for periodic self-state backup to any S3 endpoint (the lab points it at RustFS — see `docs/RUSTFS.md`; the bucket is created on first use) |
+| `ATLAS_STATE_BACKUP_SECS` | *(unset)* | Interval for periodic self-state backup to any S3-compatible endpoint (the bucket is created on first use) |
 | `ATLAS_KUBECONFIG` | *(unset)* | Explicit kubeconfig; else in-cluster/default |
 | `ATLAS_JWT_SECRET` | dev default | HS256 secret (≥32 bytes required when auth is on) |
 | `ATLAS_AUTH_REQUIRED` | `0` (local) / `1` (k8s) | Require JWT on `/api` routes |

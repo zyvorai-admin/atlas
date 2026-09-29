@@ -27,29 +27,6 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # RustFS drive provisioning creates/deletes the `local` PV that fronts a freshly formatted disk.
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "create", "delete"]
-  # ...and reads the node-prep Job's pod log.
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
-  # Console "RustFS instances": list the RustFS Deployments/Services, and repoint the gateway's own
-  # environment at a chosen instance (patch is limited to this one Deployment by name).
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    resourceNames: ["atlas-gateway"]
-    verbs: ["patch"]
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get", "list", "watch"]
   # Write path: create/expand/delete PVCs.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
@@ -111,47 +88,6 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: atlas-gateway
-    namespace: zyvor-system
----
-# ServiceAccount for the throwaway installer Job the console launches to `helm install` RustFS's
-# official chart (crates/atlas-jobs/src/dispatch/rustfs_instance.rs). Namespaced Role scoped to what
-# that chart renders — the gateway itself never gets these rights.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: atlas-rustfs-installer
-  namespace: zyvor-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: atlas-rustfs-installer
-  namespace: zyvor-system
-rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # `helm install --wait` inspects the Deployment's ReplicaSets to judge rollout progress — read-only,
-  # same resource family as the deployments access above (found live: "replicasets.apps is forbidden").
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps", "services", "serviceaccounts", "persistentvolumeclaims", "pods"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: atlas-rustfs-installer
-  namespace: zyvor-system
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: atlas-rustfs-installer
-subjects:
-  - kind: ServiceAccount
-    name: atlas-rustfs-installer
     namespace: zyvor-system
 ---
 apiVersion: apps/v1
@@ -252,65 +188,6 @@ spec:
                   fieldPath: status.hostIP
             - name: ATLAS_RGW_PUBLIC_ENDPOINT
               value: "http://$(NODE_IP):30800"
-            # Self-state backup: periodic VACUUM INTO snapshots of Atlas's own control-plane DB
-            # (inventory/jobs/audit/quotas/DataBridge state) uploaded to RustFS (the lab's real
-            # object store, deploy/rustfs-lab/), separate from the tenant-volume backups Atlas
-            # already does. The bucket is created on first run if missing; credentials are the
-            # same `rustfs-credentials` Secret the RustFS write path uses (lab shortcut — a
-            # production deploy should give the backup its own least-privilege RustFS user).
-            - name: ATLAS_STATE_BACKUP_SECS
-              value: "3600"
-            - name: ATLAS_STATE_BACKUP_ENDPOINT
-              value: "http://$(NODE_IP):30930"
-            - name: ATLAS_STATE_BACKUP_BUCKET
-              value: "atlas-self-state"
-            - name: ATLAS_STATE_BACKUP_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rustfs-sdb-secret
-                  key: RUSTFS_ACCESS_KEY
-                  optional: true
-            - name: ATLAS_STATE_BACKUP_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rustfs-sdb-secret
-                  key: RUSTFS_SECRET_KEY
-                  optional: true
-            # RustFS backend — Atlas's primary object store. The lab's server is RustFS's official chart
-            # on the dedicated disk (release `rustfs-sdb`, credentials Secret `rustfs-sdb-secret` with
-            # RUSTFS_* keys, S3 NodePort 30930) — created by the console's "Deploy RustFS" or, on a fresh
-            # install, by the ATLAS_RUSTFS_AUTO_DEVICE automation below. The console's "Use for Atlas"
-            # rewrites these env vars at runtime; a re-apply of this manifest restores them.
-            # The endpoint is the RustFS NodePort, not the in-cluster Service DNS name, deliberately: the
-            # console hands the browser presigned PUT/GET URLs built from it, and the gateway pod reaches
-            # the node's NodePort. On a cluster without RustFS set ATLAS_RUSTFS_ENABLE=0.
-            - name: ATLAS_RUSTFS_ENABLE
-              value: "1"
-            - name: ATLAS_RUSTFS_ENDPOINT
-              value: "http://$(NODE_IP):30930"
-            # Empty = every bucket the server reports (a non-empty list acts as an allow-list).
-            - name: ATLAS_RUSTFS_BUCKETS
-              value: ""
-            - name: ATLAS_RUSTFS_DRIVER_MODE
-              value: "real"
-            # Bucket create/delete resolve credentials from this Secret via the backend's
-            # connection_ref (namespace: ATLAS_RUSTFS_CREDENTIALS_NAMESPACE, default zyvor-system).
-            - name: ATLAS_RUSTFS_CREDENTIALS_SECRET
-              value: "rustfs-sdb-secret"
-            # Signed ListBuckets discovery uses the same credential. optional: an absent Secret
-            # leaves discovery anonymous (which a real, auth-enabled RustFS will reject and report).
-            - name: ATLAS_RUSTFS_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rustfs-sdb-secret
-                  key: RUSTFS_ACCESS_KEY
-                  optional: true
-            - name: ATLAS_RUSTFS_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rustfs-sdb-secret
-                  key: RUSTFS_SECRET_KEY
-                  optional: true
             # Third ZFS backend, real mode: `zpool`/`zfs`/`lsblk`/`wipefs`/`findmnt`/`blockdev` shell
             # out against the host's own block devices (privileged + hostPath /dev below). No pools
             # exist yet at startup (ATLAS_ZFS_POOLS unset) — POST /zfs/pools/from-device provisions
@@ -326,32 +203,6 @@ spec:
             # docs/DISKS.md and host-mountinfo below.
             - name: ATLAS_HOST_MOUNTINFO_PATH
               value: "/host-mountinfo"
-            # RustFS drive provisioning (Disks page): the node-prep Job runs this same image on this
-            # node — see crates/atlas-jobs/src/dispatch/rustfs_drive.rs.
-            - name: ATLAS_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: ATLAS_POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            # Install-time automation (opt-in): RustFS on this dedicated lab disk without console clicks.
-            # Formats /dev/sdb only if it is completely empty (never wipes), installs RustFS from the
-            # official chart on the resulting drive and points Atlas at it — see
-            # crates/atlas-gateway/src/routes/rustfs.rs (spawn_rustfs_auto). Remove both to stay manual.
-            - name: ATLAS_RUSTFS_AUTO_DEVICE
-              value: "/dev/sdb"
-            - name: ATLAS_RUSTFS_AUTO_ACTIVATE
-              value: "1"
-            - name: ATLAS_DEPLOYMENT_NAME
-              value: "atlas-gateway"
-            - name: ATLAS_CONSOLE_NODE_PORT
-              value: "30510"
-            - name: ATLAS_SELF_IMAGE
-              value: "localhost/atlas-gateway:dev"
-            - name: ATLAS_SELF_IMAGE_PULL_POLICY
-              value: "Never"
             # OIDC/SSO login against the throwaway Dex instance (see deploy/dex-lab/) — a lab-only
             # test IdP, not a real identity provider. Remove these four ATLAS_OIDC_* vars (or leave
             # Dex torn down) to disable the "Sign in with SSO" button; the feature auto-gates off

@@ -160,24 +160,14 @@ spec:
             - name: ATLAS_STATE_BACKUP_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  {{- if .Values.stateBackup.useRustfs }}
-                  name: {{ .Values.rustfs.credentialsSecret }}
-                  key: AWS_ACCESS_KEY_ID
-                  {{- else }}
                   name: {{ include "atlas.authSecretName" . }}
                   key: {{ .Values.stateBackup.accessKeySecretKey }}
-                  {{- end }}
                   optional: true
             - name: ATLAS_STATE_BACKUP_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  {{- if .Values.stateBackup.useRustfs }}
-                  name: {{ .Values.rustfs.credentialsSecret }}
-                  key: AWS_SECRET_ACCESS_KEY
-                  {{- else }}
                   name: {{ include "atlas.authSecretName" . }}
                   key: {{ .Values.stateBackup.secretKeySecretKey }}
-                  {{- end }}
                   optional: true
             {{- end }}
             {{- if .Values.oidc.enabled }}
@@ -275,12 +265,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            {{- if .Values.disks.autoRustfsDevice }}
-            - name: ATLAS_RUSTFS_AUTO_DEVICE
-              value: {{ .Values.disks.autoRustfsDevice | quote }}
-            - name: ATLAS_RUSTFS_AUTO_ACTIVATE
-              value: {{ .Values.disks.autoRustfsActivate | ternary "1" "0" | quote }}
-            {{- end }}
             - name: ATLAS_DEPLOYMENT_NAME
               value: {{ include "atlas.fullname" . | quote }}
             - name: ATLAS_CONSOLE_NODE_PORT
@@ -290,32 +274,6 @@ spec:
             - name: ATLAS_SELF_IMAGE_PULL_POLICY
               value: {{ .Values.image.pullPolicy | quote }}
             {{- end }}
-            {{- if .Values.rustfs.enabled }}
-            - name: ATLAS_RUSTFS_ENABLE
-              value: "1"
-            - name: ATLAS_RUSTFS_ENDPOINT
-              value: {{ include "atlas.rustfsEndpoint" . | quote }}
-            - name: ATLAS_RUSTFS_BUCKETS
-              value: {{ .Values.rustfs.buckets | quote }}
-            - name: ATLAS_RUSTFS_DRIVER_MODE
-              value: {{ .Values.rustfs.driverMode | default "fake" | quote }}
-            - name: ATLAS_RUSTFS_CREDENTIALS_SECRET
-              value: {{ .Values.rustfs.credentialsSecret | quote }}
-            - name: ATLAS_RUSTFS_CREDENTIALS_NAMESPACE
-              value: {{ include "atlas.namespace" . | quote }}
-            - name: ATLAS_RUSTFS_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.rustfs.credentialsSecret }}
-                  key: AWS_ACCESS_KEY_ID
-                  optional: true
-            - name: ATLAS_RUSTFS_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.rustfs.credentialsSecret }}
-                  key: AWS_SECRET_ACCESS_KEY
-                  optional: true
-            {{- end }}
             {{- if .Values.service.https.enabled }}
             - name: ATLAS_HTTPS_ADDR
               value: "0.0.0.0:{{ .Values.service.https.port }}"
@@ -324,13 +282,12 @@ spec:
             - name: ATLAS_TLS_KEY
               value: "/etc/atlas-tls/tls.key"
             {{- end }}
-            {{- if .Values.rustfs.caSecretName }}
-            # Trust a RustFS server's TLS certificate that isn't from a CA already in the system
-            # trust store (a private CA, or a self-signed lab cert — see docs/RUSTFS.md's TLS
-            # section and scripts/rustfs-tls-selfsigned.sh). Never disables verification; it only
-            # adds this one CA on top of the default roots.
-            - name: ATLAS_RUSTFS_CA_CERT
-              value: "/etc/atlas-rustfs-ca/tls.crt"
+            {{- if .Values.s3.caSecretName }}
+            # Trust a bring-your-own S3 endpoint's TLS certificate that isn't from a CA already in
+            # the system trust store (a private CA, or a self-signed cert). Never disables
+            # verification; it only adds this one CA on top of the default roots.
+            - name: ATLAS_S3_CA_CERT
+              value: "/etc/atlas-s3-ca/tls.crt"
             {{- end }}
             - name: ATLAS_RATE_LIMIT_RPM
               value: {{ .Values.rateLimitRpm | quote }}
@@ -375,9 +332,9 @@ spec:
               mountPath: /etc/atlas-tls
               readOnly: true
             {{- end }}
-            {{- if .Values.rustfs.caSecretName }}
-            - name: rustfs-ca
-              mountPath: /etc/atlas-rustfs-ca
+            {{- if .Values.s3.caSecretName }}
+            - name: s3-ca
+              mountPath: /etc/atlas-s3-ca
               readOnly: true
             {{- end }}
             {{- if .Values.disks.enabled }}
@@ -406,10 +363,10 @@ spec:
             secretName: atlas-tls
             optional: true
         {{- end }}
-        {{- if .Values.rustfs.caSecretName }}
-        - name: rustfs-ca
+        {{- if .Values.s3.caSecretName }}
+        - name: s3-ca
           secret:
-            secretName: {{ .Values.rustfs.caSecretName }}
+            secretName: {{ .Values.s3.caSecretName }}
         {{- end }}
         {{- if .Values.disks.enabled }}
         - name: host-dev

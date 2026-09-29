@@ -7,15 +7,17 @@ use sqlx::AnyPool;
 use std::sync::Arc;
 
 use super::helpers::{
-    build_s3_target, build_s3_target_for_backend, poll_configmap, poll_pvc_phase,
-    poll_snapshot_ready, provision_from_snapshot, read_backup_manifest, require_k8s, sha256_hex,
+    build_s3_target, poll_configmap, poll_pvc_phase, poll_snapshot_ready,
+    provision_from_snapshot, read_backup_manifest, require_k8s, sha256_hex,
 };
 use crate::spec::JobSpec;
 
-/// `ATLAS_RUSTFS_ENDPOINT`, mirroring the same env var `atlas-driver-rustfs`'s `from_env()` reads
-/// — job dispatch has no `AppState`/`Config` handle, same convention as `is_fake_zfs_mode()`.
-pub(crate) fn rustfs_endpoint() -> String {
-    std::env::var("ATLAS_RUSTFS_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into())
+/// Destination S3 endpoint for generic object jobs (self-test, BYO S3).
+/// Prefers `ATLAS_S3_ENDPOINT`, then the public RGW override.
+pub(crate) fn s3_endpoint() -> String {
+    std::env::var("ATLAS_S3_ENDPOINT")
+        .or_else(|_| std::env::var("ATLAS_RGW_PUBLIC_ENDPOINT"))
+        .unwrap_or_else(|_| "http://127.0.0.1:7480".into())
 }
 
 pub(crate) async fn dispatch_object(
@@ -388,83 +390,10 @@ pub(crate) async fn dispatch_object(
             }))
         }
 
-        JobSpec::BucketCreateRustfs {
-            bucket_id,
-            backend_id,
-            bucket_name,
-            region,
-            credentials_namespace,
-            object_lock,
-        } => {
-            let k8s = require_k8s(k8s)?;
-            let endpoint = rustfs_endpoint();
-            // Recorded before the S3 call (mirrors BucketCreate's own ordering rationale: only
-            // after the operation is at least attempted, never before — but here the S3 call
-            // itself is fast/synchronous, so this just needs to happen before set_bound).
-            atlas_inventory::buckets::insert_bucket(
-                pool,
-                &bucket_id,
-                "global",
-                &bucket_name,
-                &backend_id,
-                &credentials_namespace,
-                "", // no ObjectBucketClaim — RustFS has no k8s operator involved
-                "",
+        JobSpec::BucketCreateRustfs { .. } | JobSpec::BucketDeleteRustfs { .. } => {
+            anyhow::bail!(
+                "RustFS bucket jobs are retired; use Ceph RGW ObjectBucketClaim (bkd_ceph_lab)"
             )
-            .await?;
-            let (s3, connection_ref) = build_s3_target_for_backend(
-                &k8s,
-                pool,
-                &backend_id,
-                &credentials_namespace,
-                &endpoint,
-                &region,
-                &bucket_name,
-            )
-            .await?;
-            if !s3.bucket_exists().await {
-                s3.create_bucket_with_object_lock(object_lock)
-                    .await
-                    .with_context(|| format!("CreateBucket {bucket_name} on {backend_id}"))?;
-            }
-            atlas_inventory::buckets::set_bound(
-                pool,
-                &bucket_id,
-                &bucket_name,
-                &endpoint,
-                &region,
-                &connection_ref,
-            )
-            .await?;
-            Ok(serde_json::json!({
-                "bucket_id": bucket_id, "bucket_name": bucket_name, "endpoint": endpoint,
-            }))
-        }
-
-        JobSpec::BucketDeleteRustfs {
-            bucket_id,
-            backend_id,
-            bucket_name,
-            region,
-            credentials_namespace,
-        } => {
-            let k8s = require_k8s(k8s)?;
-            let endpoint = rustfs_endpoint();
-            let (s3, _connection_ref) = build_s3_target_for_backend(
-                &k8s,
-                pool,
-                &backend_id,
-                &credentials_namespace,
-                &endpoint,
-                &region,
-                &bucket_name,
-            )
-            .await?;
-            s3.delete_bucket()
-                .await
-                .with_context(|| format!("DeleteBucket {bucket_name} on {backend_id}"))?;
-            atlas_inventory::buckets::delete_bucket_row(pool, &bucket_id).await?;
-            Ok(serde_json::json!({ "bucket_id": bucket_id, "deleted": true }))
         }
 
         JobSpec::BackupCreate {

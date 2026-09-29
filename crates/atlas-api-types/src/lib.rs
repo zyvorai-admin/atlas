@@ -16,7 +16,9 @@ pub enum BackendType {
     Nfs,
     Zfs,
     Longhorn,
-    /// S3-compatible object backend (RustFS).
+    /// Deprecated: the first-party RustFS product driver was removed. Kept so existing
+    /// inventory rows and API payloads with `backend_type: "rustfs"` still deserialize.
+    /// New object backends use Ceph RGW (`Ceph`) or a generic S3 endpoint via `atlas-driver-rgw`.
     Rustfs,
     San,
     CloudBlock,

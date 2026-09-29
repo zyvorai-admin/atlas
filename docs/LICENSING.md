@@ -30,8 +30,7 @@ tag and [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Bundled third-party software
 
-The gateway images include, under their own licenses: Helm (Apache-2.0) and the official RustFS Helm chart
-(Apache-2.0), used by the console's "Deploy RustFS" feature, and the Oracle Instant Client (Oracle's
+The gateway images include, under their own licenses: the Oracle Instant Client (Oracle's
 redistributable Basic Lite license) for the DataBridge Oracle connector — see [`NOTICE`](../NOTICE) and the
 Dockerfiles. Rust and frontend dependency licenses are policed by `cargo deny` (`deny.toml`) and declared in
 `package-lock.json`.

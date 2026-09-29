@@ -16,12 +16,3 @@ keywords:
 maintainers:
   - name: Zyvor
     url: https://zyvor.dev
-# The RustFS server is deployed with RustFS's own official chart (https://charts.rustfs.com), vendored
-# in charts/ so installs need no network. Aliased so its values live under `rustfsserver:`; rendered
-# only when `rustfs.server.enabled`.
-dependencies:
-  - name: rustfs
-    version: 1.0.0
-    repository: https://charts.rustfs.com
-    alias: rustfsserver
-    condition: rustfs.server.enabled

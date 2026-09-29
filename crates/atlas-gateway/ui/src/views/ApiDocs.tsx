@@ -32,7 +32,7 @@ const SECTIONS: { title: string; items: DocsRow[] }[] = [
       { method: "GET", path: "/api/atlas/v1/pools", note: "Pools (?kind=)" },
       { method: "GET", path: "/api/atlas/v1/volumes", note: "Volumes (?state=&kind=)" },
       { method: "GET", path: "/api/atlas/v1/snapshots", note: "Snapshots" },
-      { method: "GET", path: "/api/atlas/v1/buckets", note: "Object buckets (RustFS default, Ceph RGW)" },
+      { method: "GET", path: "/api/atlas/v1/buckets", note: "Object buckets (Ceph RGW default)" },
       { method: "GET", path: "/api/atlas/v1/osds", note: "OSD inventory" },
     ],
   },
@@ -47,13 +47,13 @@ const SECTIONS: { title: string; items: DocsRow[] }[] = [
     ],
   },
   {
-    title: "Object storage (RustFS)",
+    title: "Object storage (Ceph RGW)",
     items: [
-      { method: "POST", path: "/api/atlas/v1/buckets", note: "Create bucket (backend_id; RustFS default) → job" },
+      { method: "POST", path: "/api/atlas/v1/buckets", note: "Create bucket (backend_id; Ceph RGW default) → job" },
       { method: "DELETE", path: "/api/atlas/v1/buckets/{id}", note: "Delete bucket (must be empty) → job" },
-      { method: "POST", path: "/api/atlas/v1/buckets/{id}/objects/upload-url", note: "Presigned PUT (browser → RustFS)" },
+      { method: "POST", path: "/api/atlas/v1/buckets/{id}/objects/upload-url", note: "Presigned PUT (browser → RGW)" },
       { method: "POST", path: "/api/atlas/v1/backends/{id}/selftest", note: "S3 conformance self-test → job" },
-      { method: "POST", path: "/api/atlas/v1/databridge/object", note: "Bucket-to-bucket migration (source/dest_backend_id)" },
+      { method: "POST", path: "/api/atlas/v1/databridge/object", note: "Bucket-to-bucket migration (explicit source/dest endpoint + secret_ref)" },
     ],
   },
   {

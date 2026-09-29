@@ -25,20 +25,6 @@ and the job-dispatch layer: the path must be a **whole disk** (`/dev/sdb`, `/dev
 `/dev/nvme1n1` — never a partition like `/dev/sdb1`), and the conventional first-disk name for each
 bus (`sda`, `vda`, `nvme0n1`) is refused outright as a static heuristic.
 
-## RustFS drive: `POST /api/atlas/v1/rustfs/drives/from-device`
-
-```json
-{ "device_path": "/dev/sdb", "confirm": true, "wipe_existing": false }
-```
-
-The default target on the Disks page (and the "Format a disk for RustFS" section of Storage → RustFS).
-An async job that re-runs the same hard refusals as the ZFS path, optionally wipes, and then runs a
-throwaway root Job on the node that formats XFS, mounts the disk on the host (`/mnt/atlas-disks/<disk>`,
-fstab entry with `nofail`), after which Atlas creates a `local` PV and a bound PVC `rustfs-<disk>-data`
-for a RustFS deployment to use. `GET /rustfs/drives` lists what was prepared. Needs the gateway image's
-`xfsprogs`, `ATLAS_NODE_NAME`/`ATLAS_POD_NAMESPACE`/`ATLAS_SELF_IMAGE` and PV/Job/pod-log RBAC (all in
-`deploy/k8s/atlas-gateway.yaml` and the chart). Verified live: `sdb` → XFS → mounted → PV Bound.
-
 ## ZFS: `POST /api/atlas/v1/zfs/pools/from-device`
 
 ```json

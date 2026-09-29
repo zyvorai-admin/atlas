@@ -43,12 +43,10 @@ Override only together: `ROOK_VERSION=… CEPH_IMAGE=… ./up.sh …`.
 # e.g. ./scripts/deploy-remote.sh <ephemeral-ip> operator
 ```
 
-RustFS is **not** started by the script any more: the lab's object store is RustFS's official Helm chart on a
-dedicated disk, created from the console (Storage → RustFS → Deploy RustFS…) or automatically on first start
-with `ATLAS_RUSTFS_AUTO_DEVICE=/dev/sdX` (formats an empty disk only, never wipes) — see
-[`RUSTFS.md`](RUSTFS.md). `--with-legacy-rustfs` still brings up the old manifest-based single-volume server
-([`deploy/rustfs-lab/up.sh`](../deploy/rustfs-lab/up.sh), port 30900). Set `ATLAS_RUSTFS_ENABLE=0` for a
-cluster with no RustFS.
+Object storage defaults to Ceph RGW (`bkd_ceph_lab`); no separate object-store server is started by
+this script. Any S3-compatible endpoint (MinIO, Garage, AWS, or a customer-run RustFS) is usable as
+a bring-your-own backend — see [`RUSTFS.md`](RUSTFS.md) for the history of Atlas's now-removed
+first-party RustFS integration.
 
 NodePort **30510**. Verifies `/health`, `/version`, and `/storage-classes`. Gates automatically on
 `GET /upgrade/preflight` before rolling out (pass `--force` to override a blocked pre-flight).

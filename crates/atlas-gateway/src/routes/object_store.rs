@@ -1,8 +1,10 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{Path, Query, RawQuery, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde::Deserialize;
@@ -74,7 +76,7 @@ pub(crate) async fn bucket_stats(
     if b.backend_id.as_deref() == Some(crate::startup::RUSTFS_BACKEND_ID) {
         return Ok(Json(json!({
             "bucket_id": id, "bucket": name, "available": false,
-            "reason": "bucket stats are not implemented for the RustFS backend (no radosgw-admin equivalent wired up yet)",
+            "reason": "this bucket was provisioned on the retired RustFS backend; migrate to Ceph RGW",
         })));
     }
 
@@ -172,17 +174,12 @@ pub(crate) async fn bucket_s3_target(
         .get("AWS_SECRET_ACCESS_KEY")
         .ok_or_else(|| AppError::Internal("bucket secret missing AWS_SECRET_ACCESS_KEY".into()))?;
     // `rgw_public_endpoint` is a browser-reachable override for Ceph RGW specifically (so
-    // presigned URLs work from outside the cluster) — it must never apply to a RustFS (or any
-    // other non-Ceph) bucket's own stored endpoint, which is already the real, correct one.
-    let endpoint = if b.backend_id.as_deref() == Some(crate::startup::RUSTFS_BACKEND_ID) {
-        b.endpoint.unwrap_or_default()
-    } else {
-        s.config
-            .rgw_public_endpoint
-            .clone()
-            .or(b.endpoint)
-            .unwrap_or_default()
-    };
+    // presigned URLs work from outside the cluster).
+    let endpoint = s.config
+        .rgw_public_endpoint
+        .clone()
+        .or(b.endpoint)
+        .unwrap_or_default();
     atlas_driver_rgw::S3Target::new(
         &endpoint,
         &b.region.unwrap_or_else(|| "us-east-1".into()),
@@ -191,6 +188,120 @@ pub(crate) async fn bucket_s3_target(
         secret_key,
     )
     .map_err(|e| AppError::Driver(e.to_string()))
+}
+
+/// Bucket-level S3 subresources the console's per-bucket Settings panel reads/writes — a bare
+/// `?<name>` query, no value, matching S3's own convention for all of these. Deliberately narrow
+/// (only what the console actually calls) rather than every subresource S3 defines.
+const BUCKET_SUBRESOURCES: [&str; 5] = ["versioning", "lifecycle", "policy", "object-lock", "versions"];
+
+fn require_subresource(raw: Option<String>) -> AppResult<String> {
+    let sub = raw.unwrap_or_default();
+    if BUCKET_SUBRESOURCES.contains(&sub.as_str()) {
+        Ok(sub)
+    } else {
+        Err(AppError::Validation(format!(
+            "unsupported bucket subresource {sub:?}"
+        )))
+    }
+}
+
+/// Forwards the backend's own status/content-type/body verbatim — this proxy signs and routes
+/// the request but never reinterprets an S3-compatible server's XML/JSON response.
+fn subresource_response(status: u16, content_type: Option<&str>, body: String) -> AppResult<Response> {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut headers = HeaderMap::new();
+    if let Some(ct) = content_type {
+        if let Ok(v) = ct.parse() {
+            headers.insert(header::CONTENT_TYPE, v);
+        }
+    }
+    Ok((status, headers, body).into_response())
+}
+
+/// `GET /buckets/{id}/subresource?<name>` — read a bucket-level S3 subresource (versioning,
+/// lifecycle, policy, object-lock, versions) from whichever backend actually owns the bucket.
+/// Generalizes the removed RustFS-specific admin proxy: works for Ceph RGW and any bring-your-own
+/// S3 bucket, since it signs through the bucket's own resolved `S3Target`.
+pub(crate) async fn bucket_subresource_get(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> AppResult<Response> {
+    let sub = require_subresource(raw)?;
+    let s3 = bucket_s3_target(&s, &actor, &id).await?;
+    let (status, body) = s3
+        .get_bucket_subresource(&sub)
+        .await
+        .map_err(|e| AppError::Driver(e.to_string()))?;
+    subresource_response(status, Some("application/xml"), body)
+}
+
+/// `PUT /buckets/{id}/subresource?<name>` — write a bucket-level S3 subresource. Every write is
+/// audited; the body is forwarded to the backend unparsed (XML for versioning/lifecycle/
+/// object-lock, JSON for policy).
+pub(crate) async fn bucket_subresource_put(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let sub = require_subresource(raw)?;
+    let s3 = bucket_s3_target(&s, &actor, &id).await?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/xml")
+        .to_string();
+    let (status, resp_body) = s3
+        .put_bucket_subresource(&sub, &content_type, body.to_vec())
+        .await
+        .map_err(|e| AppError::Driver(e.to_string()))?;
+    let _ = atlas_inventory::audit::record(
+        &s.pool,
+        None,
+        &actor.id,
+        "bucket.subresource.put",
+        "bucket",
+        &id,
+        if (200..300).contains(&status) { "ok" } else { "failed" },
+        Some(json!({ "subresource": sub })),
+        None,
+    )
+    .await;
+    subresource_response(status, Some(&content_type), resp_body)
+}
+
+/// `DELETE /buckets/{id}/subresource?<name>` — clear a bucket-level S3 subresource (e.g. remove a
+/// lifecycle config or bucket policy).
+pub(crate) async fn bucket_subresource_delete(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> AppResult<Response> {
+    let sub = require_subresource(raw)?;
+    let s3 = bucket_s3_target(&s, &actor, &id).await?;
+    let (status, body) = s3
+        .delete_bucket_subresource(&sub)
+        .await
+        .map_err(|e| AppError::Driver(e.to_string()))?;
+    let _ = atlas_inventory::audit::record(
+        &s.pool,
+        None,
+        &actor.id,
+        "bucket.subresource.delete",
+        "bucket",
+        &id,
+        if (200..300).contains(&status) { "ok" } else { "failed" },
+        Some(json!({ "subresource": sub })),
+        None,
+    )
+    .await;
+    subresource_response(status, Some("application/xml"), body)
 }
 
 /// `GET /buckets/{id}/objects[?prefix=]` — list objects in the bucket over S3 (creds in-cluster).
@@ -408,23 +519,18 @@ pub(crate) async fn delete_bucket(
         )));
     }
 
-    // `NULL`/missing backend_id means the row predates this field — the historical default was
-    // always Ceph, so that's the safe backward-compatible assumption here.
-    let spec = if bucket.backend_id.as_deref() == Some(crate::startup::RUSTFS_BACKEND_ID) {
-        JobSpec::BucketDeleteRustfs {
-            bucket_id: id.clone(),
-            backend_id: crate::startup::RUSTFS_BACKEND_ID.into(),
-            bucket_name: bucket.bucket_name.clone().unwrap_or(bucket.name),
-            region: bucket.region.clone().unwrap_or_else(|| "us-east-1".into()),
-            credentials_namespace: bucket.namespace.unwrap_or_else(|| "zyvor-system".into()),
-        }
-    } else {
-        JobSpec::BucketDelete {
-            bucket_id: id.clone(),
-            namespace: bucket.namespace.unwrap_or_else(|| "rook-ceph".into()),
-            // The OBC name equals the bucket's registered name (set at creation).
-            obc_name: bucket.name,
-        }
+    // `NULL`/missing backend_id means the row predates this field — default is Ceph RGW.
+    if bucket.backend_id.as_deref() == Some(crate::startup::RUSTFS_BACKEND_ID) {
+        return Err(AppError::Validation(
+            "this bucket is on the retired RustFS backend; delete it out of band or migrate first"
+                .into(),
+        ));
+    }
+    let spec = JobSpec::BucketDelete {
+        bucket_id: id.clone(),
+        namespace: bucket.namespace.unwrap_or_else(|| "rook-ceph".into()),
+        // The OBC name equals the bucket's registered name (set at creation).
+        obc_name: bucket.name,
     };
     let job_id = ids::job_id();
     let job = s
@@ -450,25 +556,24 @@ pub(crate) async fn delete_bucket(
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateBucketBody {
     name: String,
-    /// Which backend provisions this bucket. Defaults to RustFS (the primary object backend as
-    /// of this change) — pass `"bkd_ceph_lab"` explicitly for the original Rook/RGW path.
+    /// Which backend provisions this bucket. Defaults to Ceph RGW (`bkd_ceph_lab`).
     #[serde(default)]
     backend_id: Option<String>,
     namespace: Option<String>,
     storage_class: Option<String>,
-    /// Optional RGW quota: max object count. Ignored for RustFS (no quota mechanism wired up yet).
+    /// Optional RGW quota: max object count.
     max_objects: Option<i64>,
-    /// Optional RGW quota: max size (e.g. "2G"). Ignored for RustFS.
+    /// Optional RGW quota: max size (e.g. "2G").
     max_size: Option<String>,
-    /// S3 Object Lock (WORM retention). RustFS only, and only at creation — S3 (and RustFS) refuse
-    /// to enable it retroactively on an existing bucket. Ignored for Ceph RGW.
+    /// S3 Object Lock (WORM retention). Was RustFS-only, set at creation. Ceph RGW support isn't
+    /// wired up yet — rejected explicitly below rather than silently creating an unlocked bucket
+    /// for a caller who asked for WORM semantics.
     #[serde(default)]
     object_lock: bool,
 }
 
-/// `POST /buckets` — provision a bucket on the requested backend (async job). Defaults to RustFS
-/// (direct signed S3 `CreateBucket`, no Kubernetes operator involved); `backend_id: "bkd_ceph_lab"`
-/// keeps the original Rook `ObjectBucketClaim` path, unchanged.
+/// `POST /buckets` — provision a bucket on the requested backend (async job). Defaults to
+/// Ceph RGW via Rook `ObjectBucketClaim` (`bkd_ceph_lab`). The retired RustFS backend id is rejected.
 pub(crate) async fn create_bucket(
     State(s): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -499,21 +604,16 @@ pub(crate) async fn create_bucket(
     let job_id = ids::job_id();
 
     let spec = if backend_id == crate::startup::RUSTFS_BACKEND_ID {
-        if !s.config.rustfs_enable {
-            return Err(AppError::Unavailable(
-                "the RustFS backend is not enabled (set ATLAS_RUSTFS_ENABLE=1 and restart the gateway)"
-                    .into(),
+        return Err(AppError::Validation(
+            "the RustFS backend was removed; omit backend_id or pass \"bkd_ceph_lab\" for Ceph RGW"
+                .into(),
+        ));
+    } else if backend_id == CEPH_BACKEND_ID {
+        if body.object_lock {
+            return Err(AppError::Validation(
+                "object_lock is not yet supported on the Ceph RGW backend".into(),
             ));
         }
-        JobSpec::BucketCreateRustfs {
-            bucket_id: bucket_id.clone(),
-            backend_id: backend_id.clone(),
-            bucket_name: body.name.clone(),
-            region: "us-east-1".into(),
-            credentials_namespace: s.config.rustfs_credentials_namespace.clone(),
-            object_lock: body.object_lock,
-        }
-    } else if backend_id == CEPH_BACKEND_ID {
         // The OBC (and its Secret/ConfigMap) live where this gateway can read them.
         let namespace = body.namespace.unwrap_or_else(|| "rook-ceph".into());
         let storage_class = body

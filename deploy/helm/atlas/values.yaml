@@ -117,10 +117,10 @@ logLevel: "info,atlas_gateway=debug"
 # only supported open-dev path — see CLAUDE.md's "Run locally" section).
 authRequired: true
 
-# Self-state backup (periodic SQLite/pg_dump snapshot to any S3 endpoint — RustFS or RGW) — off by
+# Self-state backup (periodic SQLite/pg_dump snapshot to any S3-compatible endpoint) — off by
 # default; set enabled true and fill in bucket/endpoint plus a Secret holding the access/secret
-# keys. The bucket is created on the first run if it does not exist. The lab manifest
-# (deploy/k8s/atlas-gateway.yaml) points this at RustFS.
+# keys (accessKeySecretKey/secretKeySecretKey, in the main auth Secret). The bucket is created on
+# the first run if it does not exist.
 stateBackup:
   enabled: false
   intervalSecs: 3600
@@ -129,10 +129,6 @@ stateBackup:
   prefix: ""
   accessKeySecretKey: state-backup-access-key
   secretKeySecretKey: state-backup-secret-key
-  # Back up to the RustFS backend: endpoint defaults to the RustFS endpoint and the credentials come
-  # from `rustfs.credentialsSecret` (keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) instead of the
-  # auth Secret. The bucket is created on the first run.
-  useRustfs: false
 
 # OIDC/SSO — off by default; the console's "Sign in with SSO" button only renders when this is
 # enabled (see crates/atlas-common/src/config.rs's oidc_from_env()).
@@ -217,78 +213,13 @@ zfs:
 # gateway per node. Needs the default (non-Ceph) gateway image, which bundles zfsutils-linux.
 disks:
   enabled: false
-  # Opt-in install-time automation: name ONE raw disk (e.g. /dev/sdb) and, on first start, Atlas
-  # formats it as a RustFS drive ONLY IF it is completely empty (it never wipes — a disk that holds
-  # anything is reported in the gateway log and left alone), installs RustFS from the official chart
-  # on it, and, with `autoRustfsActivate`, points Atlas at that server. Needs `disks.enabled`.
-  autoRustfsDevice: ""
-  autoRustfsActivate: false
 
-rustfs:
-  enabled: false
-  # Address browsers AND the gateway use to reach the S3 API (presigned upload/download URLs are
-  # built from it, so it must be browser-reachable). Empty with `server.enabled`: http://<node-ip>:
-  # <server.s3NodePort>, resolved from the pod's NODE_IP.
-  endpoint: ""
-  buckets: ""
-  # "fake" (default) reports deterministic capacity fixtures — safe with no real RustFS endpoint.
-  # "real" calls `endpoint`'s health + signed S3 ListBuckets/ListObjectsV2 endpoints.
-  driverMode: fake
-  # Secret (in the gateway's namespace) holding AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY — used for
-  # signed discovery and for bucket create/delete. Created by the chart when
-  # `server.generateCredentials`, otherwise it must already exist.
-  credentialsSecret: rustfs-credentials
-  # Name of a `kubernetes.io/tls` Secret whose tls.crt Atlas should additionally trust when talking
-  # to RustFS over HTTPS — a private CA or a self-signed cert (RUSTFS_TLS_PATH), not one already in
-  # the system trust store. Empty = no extra CA trusted (plain HTTP, or HTTPS with a publicly
-  # trusted cert). See docs/RUSTFS.md's TLS section.
+# Trust a bring-your-own S3 endpoint's TLS certificate when it isn't from a CA already in the
+# system trust store (a private CA, or a self-signed cert) — used by atlas-driver-rgw for any
+# S3-compatible backend (Ceph RGW, MinIO, Garage, AWS, or a customer-run RustFS). Never disables
+# verification; it only adds this one CA on top of the default roots.
+s3:
   caSecretName: ""
-
-  # Optional RustFS server, deployed with RustFS's OWN official Helm chart (vendored under charts/,
-  # values under `rustfsserver:` below). Standalone = one pod on one volume: a single-drive RustFS has
-  # no erasure coding and cannot be expanded in place or joined as a pool (RustFS docs: migrate to a
-  # new deployment over S3 — Atlas's Object Migrations page does exactly that). For production run a
-  # multi-drive/multi-node RustFS (`rustfsserver.mode.distributed`) or point `rustfs.endpoint` at one.
-  server:
-    enabled: false
-    # Create `rustfs.credentialsSecret` once (`lookup` + `randAlphaNum`, kept on upgrade, never
-    # printed) holding BOTH key sets: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (what Atlas reads) and
-    # RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY (what the official chart's `secret.existingSecret` reads).
-    # `helm template` cannot `lookup`, so it renders throwaway values. False = supply your own.
-    generateCredentials: true
-
-# Values for the vendored official RustFS chart (only used when `rustfs.server.enabled`). Keep
-# `secret.existingSecret` equal to `rustfs.credentialsSecret` (the chart fails otherwise), and the
-# CORS origin equal to the console's origin (`service.httpNodePort`) — RustFS sends no CORS headers by
-# default, which breaks every browser upload. To put the data on a drive prepared from the Disks page,
-# set `mode.standalone.existingClaim.dataClaim` to that drive's PVC (e.g. `rustfs-sdb-data`).
-rustfsserver:
-  image:
-    tag: "1.0.0"
-  mode:
-    standalone:
-      enabled: true
-      existingClaim:
-        dataClaim: ""
-    distributed:
-      enabled: false
-  secret:
-    existingSecret: rustfs-credentials
-  ingress:
-    enabled: false   # the chart renders an nginx Ingress for example.rustfs.com by default
-  service:
-    type: NodePort
-    endpoint:
-      nodePort: 30900
-    console:
-      nodePort: 30901
-  extraEnv:
-    - name: NODE_IP
-      valueFrom:
-        fieldRef:
-          fieldPath: status.hostIP
-    - name: RUSTFS_CORS_ALLOWED_ORIGINS
-      value: "http://$(NODE_IP):30510"
 
 nodeSelector: {}
 tolerations: []

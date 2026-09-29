@@ -16,18 +16,14 @@ Implemented:
   `migrations-postgres/` Postgres dialect) — axum 0.8 REST + `tonic` gRPC; async **job engine**.
 - **Pluggable backends** behind `StorageDriver`, each with a `fake`/`real` `DriverMode` (fixture-only
   by default, zero external dependency): Ceph (`ceph`/`rbd` CLI), **NFS** (`showmount`/`df`),
-  **ZFS** (local `zpool`/`zfs list`), **RustFS** (S3-compatible; the **primary/default object
-  backend**, see `docs/RUSTFS.md`) and read-only **Longhorn** — plus a live K8s driver. Real drivers
+  **ZFS** (local `zpool`/`zfs list`) and read-only **Longhorn** — plus a live K8s driver. Real drivers
   never fabricate data; they propagate a real error when the target is unreachable. Discovery worker
-  → inventory. **RustFS runs for real** in the lab from **RustFS's own official Helm chart** on a
-  dedicated XFS drive (release `rustfs-sdb`, vendored chart in `deploy/helm/atlas/charts/`), deployed
-  and switched to from the console (Storage → RustFS); the console also drives RustFS's native admin API
-  (users, policies, pools, heal, quota, service accounts) through an allow-listed, server-signed proxy
-  (`routes/rustfs.rs`) and per-bucket Settings; bucket create/upload/download, multipart, delete, the
-  console **self-test**, DataBridge **Object Migrations** and the Helm chart (`rustfs.server`,
-  `disks.enabled`, `scripts/helm-lab-remote.sh`) are verified live; the lab's self-state backup targets it.
-  Opt-in install-time automation: `ATLAS_RUSTFS_AUTO_DEVICE` (formats only an EMPTY disk, never wipes).
-  CI gates run on the lab host via `scripts/ci-remote.sh` (never locally).
+  → inventory. **Object storage defaults to Ceph RGW** (`bkd_ceph_lab`, Rook `ObjectBucketClaim`);
+  any S3-compatible endpoint (MinIO, Garage, AWS, or a customer-run RustFS) is usable as a
+  bring-your-own backend via the generic `atlas-driver-rgw::S3Target` client — see `docs/RUSTFS.md`
+  for the history of Atlas's now-removed first-party RustFS product integration (Helm chart, admin
+  proxy, console pages, drive/instance install jobs) and what replaced it. CI gates run on the lab
+  host via `scripts/ci-remote.sh` (never locally).
 - **Raw disk provisioning** (`docs/DISKS.md`): Disks console page + `GET /zfs/devices`,
   `GET /ceph/nodes/{node}/devices` pickers, `POST /zfs/pools/from-device` (with explicit
   `wipe_existing`) and `POST /ceph/devices`. **ZFS verified live on a real disk** (wiped a stale Ceph
@@ -36,7 +32,7 @@ Implemented:
   root/boot disk and mounted devices are hard refusals that `wipe_existing` can never override.
   `POST /zfs/pools/{name}/destroy` (Disks page **Destroy…**, typed-name confirm) tears a pool down
   again (verified live: destroyed `tank0`, re-provisioned `sdb` as `tank1`).
-- Write path: volumes (PVC + direct RBD), snapshots/clone/restore, CephFS RWX, buckets (RustFS default, RGW) + backups
+- Write path: volumes (PVC + direct RBD), snapshots/clone/restore, CephFS RWX, buckets (Ceph RGW default, BYO S3) + backups
   (`export-diff`→S3, retention, presigned), scheduled snapshots/backups, per-tenant quotas + policies.
 - Observability: monitor/alerts + webhook, `/metrics` (Prometheus self), `/metrics/{history,forecast,ceph}`,
   Ceph-native `/ceph/{status,osd-tree,osd-df,df}`, unified `/events`, `/readyz`, OpenTelemetry
@@ -100,11 +96,10 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   shares→filesystem volumes).
 - `crates/atlas-driver-zfs` — `FakeZfsDriver`/`RealZfsDriver` (third backend; zpools→pools,
   datasets→filesystem volumes) + raw-disk inspection/wipe/`zpool create` (`cmd.rs`).
-- `crates/atlas-driver-rustfs` — `FakeRustfsDriver`/`RealRustfsDriver` (S3 discovery, SigV4-signed) and
-  `RustfsClient` (generic signed client for the admin API and S3 bucket sub-resources); the
-  bucket/object *write* path is in `atlas-gateway`/`atlas-jobs` over the shared `atlas-driver-rgw`
-  `S3Target`. `atlas-driver-k8s/src/node_disks.rs` holds the PV/Job/Deployment helpers the drive and
-  RustFS-instance jobs use.
+- `crates/atlas-driver-rgw` — `S3Target`, the generic SigV4 S3 client for the bucket/object write path
+  (Ceph RGW, the default, and any bring-your-own S3-compatible endpoint). The first-party
+  `atlas-driver-rustfs` crate (RustFS-product-specific discovery, admin proxy, drive/instance install
+  jobs) was removed — see `docs/RUSTFS.md`.
 - `crates/atlas-databridge` — DataBridge: source connectors, assessment, CNPG/Percona CR builders,
   pipeline stages, reconciler (cloud-to-edge DB migration; `migrations/0011`, `/api/atlas/v1/databridge/*`).
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.

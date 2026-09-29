@@ -29,15 +29,6 @@ COPY --from=ui /ui/dist crates/atlas-gateway/ui/dist
 RUN cargo build --release -p atlas-gateway -p atlasctl \
     --features atlas-databridge/mongodb,atlas-databridge/sqlserver,atlas-databridge/oracle,atlas-databridge/kafka-lag
 
-# ---- helm (pinned, checksum-verified) — used only by the console's RustFS installer Job ----
-FROM docker.io/library/debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS helm
-ARG HELM_VERSION=v3.19.0
-ARG HELM_SHA256=a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
-    && curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
-    && echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c - \
-    && tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm && install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
-
 # ---- runtime (debian + ceph squid client) ----
 FROM docker.io/library/debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 # zfsutils-linux/util-linux/setcap: same raw-disk provisioning tooling as `Dockerfile` (Disks page,
@@ -60,10 +51,6 @@ RUN echo "deb http://deb.debian.org/debian bookworm contrib" >> /etc/apt/sources
 COPY --from=builder /build/target/release/atlas-gateway /usr/local/bin/atlas-gateway
 COPY --from=builder /build/target/release/atlasctl /usr/local/bin/atlasctl
 COPY --from=builder /build/migrations /usr/local/share/atlas/migrations
-# RustFS's official Helm chart + helm, for the console's "Deploy RustFS" installer Job
-# (crates/atlas-jobs/src/dispatch/rustfs_instance.rs).
-COPY --from=helm /usr/local/bin/helm /usr/local/bin/helm
-COPY deploy/helm/atlas/charts/rustfs-1.0.0.tgz /usr/share/atlas/charts/rustfs-1.0.0.tgz
 USER atlas
 WORKDIR /var/lib/atlas
 ENV ATLAS_BIND_ADDR=0.0.0.0:5110 \

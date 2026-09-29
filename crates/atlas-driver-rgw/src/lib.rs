@@ -441,6 +441,75 @@ impl S3Target {
         }
         Ok(())
     }
+
+    /// GET a bucket-level S3 subresource (`?versioning`, `?lifecycle`, `?policy`, `?tagging`,
+    /// `?cors`, `?object-lock`, `?encryption`, ...) — the console's per-bucket Settings panel.
+    /// rusty-s3 has no dedicated action type for most of these (only `create_bucket`/
+    /// `delete_bucket` are covered), so this signs the request directly rather than adding one
+    /// bespoke `S3Action` impl per subresource. Returns the raw status + body (XML/JSON, backend-
+    /// dependent) unparsed — same "pass the server's own response through" approach the removed
+    /// RustFS-specific proxy used, now backend-agnostic.
+    pub async fn get_bucket_subresource(&self, subresource: &str) -> Result<(u16, String)> {
+        let resp = self
+            .http
+            .get(self.sign_subresource(rusty_s3::Method::Get, subresource))
+            .send()
+            .await
+            .with_context(|| format!("GET ?{subresource} on {}", self.bucket.name()))?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// PUT a bucket-level S3 subresource — see `get_bucket_subresource`.
+    pub async fn put_bucket_subresource(
+        &self,
+        subresource: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<(u16, String)> {
+        let resp = self
+            .http
+            .put(self.sign_subresource(rusty_s3::Method::Put, subresource))
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("PUT ?{subresource} on {}", self.bucket.name()))?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// DELETE a bucket-level S3 subresource — see `get_bucket_subresource`.
+    pub async fn delete_bucket_subresource(&self, subresource: &str) -> Result<(u16, String)> {
+        let resp = self
+            .http
+            .delete(self.sign_subresource(rusty_s3::Method::Delete, subresource))
+            .send()
+            .await
+            .with_context(|| format!("DELETE ?{subresource} on {}", self.bucket.name()))?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// Sign a bare `?<subresource>` request (no other query params, matching every subresource
+    /// this proxy forwards) using rusty-s3's public `signing::sign` directly.
+    fn sign_subresource(&self, method: rusty_s3::Method, subresource: &str) -> url::Url {
+        rusty_s3::signing::sign(
+            &jiff::Timestamp::now(),
+            method,
+            self.bucket.base_url().clone(),
+            self.creds.key(),
+            self.creds.secret(),
+            self.creds.token(),
+            self.bucket.region(),
+            SIGN_TTL.as_secs(),
+            std::iter::once((subresource, "")),
+            std::iter::empty(),
+        )
+    }
 }
 
 /// The `CreateBucket` request body for `region`: none for the default `us-east-1`, otherwise a

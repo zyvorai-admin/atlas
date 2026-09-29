@@ -161,25 +161,11 @@ pub(crate) async fn create_backend(
             ("active", Some(driver))
         }
         BackendType::Rustfs => {
-            let endpoint = body
-                .server
-                .clone()
-                .unwrap_or_else(|| "http://rustfs01.zyvor.lab:9000".into());
-            let buckets = body
-                .targets
-                .clone()
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| vec!["vm-images".into(), "backups".into()]);
-            let driver: std::sync::Arc<dyn atlas_driver_core::StorageDriver> =
-                match s.config.rustfs_driver_mode {
-                    atlas_common::config::DriverMode::Real => std::sync::Arc::new(
-                        atlas_driver_rustfs::RealRustfsDriver::new(&id, endpoint, buckets),
-                    ),
-                    atlas_common::config::DriverMode::Fake => std::sync::Arc::new(
-                        atlas_driver_rustfs::FakeRustfsDriver::new(&id, endpoint, buckets),
-                    ),
-                };
-            ("active", Some(driver))
+            return Err(AppError::Validation(
+                "the RustFS product driver was removed; use Ceph RGW (backend_type=ceph) \
+                 or point state-backup / DataBridge at any S3-compatible endpoint"
+                    .into(),
+            ));
         }
         // Longhorn is registered at startup with an in-cluster Kubernetes client.
         // Avoid persisting a pending row which would silently lack a live driver.

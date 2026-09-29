@@ -36,26 +36,15 @@ Expects to run in `ceph.rookNamespace` (default `rook-ceph`) with Rook's mon end
 and admin keyring Secret already present — this chart doesn't stand up Ceph itself, see
 `deploy/rook-ceph-lab/`.
 
-## RustFS object storage (server + gateway wiring)
+## Object storage: Ceph RGW (default), or bring your own S3
 
-```bash
-helm install atlas ./deploy/helm/atlas --create-namespace --set auth.createSecret=true \
-  --set rustfs.enabled=true --set rustfs.driverMode=real --set rustfs.server.enabled=true \
-  --set stateBackup.enabled=true --set stateBackup.useRustfs=true
-```
-
-`rustfs.server.enabled` renders a single-replica RustFS (`templates/rustfs.yaml`, a templated mirror of
-`deploy/rustfs-lab/deployment.yaml`, image pinned to `rustfs/rustfs:1.0.0`) with NodePorts
-`rustfs.server.s3NodePort` (30900) / `consoleNodePort` (30901) and a CORS origin for the console's
-NodePort (browser uploads/downloads go straight to RustFS via presigned URLs, so the S3 port must be
-browser-reachable). `rustfs.server.generateCredentials` creates the `rustfs.credentialsSecret`
-Secret once (`lookup` + `randAlphaNum`, kept across upgrades, `helm.sh/resource-policy: keep`, never
-printed); set it false to supply your own. The gateway gets the endpoint, the credentials Secret name
-and namespace, and the access/secret key env, so bucket create/delete, signed discovery, the console
-self-test and DataBridge object migrations all work. `stateBackup.useRustfs` points the self-state
-backup at it (bucket created on first run). This is a **lab topology** (one volume, not HA) — for
-production point `rustfs.endpoint` at a real multi-drive/multi-node RustFS and leave the server off.
-`helm template` cannot `lookup`, so it renders throwaway credentials; only a real install persists them.
+New buckets default to Ceph RGW (`ceph.enabled=true`, above) via Rook `ObjectBucketClaim`. Atlas is
+not a first-party object-storage product — the generic `atlas-driver-rgw::S3Target` client works
+against any S3-compatible endpoint (MinIO, Garage, AWS, or a customer-run RustFS) by pointing a
+backend's `connection_ref` at a Secret holding its access/secret key; nothing to install through
+this chart. If that endpoint's TLS certificate isn't from a CA already in the system trust store
+(a private CA, or a self-signed cert), set `s3.caSecretName` to a `kubernetes.io/tls` Secret whose
+`tls.crt` the gateway should additionally trust.
 
 ## Raw-disk formatting from the console (`disks.enabled`)
 
@@ -67,29 +56,11 @@ pin the pod with `nodeSelector`, keep `replicaCount: 1` (the template fails othe
 disk-enabled gateway per node. The default image has `zfsutils-linux`; `Dockerfile.ceph` now does too.
 The Ceph-OSD path additionally needs Rook with `ROOK_ENABLE_DISCOVERY_DAEMON`.
 
-### Install-time RustFS-on-a-disk
-
-`--set disks.enabled=true --set disks.autoRustfsDevice=/dev/sdb [--set disks.autoRustfsActivate=true]`
-makes the gateway, on first start, format that one disk as a RustFS drive **only if it is empty** (never a
-wipe), install RustFS from the official chart on it and (optionally) point Atlas at it. The console does
-the same steps on demand: Storage → RustFS → Drives & pools. The chart also renders the
-`atlas-rustfs-installer` ServiceAccount/Role the console's installer Job runs under, and grants the
-gateway read access to Deployments/Services plus `patch` on its **own** Deployment only.
-
-### Upgrading a release installed before the official RustFS chart
-
-The in-chart RustFS server used to be templates of our own (Deployment/Service `rustfs`); it is now
-RustFS's official chart under the `rustfsserver` alias, with different resource names. Both hold the same
-NodePorts, so a single `helm upgrade` fails ("provided port is already allocated"). Upgrade in two steps:
-first `--set rustfs.server.enabled=false` (removes the old server; the credentials Secret and the generated
-auth Secret are kept), then upgrade again with the server enabled. Data on the old chart-managed volume is
-not carried over — copy it first with DataBridge → Object Migrations if you need it. Verified live.
-
 ## Lab side-by-side install
 
 `scripts/helm-lab-remote.sh <host> <user> --set auth.createSecret=true` installs the chart as release
 `atlas-helm` in namespace `atlas-helm` from `values-lab.yaml` (own PVC, console NodePort 30520,
-RustFS 30920/30921, image `localhost/atlas-gateway:dev` already imported by `deploy-remote.sh`) next
+image `localhost/atlas-gateway:dev` already imported by `deploy-remote.sh`) next
 to the raw-manifest gateway. `namespace.create: false` is used there because `--create-namespace`
 already creates the namespace. Cluster-scoped RBAC names include the release namespace, so two
 installs (or the raw manifest's `atlas-gateway-readonly`) do not collide.

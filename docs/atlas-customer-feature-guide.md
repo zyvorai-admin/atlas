@@ -4,9 +4,9 @@
 
 > **The central storage control plane for the Zyvor product suite.**
 
-Atlas lets products ask for intent — "give me production block storage" — instead of wrestling with pool internals, then maps that intent to a real backend through pluggable drivers. It gives you block, file, and object storage from a single gateway, with async provisioning, snapshots, backups, replication, per-tenant governance, and a live console on top. Ceph is the first driver (RBD, CephFS, RGW/S3), with NFS, ZFS, Longhorn, and RustFS backends alongside it and DataBridge adding cloud-to-edge database and object mobility.
+Atlas lets products ask for intent — "give me production block storage" — instead of wrestling with pool internals, then maps that intent to a real backend through pluggable drivers. It gives you block, file, and object storage from a single gateway, with async provisioning, snapshots, backups, replication, per-tenant governance, and a live console on top. Ceph is the first driver (RBD, CephFS, RGW/S3), with NFS, ZFS, and Longhorn backends alongside it and DataBridge adding cloud-to-edge database and object mobility.
 
-**5** Storage backends (Ceph · NFS · ZFS · Longhorn · RustFS) · **6** Database engines migratable via DataBridge · **80+** REST endpoints across the control plane · **3** Access surfaces — REST · gRPC · SSE
+**4** Storage backends (Ceph · NFS · ZFS · Longhorn) · **6** Database engines migratable via DataBridge · **80+** REST endpoints across the control plane · **3** Access surfaces — REST · gRPC · SSE
 
 This is the customer-facing onboarding guide — how to access the product, your first workflows, and how to use every feature. A print-ready PDF of the same content sits alongside this file.
 
@@ -33,7 +33,7 @@ This is the customer-facing onboarding guide — how to access the product, your
 - **CLI:** `atlasctl` headless REST client — `cargo run -p atlasctl -- ` (health, ready, discover, pools, volumes, snapshots, backups, buckets, tenants, tokens, ceph-status …); global flags `--base-url` (`ATLAS_BASE_URL`) and `--token` (`ATLAS_TOKEN`).
 - **API:** REST base `/api/atlas/v1/...` (all JSON); a `tonic` gRPC edge (`atlas.v1.AtlasStorage`) on `ATLAS_GRPC_ADDR` (`:5111`, NodePort 30512) with server-streaming `WatchJob`; async writes return `202 + job_id`, streamable over SSE at `/api/atlas/v1/jobs/{id}/watch`.
 - **Login:** Auth is off by default (dev; actor is `anonymous`). Set `ATLAS_AUTH_REQUIRED=1` to require an HS256 JWT (`Authorization: Bearer `); mint one via `POST /api/atlas/v1/auth/tokens`.
-- **Needs:** A Ceph (RBD/CephFS/RGW), NFS, ZFS, Longhorn, or RustFS backend. For evaluation you need no cluster at all — run the fake driver with `ATLAS_CEPH_DRIVER_MODE=fake` (this is what `make run` does).
+- **Needs:** A Ceph (RBD/CephFS/RGW), NFS, ZFS, or Longhorn backend. For evaluation you need no cluster at all — run the fake driver with `ATLAS_CEPH_DRIVER_MODE=fake` (this is what `make run` does).
 
 **Your first workflows**
 
@@ -54,10 +54,9 @@ This is the customer-facing onboarding guide — how to access the product, your
      same deterministic capacity fixture (8 TB / 30% used) regardless of what server/exports you
      give it — it never actually runs `showmount`/`df` or `zpool list`/`zfs list` against it. Real
      capacity/volume discovery for these two backends is not implemented; only Ceph is backed by
-     the real driver. **RustFS** (the default backend for new buckets) is a mixed case: bucket
-     create/delete and object PUT/GET/DELETE/list/presigned-URLs are real, signed S3 calls — but
-     its `discover`/capacity reporting is still anonymous and fixture-shaped like NFS/ZFS, and
-     bucket `stats` isn't implemented for it yet. **Longhorn** has a real, signed read path (node
+     the real driver. **Object buckets** default to Ceph RGW (via `ObjectBucketClaim`); bucket
+     create/delete and object PUT/GET/DELETE/list/presigned-URLs are real, signed S3 calls against
+     it. **Longhorn** has a real, signed read path (node
      disk capacity, volume health via its Kubernetes CRDs) but no native write path of its own —
      PVC provisioning for it goes through the existing Kubernetes StorageClass path, not this
      driver.
@@ -100,7 +99,7 @@ _Provision and manage RBD block, CephFS file, and RGW/S3 object storage from one
   - **How:** REST `POST /api/atlas/v1/volumes` (`kind: "block"`) → `202 + job_id`; `GET /volumes/{id}`, `DELETE /volumes/{id}`. CLI: `atlasctl create-volume NAME --size-gib 5 --policy database`. Console: Storage Center → Volumes → Create.
 - **CephFS File Shares (RWX)** — Provision shared read-write-many file storage on CephFS for workloads that need concurrent access. — _Multi-writer file storage without standing up a separate NAS._
   - **How:** REST `POST /api/atlas/v1/volumes` with `"policy": "shared"` (recommended — always resolves to CephFS/RWX correctly) or an explicit placement (`kubernetes.storage_class: "zyvor-cephfs-shared"`, `access_mode: ReadWriteMany`, `kind: "filesystem"` — set `kind` explicitly on this path, since it isn't inferred from the storage class). Console: Storage Center → Volumes → Create (File).
-- **Object Buckets** — Create S3 buckets on RustFS (the default backend — a direct signed `CreateBucket` call, no Kubernetes operator involved) or Ceph RGW via `ObjectBucketClaim` (pass `"backend_id": "bkd_ceph_lab"`), with presigned upload/download URLs; per-bucket quotas and stats remain Ceph-only for now. — _Self-service object storage, portable across backends._
+- **Object Buckets** — Create S3 buckets on Ceph RGW (the default backend, via `ObjectBucketClaim`), with presigned upload/download URLs and per-bucket quotas/stats; any other S3-compatible endpoint (MinIO, Garage, AWS, a customer-run RustFS) is usable as a bring-your-own backend. — _Self-service object storage, portable across backends._
   - **How:** REST `POST /api/atlas/v1/buckets` with `{ "name": "...", "max_objects": ..., "max_size": "2G" }`; list `GET /buckets`; usage/quota via `GET /buckets/{id}/stats`. CLI: `atlasctl create-bucket NAME`. Console: Storage Center → Buckets. `name` must be a valid Kubernetes/S3-style name, 3-63 characters (lowercase, `-`/`.`, no uppercase or underscores) — an invalid name is rejected immediately rather than failing after the fact.
 - **Direct RBD Image Ops** — Provision, clone, resize, flatten, snapshot, and roll back RBD images directly, with per-image usage tracking. — _Full low-level control when you need to bypass the PVC abstraction — the only bypass-CSI path in Atlas, for non-Kubernetes consumers like machina/libvirt._
   - **How:** REST `POST /api/atlas/v1/rbd-images {name, size_bytes, pool?}` to create, `.../clone {name, snap?}` for a golden-image copy, `.../resize`, `.../flatten`, `.../snapshots`, `.../rollback`, `DELETE /rbd-images/{pool}/{image}`. Same cordon + quota admission as `POST /volumes`. CLI: `atlasctl create-rbd-image`. Console: Storage Center → Ceph → RBD Images.

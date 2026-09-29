@@ -616,12 +616,10 @@ no model required for the default path. See [AI_ADVISOR.md](AI_ADVISOR.md).
   fake-mode-tested, but the real `rbd mirror` CLI paths need a live second Ceph cluster to be
   production-verified (`dataplane_verified` is hard-coded `false` until that drill runs). See
   [DR.md](DR.md).
-- **RustFS write path unverified against a real RustFS server**: bucket create/delete and object
-  PUT/GET/DELETE/presigned-URLs are implemented and unit-tested against `rusty-s3`'s own signing
-  logic, but never exercised against a live RustFS instance — `CreateBucket`'s missing request
-  body, SigV4 presigned-URL compatibility, and multipart upload are all explicitly flagged as
-  unverified in `docs/RUSTFS.md`. Treat RustFS as the default bucket backend in code, not yet as
-  production-verified.
+- **RustFS removed**: Atlas's first-party RustFS integration (driver, admin proxy, Helm chart,
+  console pages, drive/instance install jobs) was later discarded in favor of Ceph RGW as the
+  default object backend, with any S3-compatible endpoint usable as a bring-your-own backend via
+  `atlas-driver-rgw`. See `docs/RUSTFS.md` and `CHANGELOG.md`.
 - **Raw disk provisioning unverified against real hardware/a real Rook cluster**: the ZFS
   device-safety checks and the Ceph/Rook device-claim path (`docs/DISKS.md`) are fake-mode and
   unit-tested only. The Ceph path's entire safety design further depends on the target Rook

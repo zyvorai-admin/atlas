@@ -15,7 +15,6 @@ use atlas_driver_core::{DriverRegistry, StorageDriver};
 use atlas_driver_k8s::K8sDriver;
 use atlas_driver_longhorn::LonghornDriver;
 use atlas_driver_nfs::{FakeNfsDriver, RealNfsDriver};
-use atlas_driver_rustfs::{FakeRustfsDriver, RealRustfsDriver};
 use atlas_driver_zfs::{FakeZfsDriver, RealZfsDriver};
 
 use crate::state::AppState;
@@ -27,7 +26,8 @@ pub const NFS_BACKEND_ID: &str = "bkd_nfs_lab";
 /// Optional third ZFS backend id (enabled via `ATLAS_ZFS_ENABLE`).
 pub const ZFS_BACKEND_ID: &str = "bkd_zfs_lab";
 pub const LONGHORN_BACKEND_ID: &str = "bkd_longhorn";
-/// Optional fourth RustFS backend id (enabled via `ATLAS_RUSTFS_ENABLE`).
+/// Retired RustFS backend id. Kept so persisted inventory / jobs still parse.
+/// New buckets default to [`CEPH_BACKEND_ID`] (RGW).
 pub const RUSTFS_BACKEND_ID: &str = "bkd_rustfs_lab";
 
 pub struct BuildOptions {
@@ -254,59 +254,15 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
         None
     };
 
-    // Optionally register a fourth RustFS backend — S3-compatible object storage, same
-    // pluggable-driver contract as Ceph/NFS/ZFS.
-    let rustfs_driver: Option<Arc<dyn StorageDriver>> = if config.rustfs_enable {
-        let endpoint = config
-            .rustfs_endpoint
-            .clone()
-            .unwrap_or_else(|| "http://rustfs01.zyvor.lab:9000".into());
-        let rustfs: Arc<dyn StorageDriver> = match config.rustfs_driver_mode {
-            // Real: an empty ATLAS_RUSTFS_BUCKETS means "every bucket the server reports" — the
-            // vm-images/backups names below are fixture data and must never act as an allow-list
-            // that hides real buckets.
-            atlas_common::config::DriverMode::Real => Arc::new(
-                RealRustfsDriver::new(RUSTFS_BACKEND_ID, endpoint, config.rustfs_buckets.clone())
-                    .with_credentials_from_env(),
-            ),
-            atlas_common::config::DriverMode::Fake => {
-                let buckets = if config.rustfs_buckets.is_empty() {
-                    vec!["vm-images".to_string(), "backups".to_string()]
-                } else {
-                    config.rustfs_buckets.clone()
-                };
-                Arc::new(FakeRustfsDriver::new(RUSTFS_BACKEND_ID, endpoint, buckets))
-            }
-        };
-        // The k8s Secret (in ATLAS_RUSTFS_CREDENTIALS_NAMESPACE) holding AWS_ACCESS_KEY_ID /
-        // AWS_SECRET_ACCESS_KEY that the bucket write path resolves at dispatch time. It used to be
-        // registered as None, which made every RustFS bucket create/delete fail with "has no
-        // connection_ref configured".
-        let credentials_secret = std::env::var("ATLAS_RUSTFS_CREDENTIALS_SECRET")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "rustfs-credentials".to_string());
-        let rustfs_backend = StorageBackend {
-            id: RUSTFS_BACKEND_ID.into(),
-            name: "zyvor-rustfs".into(),
-            backend_type: BackendType::Rustfs,
-            mode: BackendMode::External,
-            status: "active".into(),
-            capabilities: Capabilities {
-                object: true,
-                ..Capabilities::default()
-            },
-            connection_ref: Some(credentials_secret),
-            cordoned: false,
-        };
-        atlas_inventory::upsert_backend(&pool, &rustfs_backend).await?;
-        registry.register(rustfs.clone());
-        tracing::info!("rustfs backend registered ({RUSTFS_BACKEND_ID})");
-        Some(rustfs)
-    } else {
-        None
-    };
+    // RustFS is no longer a first-party backend. ATLAS_RUSTFS_* env is ignored.
+    // Object storage defaults to Ceph RGW; operators may still point DataBridge /
+    // state-backup at any S3-compatible endpoint via atlas-driver-rgw.
+    if config.rustfs_enable {
+        tracing::warn!(
+            "ATLAS_RUSTFS_ENABLE is set but the RustFS product driver was removed; \
+             buckets default to {CEPH_BACKEND_ID} (Ceph RGW). Bring your own S3 via RGW helpers."
+        );
+    }
 
     // Attach a live Kubernetes driver if reachable.
     let k8s = if opts.enable_k8s {
@@ -411,12 +367,6 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
                 Err(e) => tracing::warn!("initial zfs discovery failed: {e:#}"),
             }
         }
-        if let Some(rustfs) = &rustfs_driver {
-            match atlas_discovery::run_discovery(&state.pool, rustfs.clone(), None, None).await {
-                Ok(sum) => tracing::info!(?sum, "initial rustfs discovery complete"),
-                Err(e) => tracing::warn!("initial rustfs discovery failed: {e:#}"),
-            }
-        }
         if let Some(longhorn) = &longhorn_driver {
             match atlas_discovery::run_discovery(&state.pool, longhorn.clone(), None, None).await {
                 Ok(sum) => tracing::info!(?sum, "initial longhorn discovery complete"),
@@ -481,9 +431,6 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
         state.config.database_url.clone(),
         state.workers.clone(),
     );
-
-    // Opt-in install-time RustFS-on-a-disk automation (ATLAS_RUSTFS_AUTO_DEVICE); no-op when unset.
-    crate::routes::spawn_rustfs_auto(state.clone());
 
     // Audit retention: prune audit rows older than ATLAS_AUDIT_RETENTION_DAYS (0 = keep forever).
     spawn_audit_retention(state.pool.clone());
@@ -698,8 +645,7 @@ async fn backup_state_once(
             .await
             .context("VACUUM INTO snapshot")?;
     }
-    // RustFS (unlike the RGW user this used to target) has no pre-created bucket: make sure it
-    // exists, so the first backup after repointing the endpoint doesn't fail on a missing bucket.
+    // Ensure the destination bucket exists so the first backup does not fail on a missing name.
     if !s3.bucket_exists().await {
         s3.create_bucket()
             .await

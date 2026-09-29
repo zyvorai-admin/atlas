@@ -1,8 +1,7 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
-// Object-storage migration (the DataBridge object leg): copy one S3 bucket into another — RustFS by
-// default. Either side can be an Atlas backend (RustFS), in which case the endpoint and the
-// credentials Secret are filled in server-side and no key is ever typed here.
+// Object-storage migration (the DataBridge object leg): copy one S3 bucket into another.
+// Either side can be an Atlas Ceph RGW backend or an external S3 endpoint.
 import { useState } from "react";
 import { Play, Plus } from "lucide-react";
 import { apiError, http, submit, submitJob, toast } from "../../api/client";
@@ -27,9 +26,9 @@ export default function ObjectMigrations() {
   const [create, setCreate] = useState(false);
   const n = data?.length || 0;
 
-  const rustfs = (backends || []).find((b) => b.backend_type === "rustfs");
+  const ceph = (backends || []).find((b) => b.backend_type === "ceph");
   const sideOptions = [
-    ...(rustfs ? [{ value: rustfs.id, label: `RustFS (${rustfs.id})` }] : []),
+    ...(ceph ? [{ value: ceph.id, label: `Ceph RGW (${ceph.id})` }] : []),
     { value: EXTERNAL, label: "External S3 endpoint" },
   ];
 
@@ -83,7 +82,7 @@ export default function ObjectMigrations() {
       state={
         n
           ? `${n} object migration${n === 1 ? "" : "s"} — bucket-to-bucket copy, multipart, SHA-256 verified.`
-          : "No object migrations yet. Copy a bucket into RustFS."
+          : "No object migrations yet. Copy a bucket into Ceph RGW or another S3-compatible destination."
       }
       actions={
         <button type="button" className="at-btn primary" onClick={() => setCreate(true)}>

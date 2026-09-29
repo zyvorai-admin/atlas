@@ -541,8 +541,12 @@ pub(crate) struct CreateObjectMigrationBody {
     source_prefix: Option<String>,
     /// k8s Secret {access_key,secret_key} for the source; never the creds themselves.
     source_secret_ref: Option<String>,
-    /// Use an Atlas object backend (RustFS) as the source: its endpoint, credentials Secret and
-    /// Secret namespace are filled in server-side, so no endpoint or key is ever typed.
+    /// Retired: auto-filling source_endpoint/source_secret_ref from a backend id only ever worked
+    /// for RustFS's flat, gateway-level endpoint+credential config, which the default Ceph RGW
+    /// backend has no equivalent of (each bucket gets its own endpoint/Secret from its own
+    /// ObjectBucketClaim). Pass source_endpoint/source_secret_ref explicitly instead. Kept on the
+    /// wire (rejected with a clear error if set) so older clients get an actionable message rather
+    /// than a silently-wrong migration.
     #[serde(default)]
     source_backend_id: Option<String>,
     #[serde(default)]
@@ -553,7 +557,7 @@ pub(crate) struct CreateObjectMigrationBody {
     dest_region: Option<String>,
     dest_bucket: String,
     dest_secret_ref: Option<String>,
-    /// Same as `source_backend_id`, for the destination.
+    /// Retired: see `source_backend_id`.
     #[serde(default)]
     dest_backend_id: Option<String>,
     #[serde(default)]
@@ -576,44 +580,22 @@ pub(crate) async fn db_object_create(
     Json(body): Json<CreateObjectMigrationBody>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_OPERATOR)?;
-    let mut body = body;
     if body.name.trim().is_empty() {
         return Err(AppError::Validation("name is required".into()));
     }
-    // A backend id resolves endpoint + credentials Secret from the gateway's own RustFS config.
-    let mut backend_secret_namespace = None;
+    // source_backend_id/dest_backend_id used to auto-fill endpoint+credentials from the gateway's
+    // flat RustFS config; there is no equivalent for Ceph RGW (each bucket has its own
+    // ObjectBucketClaim-issued endpoint/Secret), so this shortcut is retired — reject it with a
+    // clear message rather than silently resolving nothing.
     for (which, backend_id) in [
-        ("source", body.source_backend_id.clone()),
-        ("dest", body.dest_backend_id.clone()),
+        ("source", &body.source_backend_id),
+        ("dest", &body.dest_backend_id),
     ] {
-        let Some(backend_id) = backend_id.filter(|b| !b.trim().is_empty()) else {
-            continue;
-        };
-        if backend_id != crate::startup::RUSTFS_BACKEND_ID || !s.config.rustfs_enable {
+        if backend_id.as_deref().is_some_and(|b| !b.trim().is_empty()) {
             return Err(AppError::Validation(format!(
-                "{which}_backend_id must be the enabled RustFS backend"
+                "{which}_backend_id is retired; pass {which}_endpoint and {which}_secret_ref explicitly"
             )));
         }
-        let endpoint = s.config.rustfs_endpoint.clone().ok_or_else(|| {
-            AppError::Unavailable("ATLAS_RUSTFS_ENDPOINT is not configured".into())
-        })?;
-        let secret = std::env::var("ATLAS_RUSTFS_CREDENTIALS_SECRET")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                AppError::Unavailable("ATLAS_RUSTFS_CREDENTIALS_SECRET is not configured".into())
-            })?;
-        if which == "source" {
-            body.source_endpoint = endpoint;
-            body.source_secret_ref = Some(secret);
-        } else {
-            body.dest_endpoint = endpoint;
-            body.dest_secret_ref = Some(secret);
-        }
-        backend_secret_namespace = Some(s.config.rustfs_credentials_namespace.clone());
-    }
-    if body.secret_namespace.is_none() {
-        body.secret_namespace = backend_secret_namespace;
     }
     if body.source_endpoint.trim().is_empty() || body.dest_endpoint.trim().is_empty() {
         return Err(AppError::Validation(

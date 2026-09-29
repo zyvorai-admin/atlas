@@ -19,3 +19,4 @@ hex = "0.4"
 rusty-s3 = { version = "0.10", features = ["full"] }
 url = "2"
 percent-encoding = "2"
+jiff = { workspace = true }

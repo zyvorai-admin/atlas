@@ -19,17 +19,14 @@ export default function Buckets() {
   const inv = useInvalidate();
   const refetch = () => inv("buckets", "summary");
   const [create, setCreate] = useState(false);
-  const [selftest, setSelftest] = useState(false);
   const [objBucket, setObjBucket] = useState<StorageBucket | null>(null);
   const [settingsBucket, setSettingsBucket] = useState<StorageBucket | null>(null);
   const n = data?.length || 0;
 
   // NB: /backends records are keyed `id` (only /backends/summary uses `backend_id`).
-  // Backends that can host buckets, RustFS first (it's the default object backend for new buckets).
-  const objectBackends = (backends || [])
-    .filter((b) => b.backend_type === "rustfs" || b.backend_type === "ceph")
-    .sort((a, b) => Number(b.backend_type === "rustfs") - Number(a.backend_type === "rustfs"));
-  const backendLabel = (t?: string) => (t === "rustfs" ? "RustFS" : t === "ceph" ? "Ceph RGW" : t || "?");
+  // Object backends: Ceph RGW is the default. Retired `rustfs` rows stay visible as labels only.
+  const objectBackends = (backends || []).filter((b) => b.backend_type === "ceph");
+  const backendLabel = (t?: string) => (t === "ceph" ? "Ceph RGW" : t === "rustfs" ? "RustFS (retired)" : t || "?");
   // Legacy bucket rows (created before backend_id was recorded) are Ceph RGW.
   const bucketBackend = (b: StorageBucket) => {
     if (!b.backend_id) return "Ceph RGW";
@@ -44,34 +41,11 @@ export default function Buckets() {
       title="Buckets"
       state={
         n
-          ? `${n} bucket${n === 1 ? "" : "s"} across RustFS and Ceph RGW — stats, browse / upload / download.`
+          ? `${n} bucket${n === 1 ? "" : "s"} on Ceph RGW — stats, browse / upload / download.`
           : "No buckets yet. Create the first bucket to begin exports and backups."
       }
       actions={
         <>
-          {objectBackends.some((b) => b.backend_type === "rustfs") && (
-            <>
-              <button
-                type="button"
-                className="at-btn"
-                title="Adopt every bucket the RustFS server reports (e.g. buckets copied by an object migration) and re-point known ones at the current server"
-                onClick={async () => {
-                  try {
-                    const { data: r } = await http.post("/rustfs/buckets/import");
-                    toast(`RustFS import: ${r.created} added, ${r.updated} re-pointed`, "ok");
-                    refetch();
-                  } catch (e) {
-                    toast(`RustFS import: ${apiError(e)}`, "err");
-                  }
-                }}
-              >
-                Import from RustFS
-              </button>
-              <button type="button" className="at-btn" onClick={() => setSelftest(true)}>
-                RustFS self-test
-              </button>
-            </>
-          )}
           <button type="button" className="at-btn primary" onClick={() => setCreate(true)}>
             <Plus size={14} /> Bucket
           </button>
@@ -118,40 +92,9 @@ export default function Buckets() {
               }
             }}>Stats</Button>
             <Button size="sm" onClick={() => setObjBucket(b)}>Objects</Button>
-            {bucketBackend(b) === "RustFS" && <Button size="sm" onClick={() => setSettingsBucket(b)}>Settings</Button>}
             <Button size="sm" variant="danger" onClick={() => del(`bucket ${b.bucket_name || b.name || b.id}`, () => submitJob("delete", `/buckets/${b.id}?force=true`, null, "delete bucket", refetch))}>Del</Button>
           </>
         )}
-      />
-
-      <FormModal
-        open={selftest}
-        onClose={() => setSelftest(false)}
-        title="RustFS self-test"
-        submitLabel="Run self-test"
-        fields={[
-          {
-            name: "region",
-            label: "Region (optional)",
-            optional: true,
-            placeholder: "us-east-1",
-            hint:
-              "Runs against a throwaway bucket on the live server: create, put/get, 11 MiB multipart " +
-              "upload, listing, versioned-key prune, non-empty-bucket delete refusal, delete. Per-step " +
-              "results are in the job's output (Jobs page).",
-          },
-        ]}
-        onSubmit={async (v) => {
-          const rustfs = objectBackends.find((b) => b.backend_type === "rustfs");
-          if (!rustfs) return;
-          await submitJob(
-            "post",
-            `/backends/${rustfs.id}/selftest`,
-            { region: (v.region || "").trim() },
-            "RustFS self-test",
-            () => inv("jobs", "buckets", "summary"),
-          );
-        }}
       />
 
       <FormModal open={create} onClose={() => setCreate(false)} title="Create bucket" submitLabel="Create"
@@ -170,25 +113,14 @@ export default function Buckets() {
               hint: "3-63 chars: lowercase letters, digits, dots, hyphens (S3 bucket naming rules).",
             },
           ];
-          // Ceph RGW buckets are provisioned via a Rook ObjectBucketClaim (namespace + optional RGW
-          // quotas); RustFS buckets are a plain S3 CreateBucket — none of those apply.
+          // Ceph RGW buckets are provisioned via a Rook ObjectBucketClaim (namespace + optional
+          // quotas).
           if (selType === "ceph") {
             out.push(
               { name: "namespace", label: "Namespace", value: "rook-ceph" },
               { name: "max_objects", label: "Max objects (optional)", type: "number", optional: true, min: 0 },
               { name: "max_size", label: "Max size (e.g. 2G, optional)", optional: true },
             );
-          }
-          if (selType === "rustfs") {
-            out.push({
-              name: "object_lock",
-              label: "Object Lock (WORM)",
-              options: [
-                { value: "off", label: "Off (default)" },
-                { value: "on", label: "Enabled — cannot be turned on later" },
-              ],
-              hint: "Versioned, write-once-read-many retention. Only settable at creation; configure default retention after creating the bucket (Settings → Object Lock).",
-            });
           }
           return out;
         }}
@@ -200,8 +132,6 @@ export default function Buckets() {
             body.namespace = v.namespace;
             if (v.max_objects) body.max_objects = +v.max_objects;
             if (v.max_size) body.max_size = v.max_size;
-          } else if (v.object_lock === "on") {
-            body.object_lock = true;
           }
           return submitJob("post", "/buckets", body, "bucket", refetch);
         }} />

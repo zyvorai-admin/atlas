@@ -9,6 +9,12 @@ before `0.2.0` were not tracked here — see `git log` for that history.
 
 ## [Unreleased]
 
+### Removed
+- First-party **RustFS** product integration: `atlas-driver-rustfs`, Storage → RustFS console,
+  `/rustfs/*` admin proxy, drive/instance jobs, vendored Helm subchart, and `deploy/rustfs-lab`.
+  Object storage now defaults to Ceph RGW (`bkd_ceph_lab`). Bring-your-own S3 remains via
+  `atlas-driver-rgw`. See `docs/RUSTFS.md`.
+
 ### Changed
 - Relicensed from the Zyvor Production License v1.0 to the **Apache License, Version 2.0**
   ([LICENSE](LICENSE), SPDX `Apache-2.0`): use, modification and redistribution — including production,

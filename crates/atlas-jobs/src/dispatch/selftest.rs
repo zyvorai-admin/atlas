@@ -1,6 +1,6 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
-//! Conformance self-test for an S3-compatible backend (RustFS). Runs the operations Atlas's real
+//! Conformance self-test for an S3-compatible backend (Ceph RGW or BYO S3). Runs the operations Atlas's real
 //! workloads depend on — bucket create/delete, small and multipart object upload, streaming
 //! download, prefix listing and key-suffix "versioned" retention — against a throwaway bucket on
 //! the live server, so they are verified through the console rather than trusted from unit tests.
@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use sqlx::AnyPool;
 
 use super::helpers::{build_s3_target_for_backend, sha256_hex};
-use super::object::rustfs_endpoint;
+use super::object::s3_endpoint;
 use crate::spec::JobSpec;
 
 struct Steps(Vec<Value>);
@@ -61,7 +61,7 @@ pub(crate) async fn dispatch_selftest(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let bucket = format!("atlas-selftest-{:x}", nanos & 0xffff_ffff_ffff);
-    let endpoint = rustfs_endpoint();
+    let endpoint = s3_endpoint();
     let (s3, _) = build_s3_target_for_backend(
         k8s,
         pool,

@@ -1,9 +1,10 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
-// Per-bucket settings for RustFS buckets: versioning, lifecycle, access policy, quota and object
-// versions. Every call goes through the gateway's allow-listed RustFS proxy
-// (`/rustfs/proxy/s3/{bucket}?<sub-resource>` and `/rustfs/proxy/admin/v3/quota/{bucket}`), which
-// signs the request and returns RustFS's own XML/JSON verbatim — parsed here, not re-declared.
+// Per-bucket settings: versioning, lifecycle, access policy, and object versions. Every call goes
+// through the gateway's generic bucket-subresource proxy (`/buckets/{id}/subresource?<name>`),
+// which signs the request against whichever backend owns the bucket (Ceph RGW, or any
+// bring-your-own S3 endpoint) and returns its XML/JSON verbatim — parsed here, not re-declared.
+// Quota is Ceph-specific (set at bucket-create time; see the Buckets page) and not shown here.
 import { useCallback, useEffect, useState } from "react";
 import { apiError, http, toast } from "../api/client";
 import type { StorageBucket } from "../api/types";
@@ -12,7 +13,7 @@ import { Table } from "../ui/Table";
 import { fmtBytes } from "../lib/format";
 
 const S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/";
-const TABS = ["Versioning", "Object Lock", "Lifecycle", "Access", "Quota", "Versions"] as const;
+const TABS = ["Versioning", "Object Lock", "Lifecycle", "Access", "Versions"] as const;
 type TabName = (typeof TABS)[number];
 
 interface Raw {
@@ -48,8 +49,7 @@ function errText(r: Raw): string {
   }
 }
 
-const s3Url = (bucket: string, sub: string) => `/rustfs/proxy/s3/${encodeURIComponent(bucket)}?${sub}`;
-const quotaUrl = (bucket: string) => `/rustfs/proxy/admin/v3/quota/${encodeURIComponent(bucket)}`;
+const s3Url = (id: string, sub: string) => `/buckets/${encodeURIComponent(id)}/subresource?${sub}`;
 
 function parseXml(text: string): Document {
   return new DOMParser().parseFromString(text, "application/xml");
@@ -105,23 +105,24 @@ export const buildLifecycle = (rules: string[]) =>
 export default function BucketSettings({ bucket, onClose }: { bucket: StorageBucket | null; onClose: () => void }) {
   const [tab, setTab] = useState<TabName>("Versioning");
   const [versioning, setVersioning] = useState<string | null>(null);
+  const id = bucket ? bucket.id : "";
   const name = bucket ? bucket.bucket_name || bucket.name || bucket.id : "";
 
   const loadVersioning = useCallback(async () => {
-    if (!name) return;
+    if (!id) return;
     try {
-      const r = await call("GET", s3Url(name, "versioning"));
+      const r = await call("GET", s3Url(id, "versioning"));
       setVersioning(ok(r) ? firstText(parseXml(r.text), "Status") || "Unversioned" : "Unknown");
     } catch (e) {
       setVersioning("Unknown");
       toast(`versioning: ${apiError(e)}`, "err");
     }
-  }, [name]);
+  }, [id]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
-    if (name) loadVersioning();
-  }, [name, loadVersioning]);
+    if (id) loadVersioning();
+  }, [id, loadVersioning]);
 
   if (!bucket) return null;
   const tabs = TABS.filter((t) => t !== "Versions" || versioning === "Enabled" || versioning === "Suspended");
@@ -134,25 +135,24 @@ export default function BucketSettings({ bucket, onClose }: { bucket: StorageBuc
   return (
     <SlideOver open={!!bucket} onClose={close} title={<span className="mono">{name} · settings</span>} width={620}>
       <Tabs tabs={[...tabs]} value={tabs.includes(tab) ? tab : "Versioning"} onChange={(t) => setTab(t as TabName)} />
-      {tab === "Versioning" && <VersioningTab bucket={name} status={versioning} onChanged={loadVersioning} />}
-      {tab === "Object Lock" && <ObjectLockTab bucket={name} />}
-      {tab === "Lifecycle" && <LifecycleTab bucket={name} />}
-      {tab === "Access" && <AccessTab bucket={name} />}
-      {tab === "Quota" && <QuotaTab bucket={name} />}
-      {tab === "Versions" && <VersionsTab bucket={name} />}
+      {tab === "Versioning" && <VersioningTab id={id} status={versioning} onChanged={loadVersioning} />}
+      {tab === "Object Lock" && <ObjectLockTab id={id} />}
+      {tab === "Lifecycle" && <LifecycleTab bucketId={id} />}
+      {tab === "Access" && <AccessTab id={id} bucket={name} />}
+      {tab === "Versions" && <VersionsTab id={id} />}
     </SlideOver>
   );
 }
 
 // ---------------------------------------------------------------- versioning
 
-function VersioningTab({ bucket, status, onChanged }: { bucket: string; status: string | null; onChanged: () => void }) {
+function VersioningTab({ id, status, onChanged }: { id: string; status: string | null; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
   const set = async (next: "Enabled" | "Suspended") => {
     setBusy(true);
     try {
       const body = `<VersioningConfiguration xmlns="${S3_NS}"><Status>${next}</Status></VersioningConfiguration>`;
-      const r = await call("PUT", s3Url(bucket, "versioning"), body, "application/xml");
+      const r = await call("PUT", s3Url(id, "versioning"), body, "application/xml");
       if (!ok(r)) throw new Error(errText(r));
       toast(`versioning ${next.toLowerCase()}`, "ok");
       onChanged();
@@ -188,7 +188,7 @@ function VersioningTab({ bucket, status, onChanged }: { bucket: string; status: 
 
 // ---------------------------------------------------------------- object lock
 
-function ObjectLockTab({ bucket }: { bucket: string }) {
+function ObjectLockTab({ id }: { id: string }) {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [mode, setMode] = useState("GOVERNANCE");
   const [days, setDays] = useState("");
@@ -196,8 +196,8 @@ function ObjectLockTab({ bucket }: { bucket: string }) {
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    if (!bucket) return;
-    const r = await call("GET", s3Url(bucket, "object-lock"));
+    if (!id) return;
+    const r = await call("GET", s3Url(id, "object-lock"));
     if (!ok(r)) {
       setEnabled(false);
       setError(null);
@@ -209,12 +209,12 @@ function ObjectLockTab({ bucket }: { bucket: string }) {
     setMode(firstText(doc, "Mode") || "GOVERNANCE");
     setDays(firstText(doc, "Days"));
     setError(null);
-  }, [bucket]);
+  }, [id]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();
-  }, [bucket, load]);
+  }, [id, load]);
 
   const save = async (clearRule: boolean) => {
     setBusy(true);
@@ -223,7 +223,7 @@ function ObjectLockTab({ bucket }: { bucket: string }) {
         ? `<Rule><DefaultRetention><Mode>${mode}</Mode><Days>${escapeXml(days.trim())}</Days></DefaultRetention></Rule>`
         : "";
     const body = `<ObjectLockConfiguration xmlns="${S3_NS}"><ObjectLockEnabled>Enabled</ObjectLockEnabled>${rule}</ObjectLockConfiguration>`;
-    const r = await call("PUT", s3Url(bucket, "object-lock"), body, "application/xml");
+    const r = await call("PUT", s3Url(id, "object-lock"), body, "application/xml");
     setBusy(false);
     if (ok(r)) {
       toast(clearRule ? "default retention cleared" : "default retention set", "ok");
@@ -282,7 +282,7 @@ function ObjectLockTab({ bucket }: { bucket: string }) {
 
 // ---------------------------------------------------------------- lifecycle
 
-function LifecycleTab({ bucket }: { bucket: string }) {
+function LifecycleTab({ bucketId }: { bucketId: string }) {
   const [rules, setRules] = useState<LifecycleRule[] | null>(null);
   const [id, setId] = useState("");
   const [prefix, setPrefix] = useState("");
@@ -292,14 +292,14 @@ function LifecycleTab({ bucket }: { bucket: string }) {
 
   const load = useCallback(async () => {
     try {
-      const r = await call("GET", s3Url(bucket, "lifecycle"));
+      const r = await call("GET", s3Url(bucketId, "lifecycle"));
       setRules(ok(r) ? parseLifecycle(r.text) : []);
       if (!ok(r) && r.status !== 404) toast(`lifecycle: ${errText(r)}`, "err");
     } catch (e) {
       setRules([]);
       toast(`lifecycle: ${apiError(e)}`, "err");
     }
-  }, [bucket]);
+  }, [bucketId]);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();
@@ -309,8 +309,8 @@ function LifecycleTab({ bucket }: { bucket: string }) {
     setBusy(true);
     try {
       const r = next.length
-        ? await call("PUT", s3Url(bucket, "lifecycle"), buildLifecycle(next.map((x) => x.raw)), "application/xml")
-        : await call("DELETE", s3Url(bucket, "lifecycle"));
+        ? await call("PUT", s3Url(bucketId, "lifecycle"), buildLifecycle(next.map((x) => x.raw)), "application/xml")
+        : await call("DELETE", s3Url(bucketId, "lifecycle"));
       if (!ok(r) && r.status !== 404) throw new Error(errText(r));
       toast("lifecycle saved", "ok");
       await load();
@@ -413,7 +413,7 @@ function isPublicRead(policyText: string): boolean {
   }
 }
 
-function AccessTab({ bucket }: { bucket: string }) {
+function AccessTab({ id, bucket }: { id: string; bucket: string }) {
   const [text, setText] = useState("");
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [confirmPublic, setConfirmPublic] = useState(false);
@@ -421,7 +421,7 @@ function AccessTab({ bucket }: { bucket: string }) {
 
   const load = useCallback(async () => {
     try {
-      const r = await call("GET", s3Url(bucket, "policy"));
+      const r = await call("GET", s3Url(id, "policy"));
       if (ok(r)) {
         setConfigured(true);
         try {
@@ -438,7 +438,7 @@ function AccessTab({ bucket }: { bucket: string }) {
       setConfigured(false);
       toast(`policy: ${apiError(e)}`, "err");
     }
-  }, [bucket]);
+  }, [id]);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();
@@ -448,7 +448,7 @@ function AccessTab({ bucket }: { bucket: string }) {
     setBusy(true);
     try {
       JSON.parse(json);
-      const r = await call("PUT", s3Url(bucket, "policy"), json, "application/json");
+      const r = await call("PUT", s3Url(id, "policy"), json, "application/json");
       if (!ok(r)) throw new Error(errText(r));
       toast("policy applied", "ok");
       setConfirmPublic(false);
@@ -462,7 +462,7 @@ function AccessTab({ bucket }: { bucket: string }) {
   const makePrivate = async () => {
     setBusy(true);
     try {
-      const r = await call("DELETE", s3Url(bucket, "policy"));
+      const r = await call("DELETE", s3Url(id, "policy"));
       if (!ok(r) && r.status !== 404) throw new Error(errText(r));
       toast("bucket is private", "ok");
       await load();
@@ -509,100 +509,6 @@ function AccessTab({ bucket }: { bucket: string }) {
   );
 }
 
-// ---------------------------------------------------------------- quota
-
-interface QuotaInfo {
-  quota?: number | null;
-  quota_type?: string;
-}
-interface QuotaStats {
-  quota_limit?: number | null;
-  current_usage?: number;
-  remaining_quota?: number | null;
-  usage_percentage?: number | null;
-}
-
-function QuotaTab({ bucket }: { bucket: string }) {
-  const [quota, setQuota] = useState<QuotaInfo | null>(null);
-  const [stats, setStats] = useState<QuotaStats | null>(null);
-  const [gb, setGb] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      const q = await call("GET", quotaUrl(bucket));
-      setQuota(ok(q) ? (JSON.parse(q.text) as QuotaInfo) : {});
-      const s = await call("GET", `/rustfs/proxy/admin/v3/quota-stats/${encodeURIComponent(bucket)}`);
-      setStats(ok(s) ? (JSON.parse(s.text) as QuotaStats) : null);
-    } catch (e) {
-      setQuota({});
-      toast(`quota: ${apiError(e)}`, "err");
-    }
-  }, [bucket]);
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
-    load();
-  }, [load]);
-
-  const set = async () => {
-    const n = Number(gb);
-    if (!(n > 0)) {
-      toast("enter a quota in GB (> 0)", "err");
-      return;
-    }
-    setBusy(true);
-    try {
-      const r = await call("PUT", quotaUrl(bucket), JSON.stringify({ quota: Math.round(n * 1024 ** 3), quota_type: "HARD" }), "application/json");
-      if (!ok(r)) throw new Error(errText(r));
-      toast("quota set", "ok");
-      setGb("");
-      await load();
-    } catch (e) {
-      toast(`quota: ${e instanceof Error ? e.message : String(e)}`, "err");
-    } finally {
-      setBusy(false);
-    }
-  };
-  const clear = async () => {
-    setBusy(true);
-    try {
-      const r = await call("DELETE", quotaUrl(bucket));
-      if (!ok(r)) throw new Error(errText(r));
-      toast("quota cleared", "ok");
-      await load();
-    } catch (e) {
-      toast(`quota: ${e instanceof Error ? e.message : String(e)}`, "err");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const limit = quota?.quota ?? stats?.quota_limit ?? null;
-  return (
-    <div>
-      <p className="mb-2">
-        Hard quota: <b>{limit ? fmtBytes(limit) : "none"}</b>
-      </p>
-      {stats && (
-        <p className="mb-3" style={{ color: "var(--at-ink-4)" }}>
-          Used {fmtBytes(stats.current_usage ?? 0)}
-          {stats.usage_percentage != null ? ` (${stats.usage_percentage.toFixed(1)}%)` : ""}
-          {stats.remaining_quota != null ? ` · ${fmtBytes(stats.remaining_quota)} remaining` : ""}
-        </p>
-      )}
-      <div className="flex gap-2 items-center">
-        <input className="field" style={{ width: 160 }} type="number" min={0} step="any" placeholder="quota (GB)" value={gb} onChange={(e) => setGb(e.target.value)} />
-        <Button variant="primary" loading={busy} onClick={set}>
-          Set quota
-        </Button>
-        <Button variant="danger" loading={busy} disabled={!limit} onClick={clear}>
-          Clear
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------- versions
 
 interface ObjectVersion {
@@ -640,18 +546,18 @@ export function parseVersions(text: string): ObjectVersion[] {
   return rows.sort((a, b) => a.key.localeCompare(b.key) || b.lastModified.localeCompare(a.lastModified));
 }
 
-function VersionsTab({ bucket }: { bucket: string }) {
+function VersionsTab({ id }: { id: string }) {
   const [rows, setRows] = useState<ObjectVersion[] | null>(null);
   const load = useCallback(async () => {
     try {
-      const r = await call("GET", s3Url(bucket, "versions"));
+      const r = await call("GET", s3Url(id, "versions"));
       if (!ok(r)) throw new Error(errText(r));
       setRows(parseVersions(r.text));
     } catch (e) {
       setRows([]);
       toast(`versions: ${e instanceof Error ? e.message : String(e)}`, "err");
     }
-  }, [bucket]);
+  }, [id]);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();

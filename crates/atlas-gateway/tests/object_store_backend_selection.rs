@@ -1,9 +1,8 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
-//! `POST /buckets` backend selection: RustFS is the default when `backend_id` is omitted;
-//! `"backend_id": "bkd_ceph_lab"` keeps the original Rook/RGW path working unchanged. No real k8s
-//! cluster is attached in these tests, so every job below reaches a clean `failed` state (never a
-//! fabricated success) — this suite is about which *path* got enqueued, not live provisioning.
+//! `POST /buckets` backend selection: Ceph RGW (`bkd_ceph_lab`) is the default when `backend_id`
+//! is omitted. The retired RustFS backend id is rejected. No real k8s cluster is attached, so
+//! Ceph jobs reach a clean `failed` state (never a fabricated success).
 
 use std::net::SocketAddr;
 
@@ -102,7 +101,7 @@ async fn poll_job_to_terminal(base: &str, job_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn create_bucket_defaults_to_rustfs_when_backend_id_omitted() {
+async fn create_bucket_defaults_to_ceph_rgw_when_backend_id_omitted() {
     let base = format!("http://{}/api/atlas/v1", spawn().await);
     let c = reqwest::Client::new();
     let resp = c
@@ -113,11 +112,10 @@ async fn create_bucket_defaults_to_rustfs_when_backend_id_omitted() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
     let accepted: Value = resp.json().await.unwrap();
-    assert_eq!(accepted["resource"]["backend_id"], "bkd_rustfs_lab");
+    assert_eq!(accepted["resource"]["backend_id"], "bkd_ceph_lab");
     let job_id = accepted["job_id"].as_str().unwrap().to_string();
 
-    // No k8s attached — the RustFS path also needs a k8s client to read the credentials Secret,
-    // so this must fail cleanly, never fabricate a bound bucket.
+    // No k8s attached — the OBC path needs a cluster, so this must fail cleanly.
     let job = poll_job_to_terminal(&base, &job_id).await;
     assert_eq!(job["state"], "failed", "job: {job}");
 }
@@ -155,6 +153,20 @@ async fn create_bucket_unknown_backend_id_is_rejected() {
 }
 
 #[tokio::test]
+async fn create_bucket_retired_rustfs_backend_id_is_rejected() {
+    let base = format!("http://{}/api/atlas/v1", spawn().await);
+    let c = reqwest::Client::new();
+    let resp = c
+        .post(format!("{base}/buckets"))
+        .json(&json!({ "name": "legacy-rustfs-bucket", "backend_id": "bkd_rustfs_lab" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore = "RustFS product driver removed; kept so the old name does not collide"]
 async fn create_bucket_rustfs_default_requires_the_backend_to_be_enabled() {
     // Same as `spawn()` but with rustfs_enable: false — the default backend picks RustFS, but
     // since it isn't enabled the route must refuse cleanly rather than enqueue a doomed job.

@@ -12,7 +12,7 @@
 ### Storage, as a product.
 
 The **central storage control plane** for the Zyvor suite.<br>
-Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS, Longhorn and RustFS through pluggable drivers.
+Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS and Longhorn through pluggable drivers. Object storage defaults to Ceph RGW; any S3-compatible endpoint is usable via the generic RGW client.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/zyvorai/atlas/ci.yml?branch=main&style=flat-square&labelColor=1d1d1f&label=CI)](https://github.com/zyvorai/atlas/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-0071e3?style=flat-square&labelColor=1d1d1f)](LICENSE)
@@ -27,7 +27,7 @@ Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS, Longhorn a
 
 ---
 
-**5** storage backends · **6** database engines migratable via DataBridge · **80+** REST endpoints · **3** access surfaces (REST · gRPC · SSE)
+**4** storage backends · **6** database engines migratable via DataBridge · **80+** REST endpoints · **3** access surfaces (REST · gRPC · SSE)
 
 A gateway with an Apple Shop console for operators. Read the [full docs](https://zyvorai.github.io/atlas/): quickstart, architecture, licensing.
 
@@ -72,11 +72,11 @@ More: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) · [docs/DEPLOYMENT.md]
 <tr>
 <td valign="top" width="33%">
 <b>Intent to storage</b><br>
-Volumes, snapshots, clones, CephFS RWX and S3 buckets via REST + gRPC. RustFS is the default object backend; Ceph RGW is explicitly selectable via <code>backend_id</code>.
+Volumes, snapshots, clones, CephFS RWX and S3 buckets via REST + gRPC. Ceph RGW is the default object backend.
 </td>
 <td valign="top" width="33%">
 <b>Pluggable drivers</b><br>
-Real Ceph first; NFS, ZFS, Longhorn and RustFS; a fake driver for the local demo.
+Real Ceph first; NFS, ZFS and Longhorn; a fake driver for the local demo. Generic S3 via <code>atlas-driver-rgw</code>.
 </td>
 <td valign="top" width="33%">
 <b>DataBridge</b><br>
@@ -135,7 +135,6 @@ flowchart LR
   Driver --> NFS[("NFS")]
   Driver --> ZFS[("ZFS")]
   Driver --> Longhorn[("Longhorn")]
-  Driver --> RustFS[("RustFS")]
   Atlas --> DataBridge["DataBridge"]
   DataBridge --> Edge[("Edge DB on Ceph\nPostgres · MySQL · MariaDB\nOracle · SQL Server · MongoDB")]
 ```

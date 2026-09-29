@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Lab values: a side-by-side Helm install next to the raw-manifest gateway (deploy/k8s/atlas-gateway.yaml)
 # on a single k3s host, using the locally imported image. Own namespace, own NodePorts, so it does not
-# collide with the zyvor-system gateway (30510) or its RustFS (30900/30901). Used by
-# scripts/helm-lab-remote.sh; adjust NodePorts if those are taken.
+# collide with the zyvor-system gateway (30510). Used by scripts/helm-lab-remote.sh; adjust NodePorts
+# if those are taken.
 #
 # NOTE disks.enabled: two privileged, disk-enabled gateways on one node both see the same physical
 # disks. Only let ONE of them own a pool at a time (destroy it in one console before formatting in the
@@ -20,30 +20,6 @@ namespace:
 
 service:
   httpNodePort: 30520
-
-rustfs:
-  enabled: true
-  driverMode: real
-  server:
-    enabled: true
-
-rustfsserver:
-  service:
-    endpoint:
-      nodePort: 30920
-    console:
-      nodePort: 30921
-  extraEnv:
-    - name: NODE_IP
-      valueFrom:
-        fieldRef:
-          fieldPath: status.hostIP
-    - name: RUSTFS_CORS_ALLOWED_ORIGINS
-      value: "http://$(NODE_IP):30520"
-
-stateBackup:
-  enabled: true
-  useRustfs: true
 
 disks:
   enabled: true

@@ -43,13 +43,6 @@ Database: SQLite on a ReadWriteOnce PVC, single replica, Recreate rollout. Set
 database.kind=postgres (see README.md) to run multiple replicas.
 {{- end }}
 
-{{- if and .Values.rustfs.enabled .Values.rustfs.server.enabled }}
-
-RustFS server: S3 API NodePort {{ .Values.rustfs.server.s3NodePort }}, web console NodePort {{ .Values.rustfs.server.consoleNodePort }}.
-Credentials live only in Secret {{ .Values.rustfs.credentialsSecret }} (keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY),
-generated once and kept on upgrade. This is a single-volume lab topology, not HA.
-{{- end }}
-
 {{- if .Values.disks.enabled }}
 
 WARNING: disks.enabled runs the gateway PRIVILEGED with hostPath /dev, /run/udev and /proc/1/mountinfo

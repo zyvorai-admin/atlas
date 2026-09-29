@@ -45,7 +45,6 @@ import Snapshots from "../views/Snapshots";
 import Schedules from "../views/Schedules";
 import Backups from "../views/Backups";
 import Buckets from "../views/Buckets";
-import RustfsAdmin from "../views/RustfsAdmin";
 import ProtectionStatus from "../views/ProtectionStatus";
 import Alerts from "../views/Alerts";
 import ActivityView from "../views/Activity";
@@ -129,7 +128,6 @@ export const MODULES: NavModule[] = [
   },
   { id: "volumes", codename: "atlas", label: "Volumes", path: "/volumes", icon: HardDrive, section: "STORAGE", minRole: "operator", pinned: true, topPrimary: true, shortcut: "V", element: Volumes },
   { id: "rbd", codename: "hephaestus", label: "RBD Images", path: "/rbd", icon: Layers, section: "STORAGE", minRole: "operator", element: Rbd },
-  { id: "rustfs", codename: "amphitrite", label: "RustFS", path: "/rustfs", icon: Boxes, section: "STORAGE", minRole: "admin", element: RustfsAdmin },
   { id: "snapshots", codename: "mnemosyne", label: "Snapshots", path: "/snapshots", icon: Camera, section: "STORAGE", minRole: "operator", element: Snapshots },
   { id: "schedules", codename: "chronos", label: "Schedules", path: "/schedules", icon: Timer, section: "STORAGE", minRole: "operator", element: Schedules },
 

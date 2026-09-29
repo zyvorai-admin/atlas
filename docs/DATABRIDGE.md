@@ -104,9 +104,9 @@ for stage in assess provision full-load cdc/start validate cutover; do curl -sX 
 
 Alongside the database pipeline, DataBridge moves **object storage** — AI datasets, model
 weights, checkpoints, RAG source documents, embeddings exports — from a cloud object store
-into a **local S3-compatible bucket** (RustFS by default; Ceph RGW or another S3-compatible
-destination also supported — `dest_endpoint`/`dest_bucket` are always caller-specified, there is
-no implicit destination), so Forge/Zeus consume data locally instead of the cloud. Implemented in
+into a **local S3-compatible bucket** (Ceph RGW by default; any other S3-compatible destination
+also supported — `dest_endpoint`/`dest_bucket` are always caller-specified, there is no implicit
+destination), so Forge/Zeus consume data locally instead of the cloud. Implemented in
 `atlas-databridge::object` on top of `atlas-driver-rgw::S3Target` (SigV4, path-style, streaming
 sha256 — a generic S3 client, not Ceph-specific despite the crate name), driven by the same job
 engine + `/jobs/{id}/watch` SSE.
@@ -132,30 +132,25 @@ connector (same philosophy as the DB side gating oracle/mongodb behind features)
 |---|---|---|
 | `aws` (AWS S3) | ✅ works | S3 protocol, SigV4 |
 | `gcs` (Google Cloud Storage) | ✅ works | GCS **S3-interoperability** endpoint + HMAC keys |
-| `s3-compatible` (RustFS, MinIO, Wasabi, DO Spaces, Ceph RGW, …) | ✅ works | S3 protocol |
+| `s3-compatible` (MinIO, Wasabi, DO Spaces, Ceph RGW, a customer-run RustFS, …) | ✅ works | S3 protocol |
 | `azure-blob` (Azure Blob Storage) | ✅ native connector (feature `azure-blob`) | pure-Rust Azure SDK; not S3-native, so it implements `ObjectSource` directly |
 | `vmware` (vSphere/vSAN datastores) | ❌ not an object store | VMs/VMDKs live on block storage — migrate via the block (RBD import) leg, not object copy |
 
 The source is pluggable via the `ObjectSource` trait (list + get→sha256); the destination is any
-S3-protocol endpoint (RustFS by default for new local buckets; Ceph RGW or another S3-compatible
-target also accepted — the only check is `dest_provider.is_s3_protocol()`). `azure-blob` is a
-native, feature-gated connector (below); `vmware` is rejected with guidance to use the volume
-path; any other non-S3 source errors clearly rather than failing silently.
-
-**Not yet live-verified against a RustFS destination** — the "Verified live" run above was an
-RGW-to-RGW self-migration on the same cluster. Do not treat a RustFS destination as production-
-verified until an equivalent live run has actually been done against one (see `docs/RUSTFS.md`'s
-known-unverified-risks list — presigned URLs and multipart upload wire compatibility with RustFS
-specifically haven't been exercised yet either).
+S3-protocol endpoint the caller names via `dest_endpoint` (the only check is
+`dest_provider.is_s3_protocol()`). `azure-blob` is a native, feature-gated connector (below);
+`vmware` is rejected with guidance to use the volume path; any other non-S3 source errors clearly
+rather than failing silently.
 
 ### Object migration in the console
 
-**DataBridge → Object Migrations** (`/databridge/object`). Either side can be **RustFS (the Atlas
-backend)** — then the endpoint and credentials Secret are filled in server-side
-(`source_backend_id` / `dest_backend_id` in the create body; only the enabled RustFS backend is
-accepted) and no key is ever typed — or an **external S3 endpoint** with a credentials Secret name.
-The destination bucket must already exist (create it on the Buckets page). Verified live: RustFS
-bucket → RustFS bucket, `completed`, 1/1 objects, verified.
+**DataBridge → Object Migrations** (`/databridge/object`). Both `source_endpoint`/`source_secret_ref`
+and `dest_endpoint`/`dest_secret_ref` are always caller-specified — there is no backend-id shortcut
+that auto-fills them (a prior RustFS-specific convenience along those lines was retired along with
+the first-party RustFS integration, see `docs/RUSTFS.md`; `source_backend_id`/`dest_backend_id` on
+the request are rejected with a clear error if set). The destination bucket must already exist
+(create it on the Buckets page). Verified live: an RGW-to-RGW self-migration on the same cluster,
+`completed`, objects copied byte-for-byte with per-object sha256 verification.
 
 ### Object REST endpoints (`/api/atlas/v1`, `require_role(operator)`, tenant-scoped)
 | Method | Path | Purpose |

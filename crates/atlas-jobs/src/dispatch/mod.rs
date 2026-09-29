@@ -5,8 +5,6 @@ mod helpers;
 mod object;
 mod rbd;
 mod rook;
-mod rustfs_drive;
-mod rustfs_instance;
 mod selftest;
 mod volumes;
 mod zfs;
@@ -48,13 +46,19 @@ pub(crate) async fn dispatch(
             volumes::dispatch_volumes(pool, k8s, tenant_id, spec).await
         }
         JobSpec::BucketCreate { .. }
-        | JobSpec::BucketCreateRustfs { .. }
         | JobSpec::BackupCreate { .. }
         | JobSpec::RestoreBackup { .. }
         | JobSpec::BackupDelete { .. }
-        | JobSpec::BucketDelete { .. }
-        | JobSpec::BucketDeleteRustfs { .. } => {
+        | JobSpec::BucketDelete { .. } => {
             object::dispatch_object(pool, k8s, tenant_id, spec).await
+        }
+        JobSpec::BucketCreateRustfs { .. }
+        | JobSpec::BucketDeleteRustfs { .. }
+        | JobSpec::RustfsDriveProvision { .. }
+        | JobSpec::RustfsInstance { .. } => {
+            anyhow::bail!(
+                "RustFS job variants are retired; reprovision on Ceph RGW (bkd_ceph_lab) or a generic S3 endpoint"
+            )
         }
         JobSpec::CephPoolCreate { .. }
         | JobSpec::CephPoolDelete { .. }
@@ -65,12 +69,6 @@ pub(crate) async fn dispatch(
         | JobSpec::CephOsdAddDevice { .. } => rook::dispatch_rook(pool, k8s, tenant_id, spec).await,
         JobSpec::ZfsPoolCreateFromDevice { .. } | JobSpec::ZfsPoolDestroy { .. } => {
             zfs::dispatch_zfs(pool, k8s, tenant_id, spec).await
-        }
-        JobSpec::RustfsDriveProvision { .. } => {
-            rustfs_drive::dispatch_rustfs_drive(k8s, spec).await
-        }
-        JobSpec::RustfsInstance { .. } => {
-            rustfs_instance::dispatch_rustfs_instance(k8s, spec).await
         }
         JobSpec::S3BackendSelfTest { .. } => selftest::dispatch_selftest(pool, k8s, spec).await,
         JobSpec::SourceDiscover { .. }
