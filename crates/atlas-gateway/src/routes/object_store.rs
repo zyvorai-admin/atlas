@@ -221,7 +221,7 @@ fn subresource_response(status: u16, content_type: Option<&str>, body: String) -
 
 /// `GET /buckets/{id}/subresource?<name>` — read a bucket-level S3 subresource (versioning,
 /// lifecycle, policy, object-lock, versions) from whichever backend actually owns the bucket.
-/// Generalizes the removed RustFS-specific admin proxy: works for Ceph RGW and any bring-your-own
+/// A backend-agnostic admin proxy: works for Ceph RGW and any bring-your-own
 /// S3 bucket, since it signs through the bucket's own resolved `S3Target`.
 pub(crate) async fn bucket_subresource_get(
     State(s): State<AppState>,
@@ -565,7 +565,7 @@ pub(crate) struct CreateBucketBody {
     max_objects: Option<i64>,
     /// Optional RGW quota: max size (e.g. "2G").
     max_size: Option<String>,
-    /// S3 Object Lock (WORM retention). Was RustFS-only, set at creation. Ceph RGW support isn't
+    /// S3 Object Lock (WORM retention), set at creation. Ceph RGW support isn't
     /// wired up yet — rejected explicitly below rather than silently creating an unlocked bucket
     /// for a caller who asked for WORM semantics.
     #[serde(default)]

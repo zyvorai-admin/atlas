@@ -17,7 +17,6 @@ async fn spawn() -> SocketAddr {
     spawn_with(
         atlas_common::config::DriverMode::Fake,
         atlas_common::config::DriverMode::Fake,
-        atlas_common::config::DriverMode::Fake,
     )
     .await
 }
@@ -25,7 +24,6 @@ async fn spawn() -> SocketAddr {
 async fn spawn_with(
     nfs_driver_mode: atlas_common::config::DriverMode,
     zfs_driver_mode: atlas_common::config::DriverMode,
-    rustfs_driver_mode: atlas_common::config::DriverMode,
 ) -> SocketAddr {
     let database_url = common::fresh_database_url("backends").await;
     let config = Config {
@@ -63,11 +61,6 @@ async fn spawn_with(
         zfs_host: None,
         zfs_pools: Vec::new(),
         zfs_driver_mode,
-        rustfs_enable: false,
-        rustfs_endpoint: None,
-        rustfs_buckets: Vec::new(),
-        rustfs_driver_mode,
-        rustfs_credentials_namespace: "zyvor-system".into(),
         oidc: None,
         rook_namespace: "rook-ceph".into(),
         rook_cluster_name: "rook-ceph".into(),
@@ -143,7 +136,6 @@ async fn post_backend_with_real_nfs_driver_never_fabricates_a_pool_when_unreacha
         "http://{}/api/atlas/v1",
         spawn_with(
             atlas_common::config::DriverMode::Real,
-            atlas_common::config::DriverMode::Fake,
             atlas_common::config::DriverMode::Fake,
         )
         .await

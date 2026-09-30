@@ -159,7 +159,7 @@ function ObjectBrowser({ bucket, onClose }: { bucket: StorageBucket | null; onCl
   const close = () => { setObjs(null); setListError(false); setPrefix(""); onClose(); };
   if (!bucket) return null;
 
-  // Upload straight to the object store (RustFS/RGW): gateway mints a presigned PUT, the browser PUTs the file to it —
+  // Upload straight to the object store (S3/RGW): gateway mints a presigned PUT, the browser PUTs the file to it —
   // the object bytes never pass through atlas-gateway, so large db files scale fine. With keep>0
   // each upload is stored as a timestamped version and old ones are pruned to keep N (db backups).
   const upload = async (files: FileList | null) => {

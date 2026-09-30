@@ -80,7 +80,7 @@ impl K8sDriver {
         Ok(())
     }
 
-    /// PVs carrying `label_selector` (e.g. `atlas.zyvor.dev/rustfs-drive=true`), as raw JSON so the
+    /// PVs carrying `label_selector` (e.g. `atlas.zyvor.dev/example=true`), as raw JSON so the
     /// caller can show node affinity, path and claim without a typed model.
     pub async fn list_pvs_json(&self, label_selector: &str) -> Result<Vec<serde_json::Value>, K8sError> {
         let list = pv_api(self)

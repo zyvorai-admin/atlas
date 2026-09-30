@@ -60,7 +60,7 @@ export default function ObjectMigrations() {
         name: "secret_namespace",
         label: "Credentials Secret namespace",
         value: "zyvor-system",
-        hint: "Namespace holding the Secret(s) named above (keys AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY).",
+        hint: "Namespace holding the Secret(s) named above (keys AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).",
       });
     }
     out.push({

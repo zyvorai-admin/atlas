@@ -19,7 +19,7 @@ Implemented:
   **ZFS** (local `zpool`/`zfs list`) and read-only **Longhorn** — plus a live K8s driver. Real drivers
   never fabricate data; they propagate a real error when the target is unreachable. Discovery worker
   → inventory. **Object storage defaults to Ceph RGW** (`bkd_ceph_lab`, Rook `ObjectBucketClaim`);
-  any S3-compatible endpoint (MinIO, Garage, AWS, or a customer-run RustFS) is usable as a
+  any S3-compatible endpoint (MinIO, Garage, AWS, ...) is usable as a
   bring-your-own backend via the generic `atlas-driver-rgw::S3Target` client — see `docs/RUSTFS.md`
   for the history of Atlas's now-removed first-party RustFS product integration (Helm chart, admin
   proxy, console pages, drive/instance install jobs) and what replaced it. CI gates run on the lab

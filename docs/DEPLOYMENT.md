@@ -44,7 +44,7 @@ Override only together: `ROOK_VERSION=… CEPH_IMAGE=… ./up.sh …`.
 ```
 
 Object storage defaults to Ceph RGW (`bkd_ceph_lab`); no separate object-store server is started by
-this script. Any S3-compatible endpoint (MinIO, Garage, AWS, or a customer-run RustFS) is usable as
+this script. Any S3-compatible endpoint (MinIO, Garage, AWS, ...) is usable as
 a bring-your-own backend — see [`RUSTFS.md`](RUSTFS.md) for the history of Atlas's now-removed
 first-party RustFS integration.
 

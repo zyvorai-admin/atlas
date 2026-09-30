@@ -216,7 +216,7 @@ disks:
 
 # Trust a bring-your-own S3 endpoint's TLS certificate when it isn't from a CA already in the
 # system trust store (a private CA, or a self-signed cert) — used by atlas-driver-rgw for any
-# S3-compatible backend (Ceph RGW, MinIO, Garage, AWS, or a customer-run RustFS). Never disables
+# S3-compatible backend (Ceph RGW, MinIO, Garage, AWS, ...). Never disables
 # verification; it only adds this one CA on top of the default roots.
 s3:
   caSecretName: ""

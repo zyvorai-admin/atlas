@@ -1,7 +1,7 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
 //! Minimal, generic S3 client (PDF §10.3 "Atlas → RGW: S3 API") — shared by Ceph RGW and any other
-//! S3-compatible backend (e.g. RustFS). Nothing here is Ceph-specific: it's plain SigV4 signing
+//! S3-compatible backend (Ceph RGW, MinIO, Garage, ...). Nothing here is Ceph-specific: it's plain SigV4 signing
 //! against whatever endpoint/bucket/credentials the caller supplies.
 //!
 //! Uses `rusty-s3` to build SigV4-signed request URLs and `reqwest` to execute them — no heavy
@@ -385,10 +385,10 @@ impl S3Target {
     }
 
     /// Create the bucket with S3 Object Lock (WORM retention) enabled — `x-amz-bucket-object-lock-enabled`,
-    /// an S3-standard header set only at creation; RustFS/S3 both refuse to enable it retroactively on
+    /// an S3-standard header set only at creation; S3 stores refuse to enable it retroactively on
     /// an existing bucket. Enabling it also turns bucket versioning on server-side (S3 requires
     /// versioning for object lock). Like the region body below, this header rides on a presigned PUT
-    /// outside the signed query string — RustFS accepted the analogous unsigned region body live, so
+    /// outside the signed query string — a live S3 server accepted the analogous unsigned region body, so
     /// the same leniency is expected here; verify live rather than trusting this comment.
     pub async fn create_bucket_with_object_lock(&self, enable_object_lock: bool) -> Result<()> {
         let mut action = self.bucket.create_bucket(&self.creds);
@@ -448,7 +448,7 @@ impl S3Target {
     /// `delete_bucket` are covered), so this signs the request directly rather than adding one
     /// bespoke `S3Action` impl per subresource. Returns the raw status + body (XML/JSON, backend-
     /// dependent) unparsed — same "pass the server's own response through" approach the removed
-    /// RustFS-specific proxy used, now backend-agnostic.
+    /// backend-agnostic S3 proxy.
     pub async fn get_bucket_subresource(&self, subresource: &str) -> Result<(u16, String)> {
         let resp = self
             .http
@@ -536,7 +536,7 @@ mod tests {
         assert!(body.contains("<LocationConstraint>eu-west-1</LocationConstraint>"));
     }
 
-    /// Regression: an object-lock CreateBucket sends `x-amz-bucket-object-lock-enabled`. RustFS
+    /// Regression: an object-lock CreateBucket sends `x-amz-bucket-object-lock-enabled`. The S3 server
     /// rejects any header that rides along unsigned ("headers present which were not signed",
     /// found live) — the header must be part of the presigned URL's X-Amz-SignedHeaders.
     #[test]

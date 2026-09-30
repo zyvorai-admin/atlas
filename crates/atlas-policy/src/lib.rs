@@ -76,7 +76,7 @@ pub fn find(intent: &str) -> Option<&'static Policy> {
     POLICIES.iter().find(|p| p.intent == intent)
 }
 
-/// Default backend for new object (bucket) provisioning — RustFS, not Ceph RGW. Deliberately not
+/// Default backend for new object (bucket) provisioning — Ceph RGW. Deliberately not
 /// part of the [`Policy`]/[`resolve`] machinery above: those describe StorageClass/access-mode/
 /// volume-mode placement for PVC-shaped provisioning, none of which apply to an S3 bucket. This is
 /// the one thing bucket creation actually needs resolved with an explicit-override-wins default,

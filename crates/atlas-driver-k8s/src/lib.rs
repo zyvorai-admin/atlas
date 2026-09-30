@@ -48,22 +48,6 @@ pub enum K8sError {
     NotFound(String),
 }
 
-/// RustFS's official chart names its root credential `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`; every
-/// Atlas S3 reader looks for the AWS-style names. Add the AWS aliases when only the RustFS ones exist.
-fn with_s3_aliases(mut data: BTreeMap<String, String>) -> BTreeMap<String, String> {
-    if !data.contains_key("AWS_ACCESS_KEY_ID") {
-        if let Some(v) = data.get("RUSTFS_ACCESS_KEY").cloned() {
-            data.insert("AWS_ACCESS_KEY_ID".into(), v);
-        }
-    }
-    if !data.contains_key("AWS_SECRET_ACCESS_KEY") {
-        if let Some(v) = data.get("RUSTFS_SECRET_KEY").cloned() {
-            data.insert("AWS_SECRET_ACCESS_KEY".into(), v);
-        }
-    }
-    data
-}
-
 /// Ceph CSI provisioners we badge as Ceph-backed (PDF §7.1).
 const CEPH_PROVISIONERS: &[&str] = &[
     "rbd.csi.ceph.com",
@@ -656,7 +640,7 @@ impl K8sDriver {
                     .into_iter()
                     .map(|(k, v)| (k, String::from_utf8_lossy(&v.0).to_string()))
                     .collect::<BTreeMap<String, String>>();
-                Ok(Some(with_s3_aliases(data)))
+                Ok(Some(data))
             }
             None => Ok(None),
         }
@@ -730,25 +714,6 @@ impl From<PersistentVolume> for PvSummary {
             reclaim_policy: spec.persistent_volume_reclaim_policy,
             csi_driver,
         }
-    }
-}
-
-#[cfg(test)]
-mod alias_tests {
-    use super::*;
-
-    #[test]
-    fn rustfs_keys_gain_aws_aliases_without_overriding() {
-        let mut m = BTreeMap::new();
-        m.insert("RUSTFS_ACCESS_KEY".to_string(), "a".to_string());
-        m.insert("RUSTFS_SECRET_KEY".to_string(), "s".to_string());
-        let out = with_s3_aliases(m);
-        assert_eq!(out["AWS_ACCESS_KEY_ID"], "a");
-        assert_eq!(out["AWS_SECRET_ACCESS_KEY"], "s");
-        let mut m = BTreeMap::new();
-        m.insert("AWS_ACCESS_KEY_ID".to_string(), "x".to_string());
-        m.insert("RUSTFS_ACCESS_KEY".to_string(), "a".to_string());
-        assert_eq!(with_s3_aliases(m)["AWS_ACCESS_KEY_ID"], "x");
     }
 }
 

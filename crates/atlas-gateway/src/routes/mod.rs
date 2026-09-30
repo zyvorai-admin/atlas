@@ -69,7 +69,6 @@ pub fn router(state: AppState) -> Router {
         .route("/backends/summary", get(backends_summary))
         .route("/backends/{id}", delete(delete_backend))
         .route("/backends/{id}/discover", post(discover_backend))
-        .route("/backends/{id}/selftest", post(selftest_backend))
         .route("/backends/{id}/cordon", post(cordon_backend))
         .route("/backends/{id}/uncordon", post(uncordon_backend))
         .route("/maintenance", get(get_maintenance).post(set_maintenance))

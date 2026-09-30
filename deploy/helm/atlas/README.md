@@ -40,7 +40,7 @@ and admin keyring Secret already present — this chart doesn't stand up Ceph it
 
 New buckets default to Ceph RGW (`ceph.enabled=true`, above) via Rook `ObjectBucketClaim`. Atlas is
 not a first-party object-storage product — the generic `atlas-driver-rgw::S3Target` client works
-against any S3-compatible endpoint (MinIO, Garage, AWS, or a customer-run RustFS) by pointing a
+against any S3-compatible endpoint (MinIO, Garage, AWS, ...) by pointing a
 backend's `connection_ref` at a Secret holding its access/secret key; nothing to install through
 this chart. If that endpoint's TLS certificate isn't from a CA already in the system trust store
 (a private CA, or a self-signed cert), set `s3.caSecretName` to a `kubernetes.io/tls` Secret whose

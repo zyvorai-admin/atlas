@@ -869,7 +869,7 @@ pub async fn list_backends(pool: &AnyPool) -> Result<Vec<StorageBackend>> {
 }
 
 /// A single backend row by id (`None` if not registered) — used to resolve a backend's
-/// `connection_ref` (credentials secret name) at request/dispatch time, e.g. for the RustFS
+/// `connection_ref` (credentials secret name) at request/dispatch time, e.g. for a bring-your-own S3
 /// object-storage write path.
 pub async fn get_backend(pool: &AnyPool, id: &str) -> Result<Option<StorageBackend>> {
     let row = sqlx::query(

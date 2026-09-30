@@ -11,7 +11,7 @@ const bucket: StorageBucket = {
   tenant_id: "global",
   name: "photos",
   bucket_name: "photos",
-  backend_id: "bkd_rustfs_lab",
+  backend_id: "bkd_ceph_lab",
   state: "bound",
 };
 

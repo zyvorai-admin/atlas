@@ -1,11 +1,11 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Object-storage migration — the *object* leg of Atlas DataBridge (AWS S3 → RustFS or Ceph RGW).
+//! Object-storage migration — the *object* leg of Atlas DataBridge (AWS S3 → Ceph RGW or another S3-compatible store).
 //!
 //! Mirrors the database DataBridge shape (discover → copy → verify) but for S3 objects.
 //! Reuses [`atlas_driver_rgw::S3Target`] as the byte-mover for BOTH endpoints: the AWS
-//! source and the destination (RustFS or Ceph RGW) are both S3-compatible (SigV4, path-style), so one
+//! source and the destination (Ceph RGW or another S3-compatible store) are both S3-compatible (SigV4, path-style), so one
 //! client type serves both. The copy is:
 //!
 //!   list source → diff vs dest (full | incremental by key+size) → stream each object,
@@ -57,13 +57,13 @@ impl ObjectProvider {
     }
 }
 
-/// Connection to one S3-compatible endpoint (AWS source, or RustFS / Ceph RGW destination).
+/// Connection to one S3-compatible endpoint (AWS source, or Ceph RGW / another S3-compatible store destination).
 ///
 /// Deliberately does NOT derive `Debug`/`Serialize` — the access/secret keys must never
 /// reach a log line or a persisted record. Use [`redacted`](Self::redacted) for display.
 #[derive(Clone, Deserialize)]
 pub struct S3Endpoint {
-    /// Full endpoint URL, e.g. `https://s3.us-east-1.amazonaws.com` (AWS) or the RustFS / RGW URL.
+    /// Full endpoint URL, e.g. `https://s3.us-east-1.amazonaws.com` (AWS) or the S3 / RGW URL.
     pub endpoint: String,
     #[serde(default)]
     pub region: String,
@@ -180,7 +180,7 @@ pub trait ObjectSource: Send + Sync {
     ) -> Result<(u64, String)>;
 }
 
-/// A write destination for the migration (RustFS or Ceph RGW). Pluggable so the copy loop can be
+/// A write destination for the migration (Ceph RGW or another S3-compatible store). Pluggable so the copy loop can be
 /// unit-tested against an in-memory sink instead of a live S3 endpoint.
 #[async_trait::async_trait]
 pub trait ObjectSink: Send + Sync {
@@ -217,7 +217,7 @@ impl ObjectSource for S3ObjectSource {
     }
 }
 
-/// S3-protocol destination (RustFS or Ceph RGW): wraps an [`S3Target`], streaming via multipart upload.
+/// S3-protocol destination (Ceph RGW or another S3-compatible store): wraps an [`S3Target`], streaming via multipart upload.
 pub struct S3ObjectSink(pub S3Target);
 
 #[async_trait::async_trait]
@@ -262,7 +262,7 @@ impl ObjectMigrator {
         })
     }
 
-    /// Build a migrator from an arbitrary source (e.g. Azure Blob) into a RustFS / RGW destination.
+    /// Build a migrator from an arbitrary source (e.g. Azure Blob) into a S3 / RGW destination.
     pub fn with_source(
         source: Box<dyn ObjectSource>,
         dest: S3Target,
@@ -477,11 +477,11 @@ async fn run_migration_inner(
     let source_provider = ObjectProvider::parse(&rec.source_provider);
     let dest_provider = ObjectProvider::parse(&rec.dest_provider);
 
-    // The destination must be an S3-protocol endpoint — RustFS by default, Ceph RGW or another
+    // The destination must be an S3-protocol endpoint — Ceph RGW by default, or another
     // S3-compatible target also supported (any `dest_provider` that resolves to `S3Compatible`).
     if !dest_provider.is_s3_protocol() {
         anyhow::bail!(
-            "destination provider '{}' must be S3-protocol (e.g. RustFS or Ceph RGW)",
+            "destination provider '{}' must be S3-protocol (e.g. Ceph RGW or another S3-compatible store)",
             rec.dest_provider
         );
     }
@@ -511,7 +511,7 @@ async fn run_migration_inner(
     let (src_ak, src_sk) = resolve_creds(&k8s, &rec.secret_namespace, src_ref).await?;
     let (dst_ak, dst_sk) = resolve_creds(&k8s, &rec.secret_namespace, dst_ref).await?;
 
-    // Destination endpoint (RustFS or Ceph RGW).
+    // Destination endpoint (Ceph RGW or another S3-compatible store).
     let dest = S3Endpoint {
         endpoint: rec.dest_endpoint.clone(),
         region: rec.dest_region.clone(),

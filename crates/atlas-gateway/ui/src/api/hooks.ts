@@ -8,7 +8,7 @@ import type {
   ActivityEvent, AlertRecord, AuditRow, BackupRecord, CephNodeDevice, ClusterHealthState, JobRecord, MetricForecast, MetricHistoryPoint, MetricSample, MetricsSummary, Osd,
   SnapshotSchedule, StorageBucket, StorageCluster, StoragePool, StorageSnapshot, StorageVolume,
   TenantPolicy, TenantQuota, VolumeProtectionStatus, ZfsBlockDevice,
-  MigrationSource, MigrationPlan, EdgeDbCluster, CdcStream, ValidationRun, ObjectMigration, RustfsDrive, RustfsInstance
+  MigrationSource, MigrationPlan, EdgeDbCluster, CdcStream, ValidationRun, ObjectMigration
 } from "./types";
 
 const g = async <T,>(path: string): Promise<T> => (await http.get<T>(path)).data;
@@ -32,10 +32,6 @@ export const useClusters = () => useApiQuery<StorageCluster[]>(["clusters"], "/c
 export const usePools = () => useApiQuery<StoragePool[]>(["pools"], "/pools", 10000);
 export const useOsds = () => useApiQuery<Osd[]>(["osds"], "/osds", 10000);
 export const useNodes = () => useApiQuery<{ host: string }[]>(["nodes"], "/nodes", 15000);
-export const useRustfsDrives = () =>
-  useApiQuery<RustfsDrive[]>(["rustfs-drives"], "/rustfs/drives", 10000);
-export const useRustfsInstances = () =>
-  useApiQuery<RustfsInstance[]>(["rustfs-instances"], "/rustfs/instances", 8000);
 export const useZfsDevices = () =>
   useApiQuery<ZfsBlockDevice[]>(["zfs-devices"], "/zfs/devices", 15000);
 export const useCephNodeDevices = (nodeName?: string) =>

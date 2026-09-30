@@ -254,16 +254,6 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
         None
     };
 
-    // RustFS is no longer a first-party backend. ATLAS_RUSTFS_* env is ignored.
-    // Object storage defaults to Ceph RGW; operators may still point DataBridge /
-    // state-backup at any S3-compatible endpoint via atlas-driver-rgw.
-    if config.rustfs_enable {
-        tracing::warn!(
-            "ATLAS_RUSTFS_ENABLE is set but the RustFS product driver was removed; \
-             buckets default to {CEPH_BACKEND_ID} (Ceph RGW). Bring your own S3 via RGW helpers."
-        );
-    }
-
     // Attach a live Kubernetes driver if reachable.
     let k8s = if opts.enable_k8s {
         match K8sDriver::try_default().await {

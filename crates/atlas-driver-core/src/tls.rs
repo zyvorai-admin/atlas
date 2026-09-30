@@ -1,12 +1,12 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
-//! A `reqwest::Client` that additionally trusts a CA certificate from `ATLAS_RUSTFS_CA_CERT`, for
-//! talking to a RustFS server whose TLS certificate (`RUSTFS_TLS_PATH`, see `docs/RUSTFS.md`) was
+//! A `reqwest::Client` that additionally trusts a CA certificate from `ATLAS_S3_CA_CERT`, for
+//! talking to an S3-compatible endpoint (Ceph RGW, MinIO, Garage, ...) whose TLS certificate was
 //! not issued by a CA already in the system trust store — a private CA, or a self-signed lab cert.
 //! The system/OS root store stays trusted regardless (reqwest's own default); this only adds one
-//! more root, it never removes the others and never disables verification. Shared by
-//! `atlas-driver-rustfs` (the admin/S3 proxy client) and `atlas-driver-rgw` (`S3Target`, used for
-//! both RustFS and Ceph RGW buckets) so both speak the same TLS trust policy.
+//! more root, it never removes the others and never disables verification. Used by
+//! `atlas-driver-rgw` (`S3Target`) so every S3 client speaks the same TLS trust policy. The Helm
+//! chart sets this variable from `s3.caSecretName`.
 use std::time::Duration;
 
 use rustls_pki_types::{pem::PemObject, CertificateDer};
@@ -18,10 +18,10 @@ pub fn trusted_http_client(timeout: Option<Duration>) -> Result<reqwest::Client,
     if let Some(t) = timeout {
         builder = builder.timeout(t);
     }
-    if let Ok(path) = std::env::var("ATLAS_RUSTFS_CA_CERT") {
+    if let Ok(path) = std::env::var("ATLAS_S3_CA_CERT") {
         if !path.trim().is_empty() {
             let pem = std::fs::read(&path)
-                .map_err(|e| DriverError::Backend(format!("ATLAS_RUSTFS_CA_CERT {path}: {e}")))?;
+                .map_err(|e| DriverError::Backend(format!("ATLAS_S3_CA_CERT {path}: {e}")))?;
             // reqwest's own `Certificate::from_pem` defers actual PEM parsing to `.build()` time
             // with the rustls backend (it just wraps the raw bytes), and its parser silently treats
             // content with no `-----BEGIN CERTIFICATE-----` blocks at all as "zero certificates
@@ -32,19 +32,19 @@ pub fn trusted_http_client(timeout: Option<Duration>) -> Result<reqwest::Client,
             for result in CertificateDer::pem_slice_iter(&pem) {
                 result.map_err(|e| {
                     DriverError::Backend(format!(
-                        "ATLAS_RUSTFS_CA_CERT {path} is not a valid PEM certificate: {e}"
+                        "ATLAS_S3_CA_CERT {path} is not a valid PEM certificate: {e}"
                     ))
                 })?;
                 certs_found += 1;
             }
             if certs_found == 0 {
                 return Err(DriverError::Backend(format!(
-                    "ATLAS_RUSTFS_CA_CERT {path} contains no PEM certificate blocks"
+                    "ATLAS_S3_CA_CERT {path} contains no PEM certificate blocks"
                 )));
             }
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
                 DriverError::Backend(format!(
-                    "ATLAS_RUSTFS_CA_CERT {path} is not a valid PEM certificate: {e}"
+                    "ATLAS_S3_CA_CERT {path} is not a valid PEM certificate: {e}"
                 ))
             })?;
             builder = builder.add_root_certificate(cert);
@@ -60,7 +60,7 @@ mod tests {
     use super::*;
 
     // cargo test runs these in parallel threads of the same process, and all three mutate the same
-    // process-global ATLAS_RUSTFS_CA_CERT — without this lock one test's remove_var could race
+    // process-global ATLAS_S3_CA_CERT — without this lock one test's remove_var could race
     // another's set_var. (invalid_pem_errors_not_panics also failed in CI on 2026-09-28, but that
     // turned out to be a real, fully deterministic bug in trusted_http_client itself — reqwest's
     // Certificate::from_pem defers parsing to build()-time and silently accepts zero-certificate
@@ -72,7 +72,7 @@ mod tests {
     fn no_env_var_builds_a_plain_client() {
         let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY: test-only env mutation; serialized by ENV_LOCK.
-        unsafe { std::env::remove_var("ATLAS_RUSTFS_CA_CERT") };
+        unsafe { std::env::remove_var("ATLAS_S3_CA_CERT") };
         assert!(trusted_http_client(Some(Duration::from_secs(1))).is_ok());
     }
 
@@ -80,9 +80,9 @@ mod tests {
     fn missing_ca_cert_file_errors_not_panics() {
         let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY: test-only env mutation; serialized by ENV_LOCK.
-        unsafe { std::env::set_var("ATLAS_RUSTFS_CA_CERT", "/nonexistent/path/ca.pem") };
+        unsafe { std::env::set_var("ATLAS_S3_CA_CERT", "/nonexistent/path/ca.pem") };
         let result = trusted_http_client(None);
-        unsafe { std::env::remove_var("ATLAS_RUSTFS_CA_CERT") };
+        unsafe { std::env::remove_var("ATLAS_S3_CA_CERT") };
         assert!(result.is_err());
     }
 
@@ -94,9 +94,9 @@ mod tests {
         let path = dir.join("bad.pem");
         std::fs::write(&path, b"not a certificate").unwrap();
         // SAFETY: test-only env mutation; serialized by ENV_LOCK.
-        unsafe { std::env::set_var("ATLAS_RUSTFS_CA_CERT", path.to_str().unwrap()) };
+        unsafe { std::env::set_var("ATLAS_S3_CA_CERT", path.to_str().unwrap()) };
         let result = trusted_http_client(None);
-        unsafe { std::env::remove_var("ATLAS_RUSTFS_CA_CERT") };
+        unsafe { std::env::remove_var("ATLAS_S3_CA_CERT") };
         let _ = std::fs::remove_dir_all(&dir);
         assert!(result.is_err());
     }

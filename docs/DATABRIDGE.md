@@ -132,7 +132,7 @@ connector (same philosophy as the DB side gating oracle/mongodb behind features)
 |---|---|---|
 | `aws` (AWS S3) | ✅ works | S3 protocol, SigV4 |
 | `gcs` (Google Cloud Storage) | ✅ works | GCS **S3-interoperability** endpoint + HMAC keys |
-| `s3-compatible` (MinIO, Wasabi, DO Spaces, Ceph RGW, a customer-run RustFS, …) | ✅ works | S3 protocol |
+| `s3-compatible` (MinIO, Wasabi, DO Spaces, Ceph RGW, Garage, …) | ✅ works | S3 protocol |
 | `azure-blob` (Azure Blob Storage) | ✅ native connector (feature `azure-blob`) | pure-Rust Azure SDK; not S3-native, so it implements `ObjectSource` directly |
 | `vmware` (vSphere/vSAN datastores) | ❌ not an object store | VMs/VMDKs live on block storage — migrate via the block (RBD import) leg, not object copy |
 

@@ -542,7 +542,7 @@ pub(crate) struct CreateObjectMigrationBody {
     /// k8s Secret {access_key,secret_key} for the source; never the creds themselves.
     source_secret_ref: Option<String>,
     /// Retired: auto-filling source_endpoint/source_secret_ref from a backend id only ever worked
-    /// for RustFS's flat, gateway-level endpoint+credential config, which the default Ceph RGW
+    /// for a flat, gateway-level endpoint+credential config, which the default Ceph RGW
     /// backend has no equivalent of (each bucket gets its own endpoint/Secret from its own
     /// ObjectBucketClaim). Pass source_endpoint/source_secret_ref explicitly instead. Kept on the
     /// wire (rejected with a clear error if set) so older clients get an actionable message rather
@@ -584,7 +584,7 @@ pub(crate) async fn db_object_create(
         return Err(AppError::Validation("name is required".into()));
     }
     // source_backend_id/dest_backend_id used to auto-fill endpoint+credentials from the gateway's
-    // flat RustFS config; there is no equivalent for Ceph RGW (each bucket has its own
+    // flat gateway-level endpoint config; there is no equivalent for Ceph RGW (each bucket has its own
     // ObjectBucketClaim-issued endpoint/Secret), so this shortcut is retired — reject it with a
     // clear message rather than silently resolving nothing.
     for (which, backend_id) in [

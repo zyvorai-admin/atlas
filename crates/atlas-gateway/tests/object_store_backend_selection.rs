@@ -51,11 +51,6 @@ async fn spawn() -> SocketAddr {
         zfs_host: None,
         zfs_pools: Vec::new(),
         zfs_driver_mode: atlas_common::config::DriverMode::Fake,
-        rustfs_enable: true,
-        rustfs_endpoint: Some("http://rustfs.example.test:9000".into()),
-        rustfs_buckets: Vec::new(),
-        rustfs_driver_mode: atlas_common::config::DriverMode::Fake,
-        rustfs_credentials_namespace: "zyvor-system".into(),
         oidc: None,
         rook_namespace: "rook-ceph".into(),
         rook_cluster_name: "rook-ceph".into(),
@@ -163,82 +158,4 @@ async fn create_bucket_retired_rustfs_backend_id_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-#[ignore = "RustFS product driver removed; kept so the old name does not collide"]
-async fn create_bucket_rustfs_default_requires_the_backend_to_be_enabled() {
-    // Same as `spawn()` but with rustfs_enable: false — the default backend picks RustFS, but
-    // since it isn't enabled the route must refuse cleanly rather than enqueue a doomed job.
-    let database_url = common::fresh_database_url("object-store-backend-selection-disabled").await;
-    let config = Config {
-        bind_addr: "127.0.0.1:0".into(),
-        grpc_addr: "127.0.0.1:0".into(),
-        database_url,
-        ceph_driver_mode: CephDriverMode::Fake,
-        kubeconfig_path: None,
-        jwt_secret: "obj-backend-test-secret-at-least-32-bytes!".into(),
-        jwt_secret_previous: None,
-        auth_required: false,
-        bootstrap_admin_token: None,
-        admin_username: "admin".into(),
-        admin_password: "Admin@321".into(),
-        monitor_interval_secs: 0,
-        ceph_prometheus_url: None,
-        alert_webhook_url: None,
-        backup_keep: 0,
-        backup_max_age_secs: 0,
-        rgw_public_endpoint: None,
-        snapshot_tick_secs: 0,
-        databridge_reconcile_secs: 0,
-        job_poll_secs: 0,
-        job_stale_secs: 0,
-        https_addr: None,
-        tls_cert_path: None,
-        tls_key_path: None,
-        tls_self_signed: false,
-        disable_http: false,
-        nfs_enable: false,
-        nfs_server: None,
-        nfs_exports: Vec::new(),
-        nfs_driver_mode: atlas_common::config::DriverMode::Fake,
-        zfs_enable: false,
-        zfs_host: None,
-        zfs_pools: Vec::new(),
-        zfs_driver_mode: atlas_common::config::DriverMode::Fake,
-        rustfs_enable: false,
-        rustfs_endpoint: None,
-        rustfs_buckets: Vec::new(),
-        rustfs_driver_mode: atlas_common::config::DriverMode::Fake,
-        rustfs_credentials_namespace: "zyvor-system".into(),
-        oidc: None,
-        rook_namespace: "rook-ceph".into(),
-        rook_cluster_name: "rook-ceph".into(),
-        dr_dataplane_verified: false,
-    };
-    let state = build_state(
-        config,
-        BuildOptions {
-            enable_k8s: false,
-            initial_discovery: true,
-            enable_monitor: false,
-        },
-    )
-    .await
-    .expect("build_state");
-    let app = routes::router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let base = format!("http://{addr}/api/atlas/v1");
-    let c = reqwest::Client::new();
-    let resp = c
-        .post(format!("{base}/buckets"))
-        .json(&json!({ "name": "default-bucket" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
 }

@@ -68,7 +68,7 @@ export interface LifecycleRule {
   status: string;
   days: string;
   noncurrentDays: string;
-  /** The rule's XML as RustFS returned it — re-sent untouched so unedited rules (transitions, ...) survive. */
+  /** The rule's XML as the object store returned it — re-sent untouched so unedited rules (transitions, ...) survive. */
   raw: string;
 }
 

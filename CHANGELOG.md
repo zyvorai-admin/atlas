@@ -24,6 +24,17 @@ before `0.2.0` were not tracked here — see `git log` for that history.
   `/rustfs/*` admin proxy, drive/instance jobs, vendored Helm subchart, and `deploy/rustfs-lab`.
   Object storage now defaults to Ceph RGW (`bkd_ceph_lab`). Bring-your-own S3 remains via
   `atlas-driver-rgw`. See `docs/RUSTFS.md`.
+- Remaining RustFS leftovers: the ignored `ATLAS_RUSTFS_*` configuration and its startup warning,
+  the `POST /backends/{id}/selftest` route (it could only ever answer "unsupported"), the
+  `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` credential-alias shim, the dead `/rustfs/*` console hooks and
+  types, and the `ATLAS_RUSTFS_*` block in `.env.example`. Kept on purpose so existing data still
+  loads: the `BackendType::Rustfs` value and the retired `bucket.*.rustfs` / `rustfs.*` job variants
+  (they are rejected with a clear error), plus the rejection of the `bkd_rustfs_lab` backend id.
+
+### Fixed
+- The Helm chart's `s3.caSecretName` (trust a private CA for a bring-your-own S3 endpoint) set
+  `ATLAS_S3_CA_CERT`, but the code only read the legacy `ATLAS_RUSTFS_CA_CERT`, so the setting had no
+  effect. The code now reads `ATLAS_S3_CA_CERT`. **If you set `ATLAS_RUSTFS_CA_CERT` directly, rename it.**
 
 ### Changed
 - Relicensed from the Zyvor Production License v1.0 to the **Apache License, Version 2.0**
