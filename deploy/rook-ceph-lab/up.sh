@@ -137,9 +137,14 @@ drivers:
   rbd:
     name: rook-ceph.rbd.csi.ceph.com
     enabled: true
+    # The chart's default is "none", which omits the csi-snapshotter sidecar: every
+    # VolumeSnapshot (and so every KubeVirt VMSnapshot / volume backup) of an RBD volume
+    # then times out. Found live 2026-09-30 when a VM backup's snapshot never completed.
+    snapshotPolicy: volumeSnapshot
   cephfs:
     name: rook-ceph.cephfs.csi.ceph.com
     enabled: true
+    snapshotPolicy: volumeSnapshot
   nfs:
     enabled: false
 EOF
