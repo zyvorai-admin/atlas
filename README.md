@@ -197,6 +197,8 @@ Found a security issue? See [SECURITY.md](SECURITY.md) rather than opening a pub
 
 ## License
 
+Commercial subscriptions and support: see [docs/SUBSCRIPTION-MODEL.md](docs/SUBSCRIPTION-MODEL.md).
+
 Licensed under the **[Apache License, Version 2.0](LICENSE)**. See [docs/LICENSING.md](docs/LICENSING.md)
 and [NOTICE](NOTICE).
 
