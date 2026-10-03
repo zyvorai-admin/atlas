@@ -140,6 +140,7 @@ pub enum Message {
     /// snapshot's last included index/term.
     InstallSnapshot {
         term: u64,
+        #[serde(with = "catalog_json")]
         snapshot: Box<Catalog>,
     },
     /// `match_index` is the follower's commit index: committed entries are the only ones
@@ -172,6 +173,32 @@ impl Message {
             | Message::AppendEntriesResponse { term, .. }
             | Message::InstallSnapshot { term, .. }
             | Message::InstallSnapshotResponse { term, .. } => *term,
+        }
+    }
+}
+
+/// `Message` is internally tagged, so serde buffers each variant before decoding it, and buffered
+/// integer map keys (`VolumeMeta::extents`) do not decode. The catalog therefore travels as an
+/// embedded JSON string; the inline form is still accepted from older senders.
+mod catalog_json {
+    use serde::{de::Error as _, ser::Error as _, Deserialize, Deserializer, Serializer};
+
+    use crate::metadata::Catalog;
+
+    pub fn serialize<S: Serializer>(c: &Catalog, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&serde_json::to_string(c).map_err(S::Error::custom)?)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Box<Catalog>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Json(String),
+            Inline(Box<Catalog>),
+        }
+        match Wire::deserialize(d)? {
+            Wire::Json(j) => serde_json::from_str(&j).map_err(D::Error::custom),
+            Wire::Inline(c) => Ok(c),
         }
     }
 }
