@@ -176,3 +176,28 @@ fn torn_wal_tail_is_discarded() {
     e.write(&v, 4096, b"next").unwrap();
     assert_eq!(e.read(&v, 4096, 4).unwrap(), b"next");
 }
+
+#[test]
+fn engine_metrics_reflect_io_gc_and_free_space() {
+    let td = tempfile::tempdir().unwrap();
+    let e = NativeEngine::open(cfg(td.path()), nodes()).unwrap();
+    let v = e.create_volume("v", 8192).unwrap();
+    e.write(&v, 0, &[1u8; 4096]).unwrap();
+    e.write(&v, 0, &[2u8; 4096]).unwrap();
+    e.gc_once().unwrap();
+    e.read(&v, 0, 4096).unwrap();
+
+    let m = e.render_metrics().unwrap();
+    for want in [
+        "# TYPE atlas_native_writes_total counter",
+        "atlas_native_writes_total 2\n",
+        "atlas_native_reads_total 1\n",
+        "atlas_native_gc_reclaimed_extents_total 1\n",
+        "atlas_native_allocator_free_bytes 12288\n",
+        "atlas_native_extents 1\n",
+        "atlas_native_volumes 1\n",
+        "atlas_native_device_bytes{node=\"n1\"} 8192\n",
+    ] {
+        assert!(m.contains(want), "missing {want:?} in:\n{m}");
+    }
+}

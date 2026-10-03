@@ -13,6 +13,7 @@ use crate::{
     device::FileDevice,
     durable, gc,
     metadata::{Catalog, ExtentRef, MetaCommand, MetaError, ReplicaRef, SnapshotId, VolumeId},
+    metrics::PromText,
     placement::{select_replicas, Node, PlacementPolicy},
     telemetry::NativeIoCounters,
     wal::{Wal, WalError, WalRecord},
@@ -313,6 +314,7 @@ impl NativeEngine {
             stats.reclaimed += 1;
         }
         stats.freed_bytes = self.free_bytes()?.saturating_sub(free_before);
+        self.telemetry.gc_reclaimed(stats.reclaimed);
         Ok(stats)
     }
 
@@ -351,6 +353,113 @@ impl NativeEngine {
             .lock()
             .map_err(|_| NativeError::Poisoned("wal"))?
             .len())
+    }
+
+    /// Prometheus text exposition for I/O counters, metadata and free space.
+    pub fn render_metrics(&self) -> Result<String, NativeError> {
+        let t = self.telemetry.snapshot();
+        let (applied, volumes, snapshots, extents, free_bytes, free_ranges) = {
+            let c = self
+                .catalog
+                .read()
+                .map_err(|_| NativeError::Poisoned("catalog"))?;
+            (
+                c.applied_index,
+                c.volumes.len(),
+                c.snapshots.len(),
+                c.extents.len(),
+                c.free.total_bytes(),
+                c.free.ranges().len(),
+            )
+        };
+        let wal_records = self.wal_records()?;
+        let mut p = PromText::new();
+        for (name, help, v) in [
+            ("atlas_native_reads_total", "Extent reads served.", t.reads),
+            ("atlas_native_writes_total", "Extents written.", t.writes),
+            (
+                "atlas_native_read_bytes_total",
+                "Bytes returned by reads.",
+                t.read_bytes,
+            ),
+            (
+                "atlas_native_write_bytes_total",
+                "Bytes written (before replication).",
+                t.write_bytes,
+            ),
+            (
+                "atlas_native_checksum_failures_total",
+                "Replica reads that failed checksum verification.",
+                t.checksum_failures,
+            ),
+            (
+                "atlas_native_replica_fallbacks_total",
+                "Reads served by a non-primary replica.",
+                t.replica_fallbacks,
+            ),
+            (
+                "atlas_native_gc_reclaimed_extents_total",
+                "Extents reclaimed by GC.",
+                t.gc_reclaimed,
+            ),
+        ] {
+            p.single(name, "counter", help, v);
+        }
+        p.single(
+            "atlas_native_metadata_applied_index",
+            "gauge",
+            "Highest metadata index applied.",
+            applied,
+        );
+        p.single(
+            "atlas_native_wal_records",
+            "gauge",
+            "Records retained in the metadata WAL.",
+            wal_records,
+        );
+        p.single(
+            "atlas_native_volumes",
+            "gauge",
+            "Volumes in the catalog.",
+            volumes,
+        );
+        p.single(
+            "atlas_native_snapshots",
+            "gauge",
+            "Snapshots in the catalog.",
+            snapshots,
+        );
+        p.single(
+            "atlas_native_extents",
+            "gauge",
+            "Live physical extents.",
+            extents,
+        );
+        p.single(
+            "atlas_native_allocator_free_bytes",
+            "gauge",
+            "Device bytes (summed over replicas) on the free lists.",
+            free_bytes,
+        );
+        p.single(
+            "atlas_native_allocator_free_ranges",
+            "gauge",
+            "Free ranges across all devices.",
+            free_ranges,
+        );
+        p.family(
+            "atlas_native_device_bytes",
+            "gauge",
+            "Size of each node's backing device file.",
+        );
+        for n in &self.nodes {
+            p.sample(
+                "atlas_native_device_bytes",
+                &[("node", n.spec.id.as_str())],
+                n.devices[0].len()?,
+            );
+        }
+        Ok(p.finish())
     }
 
     /// Persists the catalog and drops every WAL record it covers. Returns the records removed.

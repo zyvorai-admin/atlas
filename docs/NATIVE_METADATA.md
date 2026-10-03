@@ -103,13 +103,38 @@ The transport has **no authentication or encryption**. Bind it to a private meta
 `tests/raft_tcp.rs` runs a real 3-server cluster over localhost: election and replication, follower
 redirect, and leader shutdown, failover and rejoin from disk.
 
+### Quorum configuration (`membership` module)
+
+Every Raft quorum decision (pre-votes, votes, commit acknowledgements, check-quorum) goes through
+`Membership::has_quorum`. Today the configuration is always `Stable { voters }` (the node plus its
+peers). `Joint { old, new }` requires a majority of both sets, which is the rule a joint-consensus
+membership change needs; the change protocol itself (committing the joint and then the new
+configuration) is not implemented yet.
+
+### Metrics
+
+`RaftServer::render_metrics()` and `NativeEngine::render_metrics()` return Prometheus text; the
+process hosting a node serves them on its `/metrics` endpoint (there is no standalone native node
+binary yet). All Raft series carry a `node` label:
+
+- Raft: `atlas_native_raft_{term,commit_index,applied_index,last_index,snapshot_index}`,
+  `atlas_native_raft_role{role}` (one-hot), `atlas_native_raft_peer_match_index{peer}` (leader only),
+  `atlas_native_raft_{elections,leader_terms,append_rejections}_total`;
+- transport, per peer: `atlas_native_transport_{sent,connect_failures,write_failures,dropped}_total`,
+  plus `atlas_native_transport_rejected_frames_total`;
+- engine: `atlas_native_{reads,writes,read_bytes,write_bytes,checksum_failures,replica_fallbacks}_total`,
+  `atlas_native_gc_reclaimed_extents_total`, `atlas_native_metadata_applied_index`,
+  `atlas_native_wal_records`, `atlas_native_{volumes,snapshots,extents}`,
+  `atlas_native_allocator_free_{bytes,ranges}`, `atlas_native_device_bytes{node}`.
+
 Not implemented yet:
 
 - wiring `NativeEngine` to commit through Raft instead of its local WAL. The engine's data plane
   addresses devices as local files, so this needs a networked data-node layer first; replicating
   metadata that points at another process's local files would be incoherent;
 - transport TLS / mutual auth;
-- membership changes: the voter set is fixed at open;
+- membership changes: the voter set is fixed at open (quorum math already supports joint
+  configurations);
 - linearizable reads (read index / leases).
 
 ## Failure model covered

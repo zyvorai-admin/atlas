@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     durable,
+    membership::Membership,
     metadata::{Catalog, MetaCommand, MetaError},
     wal::{Wal, WalError, WalRecord},
 };
@@ -175,9 +176,22 @@ struct HardState {
     voted_for: Option<NodeId>,
 }
 
+/// Monotonic event counters, exported as Prometheus counters by `RaftServer`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RaftCounters {
+    /// Real elections started (after a successful pre-vote round).
+    pub elections: u64,
+    /// Times this node became leader.
+    pub leader_terms: u64,
+    /// `AppendEntries` rejections received while leader (log-consistency backoffs).
+    pub append_rejections: u64,
+}
+
 #[derive(Debug)]
 pub struct RaftNode {
     cfg: RaftConfig,
+    membership: Membership,
+    counters: RaftCounters,
     role: Role,
     hard: HardState,
     leader: Option<NodeId>,
@@ -255,7 +269,10 @@ impl RaftNode {
         for b in cfg.id.bytes() {
             rng = (rng ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
+        let membership = Membership::stable(cfg.peers.iter().cloned().chain([cfg.id.clone()]));
         let mut node = Self {
+            membership,
+            counters: RaftCounters::default(),
             role: Role::Follower,
             hard,
             leader: None,
@@ -314,6 +331,20 @@ impl RaftNode {
             .map(|e| e.index)
             .unwrap_or(self.snapshot_index)
     }
+    pub fn membership(&self) -> &Membership {
+        &self.membership
+    }
+    pub fn counters(&self) -> RaftCounters {
+        self.counters
+    }
+    /// Highest log index known to be replicated on each peer; empty unless leader.
+    pub fn peer_match_index(&self) -> BTreeMap<NodeId, u64> {
+        if self.role == Role::Leader {
+            self.match_index.clone()
+        } else {
+            BTreeMap::new()
+        }
+    }
     fn last_term(&self) -> u64 {
         self.log
             .last()
@@ -330,9 +361,9 @@ impl RaftNode {
             self.check_quorum_elapsed += 1;
             if self.check_quorum_elapsed >= self.cfg.election_ticks.0 {
                 self.check_quorum_elapsed = 0;
-                let active = self.recent_active.len() + 1;
-                self.recent_active.clear();
-                if active < self.quorum() {
+                let mut active = std::mem::take(&mut self.recent_active);
+                active.insert(self.cfg.id.clone());
+                if !self.membership.has_quorum(&active) {
                     return self.become_follower(self.hard.term, None);
                 }
             }
@@ -411,7 +442,7 @@ impl RaftNode {
             Message::PreVoteResponse { term, granted } => {
                 if self.role == Role::PreCandidate && granted && term == self.hard.term + 1 {
                     self.votes.insert(from);
-                    if self.votes.len() >= self.quorum() {
+                    if self.membership.has_quorum(&self.votes) {
                         self.campaign()?;
                     }
                 }
@@ -440,7 +471,7 @@ impl RaftNode {
             Message::RequestVoteResponse { term, granted } => {
                 if self.role == Role::Candidate && term == self.hard.term && granted {
                     self.votes.insert(from);
-                    if self.votes.len() >= self.quorum() {
+                    if self.membership.has_quorum(&self.votes) {
                         self.become_leader()?;
                     }
                 }
@@ -498,6 +529,7 @@ impl RaftNode {
                         self.send_append(&from);
                     }
                 } else {
+                    self.counters.append_rejections += 1;
                     let cur = self.next_index.get(&from).copied().unwrap_or(1);
                     let next = cur.saturating_sub(1).min(match_index + 1).max(1);
                     self.next_index.insert(from.clone(), next);
@@ -634,7 +666,7 @@ impl RaftNode {
         self.leader = None;
         self.votes = BTreeSet::from([self.cfg.id.clone()]);
         self.reset_election_timer();
-        if self.votes.len() >= self.quorum() {
+        if self.membership.has_quorum(&self.votes) {
             return self.campaign();
         }
         let msg = Message::PreVote {
@@ -649,6 +681,7 @@ impl RaftNode {
     }
 
     fn campaign(&mut self) -> Result<(), RaftError> {
+        self.counters.elections += 1;
         self.role = Role::Candidate;
         self.hard.term += 1;
         self.hard.voted_for = Some(self.cfg.id.clone());
@@ -656,7 +689,7 @@ impl RaftNode {
         self.leader = None;
         self.votes = BTreeSet::from([self.cfg.id.clone()]);
         self.reset_election_timer();
-        if self.votes.len() >= self.quorum() {
+        if self.membership.has_quorum(&self.votes) {
             return self.become_leader();
         }
         let msg = Message::RequestVote {
@@ -684,6 +717,7 @@ impl RaftNode {
     }
 
     fn become_leader(&mut self) -> Result<(), RaftError> {
+        self.counters.leader_terms += 1;
         self.role = Role::Leader;
         self.leader = Some(self.cfg.id.clone());
         self.heartbeat_elapsed = 0;
@@ -752,14 +786,19 @@ impl RaftNode {
     }
 
     fn advance_commit(&mut self) -> Result<(), RaftError> {
-        let quorum = self.quorum();
         let mut new_commit = self.commit_index;
         for n in (self.commit_index + 1..=self.last_index()).rev() {
             if self.term_at(n) != Some(self.hard.term) {
                 break;
             }
-            let acks = 1 + self.match_index.values().filter(|m| **m >= n).count();
-            if acks >= quorum {
+            let acks: BTreeSet<NodeId> = self
+                .match_index
+                .iter()
+                .filter(|(_, m)| **m >= n)
+                .map(|(p, _)| p.clone())
+                .chain([self.cfg.id.clone()])
+                .collect();
+            if self.membership.has_quorum(&acks) {
                 new_commit = n;
                 break;
             }
@@ -817,11 +856,6 @@ impl RaftNode {
             return None;
         }
         self.log.get((index - self.snapshot_index - 1) as usize)
-    }
-
-    fn quorum(&self) -> usize {
-        let voters = self.cfg.peers.len() + 1;
-        voters / 2 + 1
     }
 
     fn reset_election_timer(&mut self) {
