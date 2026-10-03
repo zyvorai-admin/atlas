@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     checksum,
     device::FileDevice,
-    gc,
+    durable, gc,
     metadata::{Catalog, ExtentRef, MetaCommand, MetaError, ReplicaRef, SnapshotId, VolumeId},
     placement::{select_replicas, Node, PlacementPolicy},
     telemetry::NativeIoCounters,
@@ -45,6 +45,8 @@ pub struct EngineConfig {
     pub root: PathBuf,
     pub extent_bytes: usize,
     pub placement: PlacementPolicy,
+    /// Compact the WAL once it retains this many records (0 disables automatic compaction).
+    pub wal_compact_after: u64,
 }
 
 impl EngineConfig {
@@ -53,6 +55,7 @@ impl EngineConfig {
             root: root.as_ref().to_path_buf(),
             extent_bytes: 4 * 1024 * 1024,
             placement: PlacementPolicy::default(),
+            wal_compact_after: 1024,
         }
     }
 }
@@ -69,6 +72,9 @@ pub struct NativeEngine {
     nodes: Vec<NodeRuntime>,
     catalog: RwLock<Catalog>,
     wal: Mutex<Wal>,
+    /// Serializes free-list allocation through data write and `InstallExtent` commit, so two
+    /// writers can never be handed the same free range.
+    write_lock: Mutex<()>,
     pub telemetry: NativeIoCounters,
 }
 
@@ -93,17 +99,19 @@ impl NativeEngine {
         } else {
             Catalog::default()
         };
-        let wal = Wal::open(cfg.root.join("wal"))?;
+        let mut wal = Wal::open(cfg.root.join("wal"))?;
         for rec in wal.replay::<MetaCommand>()? {
             if rec.index > catalog.applied_index {
                 catalog.apply(rec.term, rec.index, &rec.command)?;
             }
         }
+        wal.raise_floor(catalog.applied_index);
         let engine = Self {
             cfg,
             nodes: runtimes,
             catalog: RwLock::new(catalog),
             wal: Mutex::new(wal),
+            write_lock: Mutex::new(()),
             telemetry: NativeIoCounters::default(),
         };
         engine.persist_catalog()?;
@@ -138,6 +146,10 @@ impl NativeEngine {
         if data.is_empty() {
             return Ok(());
         }
+        let _write = self
+            .write_lock
+            .lock()
+            .map_err(|_| NativeError::Poisoned("write"))?;
         let size = {
             let c = self
                 .catalog
@@ -169,14 +181,30 @@ impl NativeEngine {
                     found: selected.len(),
                 });
             }
+            let reuse: Vec<Option<u64>> = {
+                let c = self
+                    .catalog
+                    .read()
+                    .map_err(|_| NativeError::Poisoned("catalog"))?;
+                selected
+                    .iter()
+                    .map(|id| c.free.find(id, 0, chunk.len() as u64))
+                    .collect()
+            };
             let mut replicas = Vec::new();
-            for node_id in selected {
+            for (node_id, free_off) in selected.into_iter().zip(reuse) {
                 let node = self
                     .nodes
                     .iter()
                     .find(|n| n.spec.id == node_id)
                     .ok_or_else(|| NativeError::NotFound(node_id.clone()))?;
-                let off = node.devices[0].append(chunk)?;
+                let off = match free_off {
+                    Some(off) => {
+                        node.devices[0].write_at(off, chunk)?;
+                        off
+                    }
+                    None => node.devices[0].append(chunk)?,
+                };
                 replicas.push(ReplicaRef {
                     node_id,
                     device_index: 0,
@@ -269,23 +297,22 @@ impl NativeEngine {
     }
 
     pub fn gc_once(&self) -> Result<gc::GcStats, NativeError> {
-        let candidates = {
+        let (candidates, free_before) = {
             let c = self
                 .catalog
                 .read()
                 .map_err(|_| NativeError::Poisoned("catalog"))?;
-            gc::collect_candidates(&c)
+            (gc::collect_candidates(&c), c.free.total_bytes())
         };
         let mut stats = gc::GcStats {
             candidates: candidates.len() as u64,
-            reclaimed: 0,
+            ..Default::default()
         };
-        // Phase 2 only reclaims metadata references. Device-space hole-punch/reuse comes in the
-        // allocator PR; append-only device files remain crash-simple for now.
         for eid in candidates {
             self.commit(MetaCommand::MarkExtentReclaimed { extent_id: eid })?;
             stats.reclaimed += 1;
         }
+        stats.freed_bytes = self.free_bytes()?.saturating_sub(free_before);
         Ok(stats)
     }
 
@@ -295,6 +322,46 @@ impl NativeEngine {
             .read()
             .map_err(|_| NativeError::Poisoned("catalog"))?
             .applied_index)
+    }
+
+    /// Device bytes (summed over replicas) currently on the free lists.
+    pub fn free_bytes(&self) -> Result<u64, NativeError> {
+        Ok(self
+            .catalog
+            .read()
+            .map_err(|_| NativeError::Poisoned("catalog"))?
+            .free
+            .total_bytes())
+    }
+
+    /// Size of the backing file for `node_id`'s first device.
+    pub fn device_len(&self, node_id: &str) -> Result<u64, NativeError> {
+        self.nodes
+            .iter()
+            .find(|n| n.spec.id == node_id)
+            .ok_or_else(|| NativeError::NotFound(node_id.into()))?
+            .devices[0]
+            .len()
+    }
+
+    /// Records currently retained in the WAL.
+    pub fn wal_records(&self) -> Result<u64, NativeError> {
+        Ok(self
+            .wal
+            .lock()
+            .map_err(|_| NativeError::Poisoned("wal"))?
+            .len())
+    }
+
+    /// Persists the catalog and drops every WAL record it covers. Returns the records removed.
+    pub fn checkpoint(&self) -> Result<u64, NativeError> {
+        let mut wal = self.wal.lock().map_err(|_| NativeError::Poisoned("wal"))?;
+        let c = self
+            .catalog
+            .read()
+            .map_err(|_| NativeError::Poisoned("catalog"))?;
+        self.persist_locked(&c)?;
+        Ok(wal.compact_through(c.applied_index)?)
     }
 
     fn commit(&self, command: MetaCommand) -> Result<Vec<String>, NativeError> {
@@ -317,6 +384,10 @@ impl NativeEngine {
         wal.append(&rec)?;
         *c = next;
         self.persist_locked(&c)?;
+        if self.cfg.wal_compact_after > 0 && wal.len() >= self.cfg.wal_compact_after {
+            // catalog.json now durably covers `index`, so every record up to it is redundant.
+            wal.compact_through(index)?;
+        }
         Ok(gc)
     }
 
@@ -358,17 +429,8 @@ impl NativeEngine {
     }
 
     fn persist_locked(&self, catalog: &Catalog) -> Result<(), NativeError> {
-        let tmp = self.cfg.root.join("catalog.json.tmp");
-        let dst = self.cfg.root.join("catalog.json");
         let bytes = serde_json::to_vec_pretty(catalog)?;
-        fs::write(&tmp, bytes)?;
-        let f = fs::OpenOptions::new().read(true).open(&tmp)?;
-        f.sync_all()?;
-        fs::rename(&tmp, &dst)?;
-        if let Some(parent) = dst.parent() {
-            let d = fs::File::open(parent)?;
-            d.sync_all()?;
-        }
+        durable::write_atomic(&self.cfg.root.join("catalog.json"), &bytes)?;
         Ok(())
     }
 }

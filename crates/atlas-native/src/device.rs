@@ -60,6 +60,37 @@ impl FileDevice {
         Ok(off)
     }
 
+    /// Overwrites `data.len()` bytes at `offset` (reuse of a freed range). Never extends the file.
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), NativeError> {
+        let mut f = self
+            .file
+            .lock()
+            .map_err(|_| NativeError::Poisoned("device"))?;
+        let end = f.seek(SeekFrom::End(0))?;
+        if offset + data.len() as u64 > end {
+            return Err(NativeError::Invalid(format!(
+                "write_at {offset}+{} past device end {end}",
+                data.len()
+            )));
+        }
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(data)?;
+        f.sync_data()?;
+        Ok(())
+    }
+
+    pub fn len(&self) -> Result<u64, NativeError> {
+        let f = self
+            .file
+            .lock()
+            .map_err(|_| NativeError::Poisoned("device"))?;
+        Ok(f.metadata()?.len())
+    }
+
+    pub fn is_empty(&self) -> Result<bool, NativeError> {
+        Ok(self.len()? == 0)
+    }
+
     pub fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, NativeError> {
         let mut f = self
             .file

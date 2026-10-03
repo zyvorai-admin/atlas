@@ -9,6 +9,8 @@ use std::{
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use crate::durable::sync_dir;
+
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
     #[error("wal io error: {0}")]
@@ -17,6 +19,8 @@ pub enum WalError {
     Decode(#[from] serde_json::Error),
     #[error("wal index regression: expected > {last}, got {next}")]
     IndexRegression { last: u64, next: u64 },
+    #[error("wal corrupt at line {line}: {reason}")]
+    Corrupt { line: usize, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,42 +30,39 @@ pub struct WalRecord<T> {
     pub command: T,
 }
 
+#[derive(Deserialize)]
+struct IndexOnly {
+    index: u64,
+}
+
 #[derive(Debug)]
 pub struct Wal {
+    dir: PathBuf,
     path: PathBuf,
     file: File,
     last_index: u64,
+    records: u64,
 }
 
 impl Wal {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, WalError> {
-        fs::create_dir_all(root.as_ref())?;
-        let path = root.as_ref().join("metadata.wal");
-        let last_index = if path.exists() {
-            let f = File::open(&path)?;
-            let mut last = 0;
-            for line in BufReader::new(f).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let v: serde_json::Value = serde_json::from_str(&line)?;
-                last = v.get("index").and_then(|v| v.as_u64()).unwrap_or(last);
-            }
-            last
-        } else {
-            0
-        };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
-        Ok(Self {
+        let dir = root.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("metadata.wal");
+        let (lines, torn) = scan(&path)?;
+        let file = open_append(&path)?;
+        let mut wal = Self {
+            dir,
             path,
             file,
-            last_index,
-        })
+            last_index: lines.last().map(|(i, _)| *i).unwrap_or(0),
+            records: lines.len() as u64,
+        };
+        if torn {
+            // A torn final line was never fsynced as a whole record, so it was never acknowledged.
+            wal.rewrite(|_| true)?;
+        }
+        Ok(wal)
     }
 
     pub fn append<T: Serialize>(&mut self, record: &WalRecord<T>) -> Result<(), WalError> {
@@ -71,30 +72,129 @@ impl Wal {
                 next: record.index,
             });
         }
-        serde_json::to_writer(&mut self.file, record)?;
-        self.file.write_all(b"\n")?;
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
         self.file.sync_data()?;
         self.last_index = record.index;
+        self.records += 1;
         Ok(())
     }
 
     pub fn replay<T: DeserializeOwned>(&self) -> Result<Vec<WalRecord<T>>, WalError> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let f = File::open(&self.path)?;
-        let mut out = Vec::new();
-        for line in BufReader::new(f).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            out.push(serde_json::from_str(&line)?);
-        }
-        Ok(out)
+        let (lines, _) = scan(&self.path)?;
+        lines
+            .iter()
+            .map(|(_, l)| serde_json::from_str(l).map_err(WalError::from))
+            .collect()
     }
 
     pub fn last_index(&self) -> u64 {
         self.last_index
     }
+
+    /// Number of records currently retained in the log file.
+    pub fn len(&self) -> u64 {
+        self.records
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records == 0
+    }
+
+    /// Keeps `last_index` at or above a checkpointed index, so indexes stay monotonic even when
+    /// compaction has removed every record from the file.
+    pub fn raise_floor(&mut self, index: u64) {
+        self.last_index = self.last_index.max(index);
+    }
+
+    /// Drops every record with `index <= through`. Only safe once state covering `through` has
+    /// been durably checkpointed.
+    pub fn compact_through(&mut self, through: u64) -> Result<u64, WalError> {
+        self.rewrite(|i| i > through)
+    }
+
+    /// Drops every record with `index > after` (Raft log-conflict resolution).
+    pub fn truncate_after(&mut self, after: u64) -> Result<u64, WalError> {
+        let removed = self.rewrite(|i| i <= after)?;
+        self.last_index = after;
+        Ok(removed)
+    }
+
+    /// Empties the log and restarts indexing just above `floor` (snapshot installation).
+    pub fn reset(&mut self, floor: u64) -> Result<(), WalError> {
+        self.rewrite(|_| false)?;
+        self.last_index = floor;
+        Ok(())
+    }
+
+    fn rewrite(&mut self, keep: impl Fn(u64) -> bool) -> Result<u64, WalError> {
+        let (lines, _) = scan(&self.path)?;
+        let tmp = self.dir.join("metadata.wal.tmp");
+        let mut kept = 0u64;
+        {
+            let mut f = File::create(&tmp)?;
+            for (i, l) in &lines {
+                if keep(*i) {
+                    f.write_all(l.as_bytes())?;
+                    f.write_all(b"\n")?;
+                    kept += 1;
+                }
+            }
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &self.path)?;
+        sync_dir(&self.dir)?;
+        self.file = open_append(&self.path)?;
+        let removed = self.records.saturating_sub(kept);
+        self.records = kept;
+        Ok(removed)
+    }
+}
+
+fn open_append(path: &Path) -> Result<File, WalError> {
+    Ok(OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?)
+}
+
+/// Returns every complete `(index, raw line)` and whether the final line was torn.
+fn scan(path: &Path) -> Result<(Vec<(u64, String)>, bool), WalError> {
+    if !path.exists() {
+        return Ok((Vec::new(), false));
+    }
+    let raw: Vec<String> = BufReader::new(File::open(path)?)
+        .lines()
+        .collect::<Result<_, _>>()?;
+    let last_non_empty = raw.iter().rposition(|l| !l.trim().is_empty());
+    let mut out = Vec::with_capacity(raw.len());
+    let mut torn = false;
+    for (n, line) in raw.into_iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<IndexOnly>(&line) {
+            Ok(r) => {
+                if let Some((prev, _)) = out.last() {
+                    if r.index <= *prev {
+                        return Err(WalError::Corrupt {
+                            line: n + 1,
+                            reason: format!("index {} after {prev}", r.index),
+                        });
+                    }
+                }
+                out.push((r.index, line));
+            }
+            Err(_) if Some(n) == last_non_empty => torn = true,
+            Err(e) => {
+                return Err(WalError::Corrupt {
+                    line: n + 1,
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+    Ok((out, torn))
 }

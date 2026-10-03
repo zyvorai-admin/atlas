@@ -114,6 +114,10 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
 - `crates/atlas-io` — optional node sensor (bin `atlas-io-agent`): fake/live bio source, device-map
   attribution, histograms, workload accounting, RCA, fail-open leases; own HTTP API + `/metrics`,
   not embedded in `atlas-gateway` (see `docs/IO_EBPF.md`).
+- `crates/atlas-native` — native data plane (library only, not yet wired into the gateway): replicated
+  extent engine, metadata WAL + checkpoint/compaction, refcounted extents with free-list space reuse,
+  and a sans-IO Raft core for the metadata log (no network transport yet). See
+  `docs/NATIVE_STORAGE.md`, `docs/NATIVE_METADATA.md`.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
   DB-backed rate-limit counters (`rate_limit.rs`).

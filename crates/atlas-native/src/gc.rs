@@ -7,6 +7,8 @@ use crate::metadata::{Catalog, ExtentId};
 pub struct GcStats {
     pub candidates: u64,
     pub reclaimed: u64,
+    /// Device bytes (summed over replicas) returned to the free lists.
+    pub freed_bytes: u64,
 }
 
 pub fn collect_candidates(catalog: &Catalog) -> Vec<ExtentId> {

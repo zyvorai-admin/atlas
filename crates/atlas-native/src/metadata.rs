@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::alloc::FreeList;
+
 pub type VolumeId = String;
 pub type SnapshotId = String;
 pub type ExtentId = String;
@@ -54,6 +56,8 @@ pub struct Catalog {
     pub extents: BTreeMap<ExtentId, ExtentMeta>,
     pub applied_index: u64,
     pub current_term: u64,
+    #[serde(default)]
+    pub free: FreeList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +87,8 @@ pub enum MetaCommand {
     MarkExtentReclaimed {
         extent_id: ExtentId,
     },
+    /// Appended by a new Raft leader so entries from earlier terms can be committed.
+    Noop,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +138,12 @@ impl Catalog {
                         .ok_or_else(|| MetaError::NotFound(volume_id.clone()))?;
                     vol.extents.insert(*logical_offset, extent.id.clone())
                 };
+                if !self.extents.contains_key(&extent.id) {
+                    for r in &extent.replicas {
+                        self.free
+                            .reserve(&r.node_id, r.device_index, r.offset, extent.len as u64);
+                    }
+                }
                 self.extents
                     .entry(extent.id.clone())
                     .and_modify(|e| e.refs += 1)
@@ -192,7 +204,7 @@ impl Catalog {
             MetaCommand::MarkExtentReclaimed { extent_id } => {
                 let e = self
                     .extents
-                    .get_mut(extent_id)
+                    .get(extent_id)
                     .ok_or_else(|| MetaError::NotFound(extent_id.clone()))?;
                 if e.refs != 0 {
                     return Err(MetaError::Invalid(format!(
@@ -200,12 +212,43 @@ impl Catalog {
                         e.refs
                     )));
                 }
-                e.tombstoned = true;
+                let e = self.extents.remove(extent_id).expect("checked above");
+                for r in &e.extent.replicas {
+                    self.free
+                        .release(&r.node_id, r.device_index, r.offset, e.extent.len as u64)
+                        .map_err(MetaError::Invalid)?;
+                }
             }
+            MetaCommand::Noop => {}
         }
         self.current_term = term;
         self.applied_index = index;
         Ok(gc_candidates)
+    }
+
+    /// Applies an already-committed entry. A command that fails validation still consumes its
+    /// index and leaves the catalog otherwise untouched, so every replica that applies the same
+    /// log reaches the same state.
+    pub fn apply_committed(
+        &mut self,
+        term: u64,
+        index: u64,
+        cmd: &MetaCommand,
+    ) -> Result<Vec<ExtentId>, MetaError> {
+        let mut next = self.clone();
+        match next.apply(term, index, cmd) {
+            Ok(gc) => {
+                *self = next;
+                Ok(gc)
+            }
+            Err(e) => {
+                if index > self.applied_index {
+                    self.applied_index = index;
+                    self.current_term = term;
+                }
+                Err(e)
+            }
+        }
     }
 
     fn dec_ref(&mut self, extent_id: &str, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
