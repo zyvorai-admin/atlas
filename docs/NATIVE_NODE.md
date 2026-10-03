@@ -63,6 +63,7 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | Field | Default | Notes |
 | --- | --- | --- |
 | `api_token_file` | none | Bearer token required on every `/v1/*` request. Without it `/v1/*` is open: keep `http_listen` on localhost or a private network. |
+| `http_tls` | none | `{"cert", "key", "client_ca"?}`: serve the HTTP API over TLS. With `client_ca`, every `/v1/*` request must also present a client certificate signed by it (401 otherwise; a certificate from another CA fails the handshake), while `/healthz`, `/readyz` and `/metrics` stay open to probes and scrapers. |
 | `tls` | none | Mutual TLS for the Raft and data-node transports (not the HTTP endpoint). Node ids must then be DNS names present as SANs on each node's certificate. |
 | `max_request_bytes` | 64 MiB | Larger HTTP bodies and read lengths get 413. |
 | `metadata.replicas` | 3 | Between 1 and the number of `data_nodes`. |
@@ -98,8 +99,7 @@ invalid token, 404 unknown volume/snapshot/route (or no metadata role), 409 reje
 machine, 413 body too large, 503 retryable (not enough data nodes, leadership changed, timeout).
 
 The HTTP server is deliberately small: one request per connection, `Content-Length` bodies only
-(chunked requests get 411), 16 KiB of headers, 30 s socket timeouts, no TLS (terminate TLS in front
-of it if it leaves the host).
+(chunked requests get 411), 16 KiB of headers, 30 s socket timeouts, optional TLS (`http_tls`).
 
 ## Operations
 
@@ -150,7 +150,5 @@ repair after losing a data node, and config validation.
 
 ## Not implemented yet
 
-- TLS or client-certificate auth on the HTTP endpoint (use a token plus a private network, or a
-  TLS-terminating proxy);
 - Raft membership changes (the voter set is fixed by config);
 - a Helm chart and gateway integration (the raw manifest above is the only deployment).

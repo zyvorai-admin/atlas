@@ -16,6 +16,10 @@ use std::{
     time::Duration,
 };
 
+use rustls::ServerConfig;
+
+use crate::tls::Conn;
+
 const MAX_HEADER_BYTES: usize = 16 << 10;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// After responding, unread request bytes (e.g. a refused oversized body) are drained up to this
@@ -31,6 +35,8 @@ pub struct Request {
     /// Header names lower-cased.
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// Over HTTPS with a client CA configured: the client presented a certificate it signed.
+    pub client_verified: bool,
 }
 
 #[derive(Debug)]
@@ -79,6 +85,16 @@ impl HttpServer {
     /// Serves `handler` on an already-bound `listener`; request bodies above `max_body` bytes
     /// are refused with 413.
     pub fn start(listener: TcpListener, max_body: usize, handler: Handler) -> io::Result<Self> {
+        Self::start_with(listener, max_body, handler, None)
+    }
+
+    /// As [`HttpServer::start`], serving HTTPS when `tls` is set.
+    pub fn start_with(
+        listener: TcpListener,
+        max_body: usize,
+        handler: Handler,
+        tls: Option<Arc<ServerConfig>>,
+    ) -> io::Result<Self> {
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -91,7 +107,10 @@ impl HttpServer {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let handler = handler.clone();
-                            let h = thread::spawn(move || serve(stream, max_body, &handler));
+                            let tls = tls.clone();
+                            let h = thread::spawn(move || {
+                                serve(stream, max_body, &handler, tls.as_ref())
+                            });
                             if let Ok(mut w) = workers.lock() {
                                 w.retain(|h| !h.is_finished());
                                 w.push(h);
@@ -140,36 +159,44 @@ impl Drop for HttpServer {
     }
 }
 
-fn serve(stream: TcpStream, max_body: usize, handler: &Handler) {
+fn serve(stream: TcpStream, max_body: usize, handler: &Handler, tls: Option<&Arc<ServerConfig>>) {
     if stream.set_nonblocking(false).is_err()
         || stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
     {
         return;
     }
-    let Ok(mut out) = stream.try_clone() else {
+    let Ok(raw) = stream.try_clone() else {
         return;
     };
-    let resp = match read_request(stream, max_body) {
-        Ok(req) => handler(req),
+    let Ok(mut conn) = Conn::accept(stream, tls, IO_TIMEOUT) else {
+        return;
+    };
+    let resp = match read_request(&mut conn, max_body) {
+        Ok(mut req) => {
+            req.client_verified = conn.client_verified();
+            handler(req)
+        }
         Err(resp) => resp,
     };
-    if write_response(&mut out, &resp).is_err() {
+    if write_response(&mut conn, &resp).is_err() {
         return;
     }
-    let _ = out.shutdown(Shutdown::Write);
-    let _ = out.set_read_timeout(Some(LINGER_TIMEOUT));
+    conn.close_notify();
+    let _ = raw.shutdown(Shutdown::Write);
+    let _ = raw.set_read_timeout(Some(LINGER_TIMEOUT));
     let mut sink = [0u8; 8192];
     let mut drained = 0;
+    let mut raw = raw;
     while drained < LINGER_DRAIN_BYTES {
-        match out.read(&mut sink) {
+        match raw.read(&mut sink) {
             Ok(0) | Err(_) => break,
             Ok(n) => drained += n,
         }
     }
 }
 
-fn read_request(stream: TcpStream, max_body: usize) -> Result<Request, Response> {
+fn read_request(stream: &mut impl Read, max_body: usize) -> Result<Request, Response> {
     let bad = |msg: &str| Response::text(400, msg.to_string());
     let mut r = BufReader::new(stream);
     let mut head = Vec::new();
@@ -233,6 +260,7 @@ fn read_request(stream: TcpStream, max_body: usize) -> Result<Request, Response>
         query,
         headers,
         body,
+        client_verified: false,
     })
 }
 

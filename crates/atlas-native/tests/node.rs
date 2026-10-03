@@ -91,6 +91,7 @@ impl Cluster {
             http_listen: "127.0.0.1:0".parse().unwrap(),
             api_token_file: Some(root.join("token")),
             tls: None,
+            http_tls: None,
             data_node: None,
             metadata: None,
             max_request_bytes: 1 << 20,
