@@ -17,6 +17,7 @@ pub mod gc;
 pub mod metadata;
 pub mod placement;
 pub mod raft;
+pub mod raft_server;
 pub mod telemetry;
 pub mod wal;
 
@@ -27,3 +28,4 @@ pub use gc::GcStats;
 pub use metadata::{Catalog, MetaCommand, SnapshotId, VolumeId};
 pub use placement::{FailureDomain, Node, PlacementPolicy};
 pub use raft::{Envelope, Message, RaftConfig, RaftError, RaftNode, Role};
+pub use raft_server::{RaftServer, RaftStatus};

@@ -11,8 +11,10 @@
 //! fsynced before they are acknowledged or counted toward the leader's own quorum vote, and
 //! `catalog.json` is persisted before the log is compacted past it.
 //!
-//! Not implemented: pre-vote / check-quorum (a partitioned node that rejoins with a higher term
-//! forces one extra election) and membership changes (the voter set is fixed at open).
+//! Pre-vote keeps a partitioned node from inflating its term: it only starts a real election after
+//! a majority confirms it could win. Check-quorum makes a leader that has not heard from a
+//! majority within an election timeout step down, and lets nodes with a live leader ignore
+//! disruptive vote requests. Not implemented: membership changes (the voter set is fixed at open).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -47,6 +49,12 @@ pub enum RaftError {
     Config(String),
     #[error("raft log inconsistency: {0}")]
     Inconsistent(String),
+    #[error("leadership lost before index {index} applied; it may or may not commit")]
+    LeadershipLost { index: u64 },
+    #[error("timed out waiting for index {index} to apply")]
+    Timeout { index: u64 },
+    #[error("raft server is shut down")]
+    Shutdown,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +89,8 @@ impl RaftConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Follower,
+    /// Collecting pre-votes; has not incremented its term.
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -88,6 +98,18 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
+    /// `term` is the term the sender would campaign in (its current term + 1). Never changes the
+    /// receiver's term.
+    PreVote {
+        term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// When granted, `term` echoes the proposed term; otherwise it is the responder's term.
+    PreVoteResponse {
+        term: u64,
+        granted: bool,
+    },
     RequestVote {
         term: u64,
         last_log_index: u64,
@@ -128,7 +150,9 @@ pub enum Message {
 impl Message {
     pub fn term(&self) -> u64 {
         match self {
-            Message::RequestVote { term, .. }
+            Message::PreVote { term, .. }
+            | Message::PreVoteResponse { term, .. }
+            | Message::RequestVote { term, .. }
             | Message::RequestVoteResponse { term, .. }
             | Message::AppendEntries { term, .. }
             | Message::AppendEntriesResponse { term, .. }
@@ -168,6 +192,9 @@ pub struct RaftNode {
     votes: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    /// Peers that answered the leader since the last check-quorum round.
+    recent_active: BTreeSet<NodeId>,
+    check_quorum_elapsed: u64,
     election_elapsed: u64,
     election_timeout: u64,
     heartbeat_elapsed: u64,
@@ -241,6 +268,8 @@ impl RaftNode {
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            recent_active: BTreeSet::new(),
+            check_quorum_elapsed: 0,
             election_elapsed: 0,
             election_timeout: 0,
             heartbeat_elapsed: 0,
@@ -298,6 +327,15 @@ impl RaftNode {
 
     pub fn tick(&mut self) -> Result<(), RaftError> {
         if self.role == Role::Leader {
+            self.check_quorum_elapsed += 1;
+            if self.check_quorum_elapsed >= self.cfg.election_ticks.0 {
+                self.check_quorum_elapsed = 0;
+                let active = self.recent_active.len() + 1;
+                self.recent_active.clear();
+                if active < self.quorum() {
+                    return self.become_follower(self.hard.term, None);
+                }
+            }
             self.heartbeat_elapsed += 1;
             if self.heartbeat_elapsed >= self.cfg.heartbeat_ticks {
                 self.heartbeat_elapsed = 0;
@@ -306,7 +344,7 @@ impl RaftNode {
         } else {
             self.election_elapsed += 1;
             if self.election_elapsed >= self.election_timeout {
-                self.campaign()?;
+                self.pre_campaign()?;
             }
         }
         Ok(())
@@ -337,22 +375,53 @@ impl RaftNode {
     pub fn step(&mut self, env: Envelope) -> Result<(), RaftError> {
         let from = env.from;
         let term = env.msg.term();
-        if term > self.hard.term {
-            let hint = matches!(
-                env.msg,
-                Message::AppendEntries { .. } | Message::InstallSnapshot { .. }
-            )
-            .then(|| from.clone());
-            self.become_follower(term, hint)?;
+        match env.msg {
+            Message::PreVote { .. } | Message::PreVoteResponse { granted: true, .. } => {}
+            Message::RequestVote { .. } if term > self.hard.term && self.leader_active() => {
+                // Check-quorum lease: a live leader exists, so this election is disruptive.
+                return Ok(());
+            }
+            _ if term > self.hard.term => {
+                let hint = matches!(
+                    env.msg,
+                    Message::AppendEntries { .. } | Message::InstallSnapshot { .. }
+                )
+                .then(|| from.clone());
+                self.become_follower(term, hint)?;
+            }
+            _ => {}
         }
         match env.msg {
+            Message::PreVote {
+                term,
+                last_log_index,
+                last_log_term,
+            } => {
+                let granted = term > self.hard.term
+                    && self.log_up_to_date(last_log_index, last_log_term)
+                    && !self.leader_active();
+                self.send(
+                    from,
+                    Message::PreVoteResponse {
+                        term: if granted { term } else { self.hard.term },
+                        granted,
+                    },
+                );
+            }
+            Message::PreVoteResponse { term, granted } => {
+                if self.role == Role::PreCandidate && granted && term == self.hard.term + 1 {
+                    self.votes.insert(from);
+                    if self.votes.len() >= self.quorum() {
+                        self.campaign()?;
+                    }
+                }
+            }
             Message::RequestVote {
                 term,
                 last_log_index,
                 last_log_term,
             } => {
-                let up_to_date = last_log_term > self.last_term()
-                    || (last_log_term == self.last_term() && last_log_index >= self.last_index());
+                let up_to_date = self.log_up_to_date(last_log_index, last_log_term);
                 let can_vote = self.hard.voted_for.as_ref().is_none_or(|v| *v == from);
                 let granted = term == self.hard.term && can_vote && up_to_date;
                 if granted {
@@ -418,6 +487,7 @@ impl RaftNode {
                 if self.role != Role::Leader || term != self.hard.term {
                     return Ok(());
                 }
+                self.recent_active.insert(from.clone());
                 if success {
                     let m = self.match_index.entry(from.clone()).or_insert(0);
                     *m = (*m).max(match_index);
@@ -455,6 +525,7 @@ impl RaftNode {
                 if self.role != Role::Leader || term != self.hard.term {
                     return Ok(());
                 }
+                self.recent_active.insert(from.clone());
                 let last = self.last_index();
                 let m = self.match_index.entry(from.clone()).or_insert(0);
                 *m = (*m).max(match_index.min(last));
@@ -546,6 +617,37 @@ impl RaftNode {
         Ok(())
     }
 
+    fn log_up_to_date(&self, last_log_index: u64, last_log_term: u64) -> bool {
+        last_log_term > self.last_term()
+            || (last_log_term == self.last_term() && last_log_index >= self.last_index())
+    }
+
+    /// True while this node is the leader or has heard from one within the minimum election
+    /// timeout.
+    fn leader_active(&self) -> bool {
+        self.role == Role::Leader
+            || (self.leader.is_some() && self.election_elapsed < self.cfg.election_ticks.0)
+    }
+
+    fn pre_campaign(&mut self) -> Result<(), RaftError> {
+        self.role = Role::PreCandidate;
+        self.leader = None;
+        self.votes = BTreeSet::from([self.cfg.id.clone()]);
+        self.reset_election_timer();
+        if self.votes.len() >= self.quorum() {
+            return self.campaign();
+        }
+        let msg = Message::PreVote {
+            term: self.hard.term + 1,
+            last_log_index: self.last_index(),
+            last_log_term: self.last_term(),
+        };
+        for p in self.cfg.peers.clone() {
+            self.send(p, msg.clone());
+        }
+        Ok(())
+    }
+
     fn campaign(&mut self) -> Result<(), RaftError> {
         self.role = Role::Candidate;
         self.hard.term += 1;
@@ -585,6 +687,8 @@ impl RaftNode {
         self.role = Role::Leader;
         self.leader = Some(self.cfg.id.clone());
         self.heartbeat_elapsed = 0;
+        self.check_quorum_elapsed = 0;
+        self.recent_active.clear();
         let next = self.last_index() + 1;
         self.next_index = self.cfg.peers.iter().map(|p| (p.clone(), next)).collect();
         self.match_index = self.cfg.peers.iter().map(|p| (p.clone(), 0)).collect();
