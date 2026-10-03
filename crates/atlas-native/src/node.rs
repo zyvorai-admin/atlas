@@ -259,6 +259,8 @@ struct NodeShared {
     require_client_cert: bool,
     /// Bounds `POST /v1/members` (joint and final entries, including a new voter catching up).
     membership_timeout: Duration,
+    /// `(extent_bytes, replicas)` of the metadata role, reported by `/v1/status`.
+    layout: Option<(usize, usize)>,
     raft: Option<Arc<RaftServer>>,
     engine: Option<NativeEngine>,
     data: Mutex<Option<DataNodeServer>>,
@@ -406,6 +408,7 @@ impl NativeNode {
                 .map(|m| Duration::from_millis(m.proposal_timeout_ms.saturating_mul(6)))
                 .unwrap_or_default(),
             require_client_cert: cfg.http_tls.as_ref().is_some_and(|t| t.client_ca.is_some()),
+            layout: cfg.metadata.as_ref().map(|m| (m.extent_bytes, m.replicas)),
             raft,
             engine,
             data: Mutex::new(data),
@@ -785,6 +788,7 @@ fn status(sh: &NodeShared) -> Response {
         &json!({
             "node_id": sh.id,
             "metadata": raft,
+            "layout": sh.layout.map(|(e, r)| json!({ "extent_bytes": e, "replicas": r })),
             "data_nodes": nodes,
             "last_repair": last_repair,
             "data_node": fence.map(|f| json!({ "fence": f })),

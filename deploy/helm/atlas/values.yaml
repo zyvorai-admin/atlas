@@ -204,6 +204,22 @@ zfs:
   # host mount table) and forces real mode.
   driverMode: fake
 
+# atlas-native cluster (deploy/helm/atlas-native) as backend `bkd_native`: discovery, plus
+# synchronous block volume / snapshot create and delete through POST /volumes with
+# `kubernetes.backend_id: bkd_native`. "fake" (default) keeps volumes in memory.
+native:
+  enabled: false
+  driverMode: fake
+  # Comma-separated node API base URLs, e.g.
+  # "https://atlas-native-0.atlas-native.atlas-native.svc.cluster.local:7480,...".
+  endpoints: ""
+  # Secret with key `token` (the atlas-native chart creates "<release>-api").
+  tokenSecret: ""
+  # Secret with `ca.crt` (private CA of the node API) and, when clientCert is true, the client
+  # `tls.crt`/`tls.key` for nodes running with httpTls.requireClientCert.
+  tlsSecret: ""
+  clientCert: false
+
 # Raw-disk provisioning from the console's Disks page: wipe + `zpool create` / `zpool destroy`
 # (ZFS) and the Ceph-OSD-via-Rook path. Renders a PRIVILEGED gateway pod with hostPath mounts of the
 # node's /dev, /run/udev (read-only) and /proc/1/mountinfo (read-only) — see docs/DISKS.md for why

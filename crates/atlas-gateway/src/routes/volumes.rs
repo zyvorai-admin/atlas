@@ -8,14 +8,18 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use atlas_api_types::{CreateVolumeRequest, Owner, Placement};
+use atlas_api_types::{
+    CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest, DeleteVolumeRequest, Owner,
+    Placement,
+};
 use atlas_common::{ids, AppError, AppResult};
+use atlas_driver_core::{DriverError, StorageDriver};
 use atlas_jobs::{JobSpec, OwnerRef};
 
 use super::util::{accepted, validate_k8s_name, CEPH_BACKEND_ID};
 use crate::auth::Actor;
+use crate::startup::{LONGHORN_BACKEND_ID, NATIVE_BACKEND_ID};
 use crate::state::AppState;
-use crate::startup::LONGHORN_BACKEND_ID;
 
 // ---- snapshots (read) ----
 
@@ -70,6 +74,15 @@ pub(crate) async fn create_volume(
         }
     }
 
+    if body
+        .kubernetes
+        .as_ref()
+        .and_then(|k| k.backend_id.as_deref())
+        == Some(NATIVE_BACKEND_ID)
+    {
+        return create_native_volume(&s, &actor, body).await;
+    }
+
     let k8s_opts = body.kubernetes.clone();
     let namespace = k8s_opts
         .as_ref()
@@ -113,23 +126,38 @@ pub(crate) async fn create_volume(
         // the best available signal here — still correct for the common case of a tenant
         // overriding just the StorageClass for an existing named intent.
     }
-    let backend_id = k8s_opts.as_ref().and_then(|k| k.backend_id.as_deref())
+    let backend_id = k8s_opts
+        .as_ref()
+        .and_then(|k| k.backend_id.as_deref())
         .unwrap_or(CEPH_BACKEND_ID);
     if backend_id != CEPH_BACKEND_ID {
         if backend_id != LONGHORN_BACKEND_ID || s.driver_for(backend_id).is_none() {
-            return Err(AppError::Validation(format!("backend {backend_id} is not available for PVC provisioning")));
-        }
-        let k8s = s.k8s.as_ref().ok_or_else(|| AppError::Unavailable("Kubernetes unavailable".into()))?;
-        let classes = k8s.list_storage_classes().await
-            .map_err(|e| AppError::Unavailable(e.to_string()))?;
-        if !classes.iter().any(|sc| sc.name == placement.storage_class && sc.provisioner == "driver.longhorn.io") {
             return Err(AppError::Validation(format!(
-                "storage class {} must use driver.longhorn.io for backend {backend_id}", placement.storage_class
+                "backend {backend_id} is not available for PVC provisioning"
+            )));
+        }
+        let k8s = s
+            .k8s
+            .as_ref()
+            .ok_or_else(|| AppError::Unavailable("Kubernetes unavailable".into()))?;
+        let classes = k8s
+            .list_storage_classes()
+            .await
+            .map_err(|e| AppError::Unavailable(e.to_string()))?;
+        if !classes
+            .iter()
+            .any(|sc| sc.name == placement.storage_class && sc.provisioner == "driver.longhorn.io")
+        {
+            return Err(AppError::Validation(format!(
+                "storage class {} must use driver.longhorn.io for backend {backend_id}",
+                placement.storage_class
             )));
         }
     }
     if atlas_inventory::is_backend_cordoned(&s.pool, backend_id).await? {
-        return Err(AppError::Unavailable(format!("backend {backend_id} is cordoned for maintenance")));
+        return Err(AppError::Unavailable(format!(
+            "backend {backend_id} is cordoned for maintenance"
+        )));
     }
     let access_modes = k8s_opts
         .as_ref()
@@ -204,6 +232,115 @@ pub(crate) async fn create_volume(
     ))
 }
 
+/// The atlas-native driver when `volume_id` lives on that backend.
+async fn native_driver_for_volume(
+    s: &AppState,
+    volume_id: &str,
+) -> AppResult<Option<std::sync::Arc<dyn StorageDriver>>> {
+    if atlas_inventory::volume_backend_id(&s.pool, volume_id)
+        .await?
+        .as_deref()
+        != Some(NATIVE_BACKEND_ID)
+    {
+        return Ok(None);
+    }
+    s.drivers
+        .get(NATIVE_BACKEND_ID)
+        .map(Some)
+        .ok_or_else(|| AppError::Unavailable("the atlas-native driver is not enabled".into()))
+}
+
+fn driver_error(e: DriverError) -> AppError {
+    match e {
+        DriverError::Unreachable(m) => AppError::Unavailable(m),
+        DriverError::Backend(m) if m.starts_with("not found") => AppError::NotFound(m),
+        DriverError::Backend(m) => AppError::Conflict(m),
+        e => AppError::Driver(e.to_string()),
+    }
+}
+
+async fn audit(
+    s: &AppState,
+    tenant: Option<&str>,
+    actor: &Actor,
+    action: &str,
+    kind: &str,
+    id: &str,
+    detail: Option<Value>,
+) {
+    let _ = atlas_inventory::audit::record(
+        &s.pool,
+        tenant,
+        &actor.id,
+        action,
+        kind,
+        id,
+        "succeeded",
+        detail,
+        None,
+    )
+    .await;
+}
+
+/// `POST /volumes` on the atlas-native backend: synchronous (no Kubernetes involved).
+async fn create_native_volume(
+    s: &AppState,
+    actor: &Actor,
+    body: CreateVolumeRequest,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    let driver = s.drivers.get(NATIVE_BACKEND_ID).ok_or_else(|| {
+        AppError::Validation(format!("backend {NATIVE_BACKEND_ID} is not enabled"))
+    })?;
+    if atlas_inventory::is_backend_cordoned(&s.pool, NATIVE_BACKEND_ID).await? {
+        return Err(AppError::Unavailable(format!(
+            "backend {NATIVE_BACKEND_ID} is cordoned for maintenance"
+        )));
+    }
+    let res = driver
+        .create_volume(body.clone())
+        .await
+        .map_err(driver_error)?;
+    // Discovery records the cluster/pool rows and the volume; then attribute it to the tenant.
+    atlas_discovery::run_discovery(&s.pool, driver, None, None)
+        .await
+        .map_err(|e| AppError::Unavailable(format!("discovery after create: {e:#}")))?;
+    let vol = atlas_inventory::get_volume(&s.pool, &res.volume_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("{} missing after discovery", res.volume_id)))?;
+    atlas_inventory::upsert_volume(&s.pool, NATIVE_BACKEND_ID, &body.tenant_id, &vol, None).await?;
+    if let Some(o) = &body.owner {
+        atlas_inventory::insert_binding(
+            &s.pool,
+            &format!("bind_{}", res.volume_id),
+            &body.tenant_id,
+            &o.product,
+            &o.resource_type,
+            &o.resource_id,
+            "volume",
+            &res.volume_id,
+            &o.role,
+        )
+        .await?;
+    }
+    audit(
+        s,
+        Some(&body.tenant_id),
+        actor,
+        "volume.create",
+        "volume",
+        &res.volume_id,
+        Some(json!({ "name": body.name, "backend_id": NATIVE_BACKEND_ID })),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            json!({ "volume_id": res.volume_id, "backend_id": NATIVE_BACKEND_ID,
+                     "backend_native_id": res.backend_native_id, "state": "available" }),
+        ),
+    ))
+}
+
 /// `DELETE /volumes/{id}[?confirm=true]` — delete the PVC + inventory row as a job.
 /// Safe-by-default (PDF §14 Rule 2): production-class volumes require confirm=true
 /// (legacy force=true also accepted — matches the console delete path).
@@ -220,6 +357,19 @@ pub(crate) async fn delete_volume(
     if volume_requires_delete_confirm(&vol) && !q.confirmed() {
         return Err(AppError::Validation(
             "confirm=true is required to delete this volume (production / protected class)".into(),
+        ));
+    }
+    if let Some(driver) = native_driver_for_volume(&s, &id).await? {
+        let native = vol.backend_native_id.clone().unwrap_or_else(|| id.clone());
+        driver
+            .delete_volume(DeleteVolumeRequest { volume_id: native })
+            .await
+            .map_err(driver_error)?;
+        atlas_inventory::delete_volume_row(&s.pool, &id).await?;
+        audit(&s, None, &actor, "volume.delete", "volume", &id, None).await;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "volume_id": id, "deleted": true })),
         ));
     }
     let namespace = vol
@@ -284,6 +434,11 @@ pub(crate) async fn expand_volume(
             "new_size_bytes must be larger than the current size".into(),
         ));
     }
+    if native_driver_for_volume(&s, &id).await?.is_some() {
+        return Err(AppError::Validation(
+            "the atlas-native backend does not support resizing volumes yet".into(),
+        ));
+    }
     let namespace = vol
         .kubernetes_namespace
         .ok_or_else(|| AppError::Validation("volume has no kubernetes namespace".into()))?;
@@ -333,6 +488,48 @@ pub(crate) async fn create_snapshot(
         &resource_tenant,
         format!("volume {id}"),
     )?;
+    if let Some(driver) = native_driver_for_volume(&s, &id).await? {
+        let name = body
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| format!("{}-snap", vol.name));
+        let native = vol.backend_native_id.clone().unwrap_or_else(|| id.clone());
+        let res = driver
+            .create_snapshot(CreateSnapshotRequest {
+                volume_id: native,
+                name: name.clone(),
+            })
+            .await
+            .map_err(driver_error)?;
+        atlas_inventory::snapshots::insert_snapshot(
+            &s.pool,
+            &res.snapshot_id,
+            &resource_tenant,
+            &id,
+            &name,
+            Some(&res.backend_native_id),
+            "crash",
+            "ready",
+        )
+        .await?;
+        audit(
+            &s,
+            Some(&resource_tenant),
+            &actor,
+            "snapshot.create",
+            "volume",
+            &id,
+            Some(json!({ "snapshot_id": res.snapshot_id, "name": name })),
+        )
+        .await;
+        return Ok((
+            StatusCode::CREATED,
+            Json(
+                json!({ "snapshot_id": res.snapshot_id, "volume_id": id, "name": name,
+                         "state": "ready" }),
+            ),
+        ));
+    }
     let namespace = vol
         .kubernetes_namespace
         .ok_or_else(|| AppError::Validation("volume has no kubernetes namespace".into()))?;
@@ -443,6 +640,30 @@ pub(crate) async fn delete_snapshot(
         )));
     }
 
+    if let Some(driver) = native_driver_for_volume(&s, &snap.volume_id).await? {
+        let native = snap.backend_native_id.clone().unwrap_or_else(|| id.clone());
+        driver
+            .delete_snapshot(DeleteSnapshotRequest {
+                snapshot_id: native,
+            })
+            .await
+            .map_err(driver_error)?;
+        atlas_inventory::snapshots::delete_snapshot_row(&s.pool, &id).await?;
+        audit(
+            &s,
+            Some(&snap.tenant_id),
+            &actor,
+            "snapshot.delete",
+            "snapshot",
+            &id,
+            None,
+        )
+        .await;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "snapshot_id": id, "deleted": true })),
+        ));
+    }
     // The VolumeSnapshot lives in the source volume's namespace.
     let vol = atlas_inventory::get_volume(&s.pool, &snap.volume_id).await?;
     let namespace = vol
@@ -528,6 +749,14 @@ pub(crate) async fn enqueue_clone(
         &snap.tenant_id,
         format!("snapshot {snapshot_id}"),
     )?;
+    if native_driver_for_volume(s, &snap.volume_id)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::Validation(format!(
+            "{mode} from a snapshot is not supported by the atlas-native backend yet"
+        )));
+    }
     // Defaults come from the source volume.
     let src = atlas_inventory::get_volume(&s.pool, &snap.volume_id).await?;
     let namespace = body

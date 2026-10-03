@@ -103,6 +103,7 @@ purely additive.
 | Fake ZFS | `atlas-driver-zfs` | Deterministic fixtures | `ATLAS_ZFS_DRIVER_MODE=fake` (default). |
 | Ceph RGW (object) | `atlas-driver-rgw` | Generic SigV4 S3 client (`S3Target`) for bucket/object CRUD, presigned URLs | Default backend for `POST /buckets` (`bkd_ceph_lab`, via Rook `ObjectBucketClaim`). Also used for any bring-your-own S3-compatible endpoint (MinIO, Garage, AWS, a customer-run RustFS) — see `docs/RUSTFS.md` for the history of Atlas's now-removed first-party RustFS integration. |
 | Longhorn | `atlas-driver-longhorn` | Read-only, over Longhorn's Kubernetes v1beta2 CRDs (`nodes`/`volumes`) | `ATLAS_LONGHORN_ENABLE=1`. No native write path — PVC provisioning goes through the Kubernetes StorageClass path, not this driver. See `docs/LONGHORN.md`. |
+| atlas-native | `atlas-driver-native` | `atlas-native-node` HTTP API (`/v1/status`, `/v1/volumes`, snapshots): one cluster, one replicated `native` pool, block volumes; create/delete volumes and snapshots | `ATLAS_NATIVE_ENABLE=1` registers `bkd_native`; `ATLAS_NATIVE_DRIVER_MODE=real` + `ATLAS_NATIVE_ENDPOINTS` for a live cluster (fake keeps volumes in memory). The only driver whose write methods the gateway calls: `POST /volumes` with `kubernetes.backend_id: bkd_native` and the snapshot routes run synchronously through it. See `docs/NATIVE_NODE.md`. |
 | Kubernetes | `atlas-driver-k8s` | Lists StorageClasses / PVCs / PVs via `kube-rs`; tags Ceph-backed classes | Always live when a cluster is reachable. Also the mechanism behind `POST /ceph/devices` (patches the `CephCluster` CR for raw-disk-to-OSD provisioning, see `docs/DISKS.md`). |
 
 ## Request flow (discovery)
@@ -181,6 +182,7 @@ secret-redacting `Debug`:
 | `ATLAS_NFS_DRIVER_MODE` / `ATLAS_ZFS_DRIVER_MODE` | `fake` | `real` (live `showmount`/`zpool`/`zfs` discovery) or `fake` (fixtures) |
 | `ATLAS_S3_CA_CERT` | *(unset)* | Path to a mounted CA cert to additionally trust for any S3-compatible endpoint (private CA / self-signed) — never disables verification, only adds one root |
 | `ATLAS_LONGHORN_ENABLE` | `0` | Register the read-only Longhorn backend (see `docs/LONGHORN.md`) |
+| `ATLAS_NATIVE_ENABLE`, `ATLAS_NATIVE_DRIVER_MODE`, `ATLAS_NATIVE_ENDPOINTS`, `ATLAS_NATIVE_TOKEN_FILE`, `ATLAS_NATIVE_CA_CERT`, `ATLAS_NATIVE_CLIENT_CERT`/`_KEY`, `ATLAS_NATIVE_TIMEOUT_SECS` | off / `fake` / – / – / – / – / `10` | Register the atlas-native backend `bkd_native` (see `docs/NATIVE_NODE.md`, "Atlas gateway") |
 | `ATLAS_HOST_MOUNTINFO_PATH` | *(unset)* | Path to a hostPath-mounted `/proc/1/mountinfo` (e.g. `/host-mountinfo`) so the ZFS root/boot-disk safety check can see the *host's* real mount table from inside a container, not just its own mount namespace — see `docs/DISKS.md` |
 | `ATLAS_RATE_LIMIT_RPM` | `600` | Per-actor per-minute request budget |
 | `ATLAS_RATE_LIMIT_SYNC_SECS` | `2` | Cross-replica rate-limit counter sync interval (Postgres only) |

@@ -99,6 +99,7 @@ pub(crate) async fn create_backend(
         Some("san") => BackendType::San,
         Some("cloud_block") => BackendType::CloudBlock,
         Some("kubernetes") => BackendType::Kubernetes,
+        Some("native") => BackendType::Native,
         Some(other) => {
             return Err(AppError::Validation(format!(
                 "unknown backend_type: {other}"
@@ -170,6 +171,9 @@ pub(crate) async fn create_backend(
         // Avoid persisting a pending row which would silently lack a live driver.
         BackendType::Longhorn => return Err(AppError::Validation(
             "enable Longhorn with ATLAS_LONGHORN_ENABLE=1 and restart the gateway".into(),
+        )),
+        BackendType::Native => return Err(AppError::Validation(
+            "enable atlas-native with ATLAS_NATIVE_ENABLE=1 and ATLAS_NATIVE_ENDPOINTS, then restart the gateway".into(),
         )),
         _ => ("pending", None),
     };

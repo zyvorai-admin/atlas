@@ -385,6 +385,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-driver-native"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "atlas-api-types",
+ "atlas-driver-core",
+ "atlas-native",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "atlas-driver-nfs"
 version = "0.4.0"
 dependencies = [
@@ -443,6 +459,7 @@ dependencies = [
  "atlas-driver-core",
  "atlas-driver-k8s",
  "atlas-driver-longhorn",
+ "atlas-driver-native",
  "atlas-driver-nfs",
  "atlas-driver-rgw",
  "atlas-driver-zfs",
