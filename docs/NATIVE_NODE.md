@@ -106,6 +106,10 @@ The HTTP server is deliberately small: one request per connection, `Content-Leng
 - **Maintenance**: the leader runs `repair_once` (scrub every replica, re-replicate missing or
   corrupt ones) and `gc_once` (reclaim unreferenced extents) on their intervals. Each pass is a full
   scan; size the repair interval to the data volume.
+- **Dead connections**: a peer that vanishes without closing its sockets (a deleted pod, a
+  powered-off host) is detected by its Raft senders: a connection is replaced when the peer has
+  answered none of our requests for `max(40 ticks, 1 s)` or has reconnected to us since (it
+  restarted). Counted in `atlas_native_transport_stale_reconnects_total`.
 - **Failure**: a data node that fails I/O is backed off for 5 s and writes move to the next eligible
   node; reads fall back to other replicas. Losing the metadata leader triggers an election
   (typically well under a second with the default tick) and clients retry against the new leader.
@@ -138,6 +142,16 @@ hash. Pods therefore roll only when the image or manifest changed; re-running it
 writes and reads a block through the leader, and with `--verify-failover` deletes the leader pod and
 reads the block back from the newly elected one.
 
+### Helm
+
+`deploy/helm/atlas-native` is the production form of the same layout: configurable voter count,
+replication factor and engine tuning, an API token Secret (generated and kept across upgrades, or
+your own), optional Raft/data mutual TLS (an existing Secret or a cert-manager `Certificate` with
+every pod name as a SAN), optional HTTPS with client-certificate auth, and a `ServiceMonitor`. See
+its [README](../deploy/helm/atlas-native/README.md). `deploy/native/helm-live-check.sh <repo> <tag>`
+installs it with both TLS layers on a throwaway PKI and verifies auth refusals, unaligned I/O,
+leader-pod failover and that an unchanged `helm upgrade` restarts nothing.
+
 ## Smoke test
 
 `deploy/native/smoke.sh [path/to/atlas-native-node]` starts three metadata and three data node
@@ -151,4 +165,4 @@ repair after losing a data node, and config validation.
 ## Not implemented yet
 
 - Raft membership changes (the voter set is fixed by config);
-- a Helm chart and gateway integration (the raw manifest above is the only deployment).
+- gateway integration.
