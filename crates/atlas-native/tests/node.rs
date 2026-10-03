@@ -333,6 +333,53 @@ fn http_api_round_trip_with_auth_and_leader_redirect() {
     want.extend_from_slice(&[0u8; 4]);
     c.wait_read(&format!("/v1/volumes/{v}/data?offset=3904&len=300"), &want);
 
+    // Clone from the snapshot and grow the source.
+    let (_, cl) = c.on_leader(
+        "POST",
+        &format!("/v1/snapshots/{s}/clone"),
+        br#"{"name":"copy","size_bytes":12288}"#,
+        201,
+    );
+    let cv = json(&cl)["id"].as_str().unwrap().to_string();
+    let mut want = vec![9u8; 4096];
+    want.extend_from_slice(&[0u8; 8192]);
+    c.wait_read(&format!("/v1/volumes/{cv}/data?offset=0&len=12288"), &want);
+    c.on_leader(
+        "POST",
+        &format!("/v1/volumes/{v}/resize"),
+        br#"{"size_bytes":16384}"#,
+        200,
+    );
+    c.on_leader(
+        "PUT",
+        &format!("/v1/volumes/{v}/data?offset=16000"),
+        &[3u8; 384],
+        204,
+    );
+    c.on_leader(
+        "POST",
+        &format!("/v1/volumes/{v}/resize"),
+        br#"{"size_bytes":4096}"#,
+        409,
+    );
+    c.on_leader(
+        "POST",
+        "/v1/volumes/nope/resize",
+        br#"{"size_bytes":1}"#,
+        404,
+    );
+    c.on_leader("POST", "/v1/snapshots/nope/clone", br#"{"name":"x"}"#, 404);
+    assert_eq!(
+        api(
+            laddr,
+            "POST",
+            &format!("/v1/snapshots/{s}/clone"),
+            br#"{"name":"x","size_bytes":"big"}"#
+        )
+        .0,
+        400
+    );
+
     let (st, m) = http(laddr, "GET", "/metrics", None, b"");
     let m = String::from_utf8(m).unwrap();
     assert_eq!(st, 200);

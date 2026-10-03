@@ -18,9 +18,10 @@ mod http;
 
 use async_trait::async_trait;
 use atlas_api_types::{
-    CreateSnapshotRequest, CreateSnapshotResult, CreateVolumeRequest, CreateVolumeResult,
-    DeleteSnapshotRequest, DeleteVolumeRequest, DiscoveryResult, Health, MetricSample,
-    StorageCluster, StorageHealth, StoragePool, StorageVolume, VolumeKind,
+    CloneSnapshotRequest, CreateSnapshotRequest, CreateSnapshotResult, CreateVolumeRequest,
+    CreateVolumeResult, DeleteSnapshotRequest, DeleteVolumeRequest, DiscoveryResult,
+    ExpandVolumeRequest, Health, MetricSample, StorageCluster, StorageHealth, StoragePool,
+    StorageVolume, VolumeKind,
 };
 use atlas_driver_core::{DriverError, StorageDriver};
 use serde::Deserialize;
@@ -77,10 +78,31 @@ pub struct NativeVolume {
 pub trait NativeApi: Send + Sync {
     async fn status(&self) -> Result<NodeStatus, DriverError>;
     async fn volumes(&self) -> Result<Vec<NativeVolume>, DriverError>;
-    async fn create_volume(&self, name: &str, size_bytes: u64) -> Result<String, DriverError>;
+    /// Creates take the new id from the caller so a retried create is a no-op.
+    async fn create_volume(
+        &self,
+        id: &str,
+        name: &str,
+        size_bytes: u64,
+    ) -> Result<String, DriverError>;
     async fn delete_volume(&self, id: &str) -> Result<(), DriverError>;
-    async fn create_snapshot(&self, volume_id: &str, name: &str) -> Result<String, DriverError>;
+    async fn resize_volume(&self, id: &str, size_bytes: u64) -> Result<(), DriverError>;
+    async fn create_snapshot(
+        &self,
+        id: &str,
+        volume_id: &str,
+        name: &str,
+    ) -> Result<String, DriverError>;
+    async fn clone_snapshot(
+        &self,
+        id: &str,
+        snapshot_id: &str,
+        name: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<String, DriverError>;
     async fn delete_snapshot(&self, id: &str) -> Result<(), DriverError>;
+    async fn read(&self, volume_id: &str, offset: u64, len: u64) -> Result<Vec<u8>, DriverError>;
+    async fn write(&self, volume_id: &str, offset: u64, data: Vec<u8>) -> Result<(), DriverError>;
 }
 
 pub struct NativeDriver<A> {
@@ -164,6 +186,17 @@ fn health_of(status: &NodeStatus) -> (Health, String) {
             ),
         )
     }
+}
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn positive(size: i64) -> Result<u64, DriverError> {
+    u64::try_from(size)
+        .ok()
+        .filter(|s| *s > 0)
+        .ok_or_else(|| DriverError::Backend("size_bytes must be > 0".into()))
 }
 
 fn to_i64(v: u64) -> i64 {
@@ -325,11 +358,35 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
                 "atlas-native provides block volumes only".into(),
             ));
         }
-        let size = u64::try_from(req.size_bytes)
-            .ok()
-            .filter(|s| *s > 0)
-            .ok_or_else(|| DriverError::Backend("size_bytes must be > 0".into()))?;
-        let id = self.api.create_volume(&req.name, size).await?;
+        let size = positive(req.size_bytes)?;
+        let id = self.api.create_volume(&new_id(), &req.name, size).await?;
+        Ok(CreateVolumeResult {
+            volume_id: format!("{VOLUME_PREFIX}{id}"),
+            backend_native_id: id,
+        })
+    }
+
+    async fn expand_volume(&self, req: ExpandVolumeRequest) -> Result<(), DriverError> {
+        let size = positive(req.new_size_bytes)?;
+        self.api
+            .resize_volume(native_volume_id(&req.volume_id), size)
+            .await
+    }
+
+    async fn clone_snapshot(
+        &self,
+        req: CloneSnapshotRequest,
+    ) -> Result<CreateVolumeResult, DriverError> {
+        let size = req.size_bytes.map(positive).transpose()?;
+        let id = self
+            .api
+            .clone_snapshot(
+                &new_id(),
+                native_snapshot_id(&req.snapshot_id),
+                &req.new_volume_name,
+                size,
+            )
+            .await?;
         Ok(CreateVolumeResult {
             volume_id: format!("{VOLUME_PREFIX}{id}"),
             backend_native_id: id,
@@ -348,7 +405,7 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
     ) -> Result<CreateSnapshotResult, DriverError> {
         let id = self
             .api
-            .create_snapshot(native_volume_id(&req.volume_id), &req.name)
+            .create_snapshot(&new_id(), native_volume_id(&req.volume_id), &req.name)
             .await?;
         Ok(CreateSnapshotResult {
             snapshot_id: format!("{SNAPSHOT_PREFIX}{id}"),
@@ -359,6 +416,31 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
     async fn delete_snapshot(&self, req: DeleteSnapshotRequest) -> Result<(), DriverError> {
         self.api
             .delete_snapshot(native_snapshot_id(&req.snapshot_id))
+            .await
+    }
+
+    async fn read_volume(
+        &self,
+        volume_id: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, DriverError> {
+        self.api
+            .read(native_volume_id(volume_id), offset, len)
+            .await
+    }
+
+    async fn write_volume(
+        &self,
+        volume_id: &str,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), DriverError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.api
+            .write(native_volume_id(volume_id), offset, data)
             .await
     }
 }
@@ -409,6 +491,46 @@ mod tests {
             .await
             .unwrap();
         assert!(snap.snapshot_id.starts_with("snap_native_"));
+
+        d.expand_volume(ExpandVolumeRequest {
+            volume_id: created.volume_id.clone(),
+            new_size_bytes: 16 << 20,
+        })
+        .await
+        .unwrap();
+        let clone = d
+            .clone_snapshot(CloneSnapshotRequest {
+                snapshot_id: snap.snapshot_id.clone(),
+                new_volume_name: "copy".into(),
+                size_bytes: None,
+            })
+            .await
+            .unwrap();
+        let sizes: Vec<(String, i64)> = d
+            .list_volumes(POOL_NAME)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| (v.id, v.size_bytes))
+            .collect();
+        assert!(sizes.contains(&(created.volume_id.clone(), 16 << 20)));
+        assert!(
+            sizes.contains(&(clone.volume_id.clone(), 8 << 20)),
+            "{sizes:?}"
+        );
+        assert!(d
+            .clone_snapshot(CloneSnapshotRequest {
+                snapshot_id: snap.snapshot_id.clone(),
+                new_volume_name: "small".into(),
+                size_bytes: Some(4096),
+            })
+            .await
+            .is_err());
+        d.delete_volume(DeleteVolumeRequest {
+            volume_id: clone.volume_id,
+        })
+        .await
+        .unwrap();
         d.delete_snapshot(DeleteSnapshotRequest {
             snapshot_id: snap.snapshot_id,
         })

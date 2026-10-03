@@ -125,6 +125,41 @@ async fn native_backend_volume_and_snapshot_lifecycle() {
         "volume is attributed to its tenant: {acme}"
     );
 
+    let (st, _) = send(
+        c.put(format!("{base}/volumes/{vid}/data?offset=4090"))
+            .body(b"hello native".to_vec()),
+    )
+    .await;
+    assert_eq!(st, 204);
+    let r = c
+        .get(format!("{base}/volumes/{vid}/data?offset=4088&len=16"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(&r.bytes().await.unwrap()[..], b"\0\0hello native\0\0");
+    let (st, body) = send(c.get(format!("{base}/volumes/{vid}/data?offset=8388600&len=16"))).await;
+    assert_eq!(st, 400, "read past the end: {body}");
+    let (st, body) = send(c.get(format!("{base}/volumes/{vid}/data?offset=0&len=999999999"))).await;
+    assert_eq!(st, 400, "len over the cap: {body}");
+    let r = c
+        .put(format!("{base}/volumes/{vid}/data?offset=0"))
+        .body(vec![0u8; (4 << 20) + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 413);
+    let (_, all) = send(c.get(format!("{base}/volumes"))).await;
+    let other = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .find(|id| !id.starts_with("vol_native_"))
+        .expect("a fixture volume on another backend");
+    let (st, body) = send(c.get(format!("{base}/volumes/{other}/data?offset=0&len=1"))).await;
+    assert_eq!(st, 400, "{body}");
+
     let (st, snap) = send(
         c.post(format!("{base}/volumes/{vid}/snapshots"))
             .json(&json!({ "name": "nightly" })),
@@ -140,14 +175,39 @@ async fn native_backend_volume_and_snapshot_lifecycle() {
             .json(&json!({ "new_size_bytes": 16_777_216 })),
     )
     .await;
-    assert_eq!(st, 400, "{body}");
-    let (st, body) = send(
+    assert_eq!(st, 200, "{body}");
+    let (_, vol) = send(c.get(format!("{base}/volumes/{vid}"))).await;
+    assert_eq!(vol["size_bytes"], 16_777_216);
+
+    let (st, clone) = send(
         c.post(format!("{base}/snapshots/{sid}/clone"))
             .json(&json!({ "name": "copy" })),
     )
     .await;
-    assert_eq!(st, 400, "{body}");
+    assert_eq!(st, 201, "{clone}");
+    let cid = clone["volume_id"].as_str().unwrap().to_string();
+    assert!(cid.starts_with("vol_native_"), "{cid}");
+    let (st, cvol) = send(c.get(format!("{base}/volumes/{cid}"))).await;
+    assert_eq!(st, 200, "{cvol}");
+    assert_eq!(cvol["name"], "copy");
+    assert_eq!(cvol["size_bytes"], 16_777_216);
+    let (_, acme) = send(c.get(format!("{base}/volumes?tenant=acme"))).await;
+    assert!(acme.to_string().contains(&cid), "{acme}");
 
+    let (st, restored) = send(
+        c.post(format!("{base}/snapshots/{sid}/restore"))
+            .json(&json!({})),
+    )
+    .await;
+    assert_eq!(st, 201, "{restored}");
+    let rid = restored["volume_id"].as_str().unwrap().to_string();
+
+    let (st, body) = send(c.delete(format!("{base}/snapshots/{sid}"))).await;
+    assert_eq!(st, 409, "clones depend on the snapshot: {body}");
+    for id in [&cid, &rid] {
+        let (st, body) = send(c.delete(format!("{base}/volumes/{id}"))).await;
+        assert_eq!(st, 200, "{body}");
+    }
     let (st, body) = send(c.delete(format!("{base}/snapshots/{sid}"))).await;
     assert_eq!(st, 200, "{body}");
     let (st, body) = send(c.delete(format!("{base}/volumes/{vid}"))).await;

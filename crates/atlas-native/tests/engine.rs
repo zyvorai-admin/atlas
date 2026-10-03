@@ -125,3 +125,93 @@ fn partial_overwrite_survives_reopen() {
     assert_eq!(e.read(&v, 0, 64).unwrap(), want);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn clone_shares_extents_until_written_and_outlives_its_source() {
+    let root = test_root("clone");
+    let e = NativeEngine::open(small_extents(&root), nodes()).unwrap();
+    let v = e.create_volume("src", 64).unwrap();
+    e.write(&v, 0, &[1u8; 64]).unwrap();
+    let s = e.create_snapshot(&v, "s").unwrap();
+    e.write(&v, 0, &[2u8; 16]).unwrap();
+
+    let c = e.clone_snapshot(&s, "copy", None).unwrap();
+    assert_eq!(e.read(&c, 0, 64).unwrap(), vec![1u8; 64]);
+    let info = |id: &str| {
+        e.volumes()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.id == id)
+            .unwrap()
+    };
+    assert_eq!(info(&c).size_bytes, 64);
+    assert_eq!(info(&c).extents, 4);
+
+    // Writes on either side stay on that side.
+    e.write(&c, 20, b"clone").unwrap();
+    assert_eq!(&e.read(&c, 20, 5).unwrap(), b"clone");
+    assert_eq!(e.read(&v, 16, 16).unwrap(), vec![1u8; 16]);
+    assert_eq!(e.read_snapshot(&s, 0, 64).unwrap(), vec![1u8; 64]);
+
+    // A larger clone reads zeros past the snapshot's end.
+    let big = e.clone_snapshot(&s, "big", Some(128)).unwrap();
+    let mut want = vec![1u8; 64];
+    want.resize(128, 0);
+    assert_eq!(e.read(&big, 0, 128).unwrap(), want);
+    assert!(e.clone_snapshot(&s, "small", Some(32)).is_err());
+    assert!(e.clone_snapshot("nope", "x", None).is_err());
+
+    // Dropping the source and snapshot leaves the clones' shared extents alone.
+    e.delete_snapshot(&s).unwrap();
+    e.delete_volume(&v).unwrap();
+    e.gc_once().unwrap();
+    let mut want = vec![1u8; 64];
+    want[20..25].copy_from_slice(b"clone");
+    assert_eq!(e.read(&c, 0, 64).unwrap(), want);
+    assert_eq!(e.read(&big, 0, 64).unwrap(), vec![1u8; 64]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn resize_grows_and_never_shrinks() {
+    let root = test_root("resize");
+    let e = NativeEngine::open(small_extents(&root), nodes()).unwrap();
+    let v = e.create_volume("v", 40).unwrap();
+    e.write(&v, 32, &[7u8; 8]).unwrap();
+    assert!(e.write(&v, 40, b"x").is_err());
+    e.resize_volume(&v, 100).unwrap();
+    e.write(&v, 38, &[8u8; 10]).unwrap();
+    let mut want = vec![0u8; 100];
+    want[32..38].fill(7);
+    want[38..48].fill(8);
+    assert_eq!(e.read(&v, 0, 100).unwrap(), want);
+    assert!(e.resize_volume(&v, 50).is_err(), "shrink refused");
+    assert!(e.resize_volume("nope", 200).is_err());
+    assert_eq!(e.volumes().unwrap()[0].size_bytes, 100);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn creates_with_a_client_id_are_idempotent() {
+    let root = test_root("idem");
+    let e = NativeEngine::open(small_extents(&root), nodes()).unwrap();
+    let v = e.create_volume_as("vol-1".into(), "v", 64).unwrap();
+    assert_eq!(e.create_volume_as("vol-1".into(), "v", 64).unwrap(), v);
+    assert!(e.create_volume_as("vol-1".into(), "other", 64).is_err());
+    assert_eq!(e.volumes().unwrap().len(), 1);
+
+    e.write(&v, 0, &[4u8; 16]).unwrap();
+    let s = e.create_snapshot_as("snap-1".into(), &v, "s").unwrap();
+    e.create_snapshot_as("snap-1".into(), &v, "s").unwrap();
+    assert!(e.create_snapshot_as("snap-1".into(), &v, "t").is_err());
+    let c = e.clone_snapshot_as("clone-1".into(), &s, "c", None).unwrap();
+    e.clone_snapshot_as("clone-1".into(), &s, "c", None).unwrap();
+    assert_eq!(e.volumes().unwrap().len(), 2);
+
+    // The repeats took no extra extent references: dropping everything reclaims every extent.
+    e.delete_volume(&c).unwrap();
+    e.delete_snapshot(&s).unwrap();
+    e.delete_volume(&v).unwrap();
+    assert_eq!(e.gc_once().unwrap().reclaimed, 1);
+    let _ = std::fs::remove_dir_all(root);
+}
