@@ -120,6 +120,7 @@ impl Cluster {
                 listen: l.local_addr().unwrap(),
                 // Every voter, this node included: the node ignores its own entry.
                 peers: raft_addrs.clone(),
+                bootstrap: None,
                 data_nodes: specs.clone(),
                 replicas: 3,
                 extent_bytes: 4096,
@@ -436,4 +437,62 @@ fn config_validation_rejects_bad_files() {
             "{name} accepted"
         );
     }
+}
+
+#[test]
+fn http_members_list_and_remove_a_voter() {
+    let c = Cluster::start(3, 3, 0);
+    let (_, first) = c.meta_addrs()[0].clone();
+    let (st, b) = api(first, "GET", "/v1/members", b"");
+    assert_eq!(st, 200);
+    let m = json(&b);
+    assert_eq!(m["membership"]["type"], "stable");
+    assert_eq!(
+        m["membership"]["voters"],
+        serde_json::json!(["m1", "m2", "m3"])
+    );
+
+    for bad in [
+        &br#"{"voters": ["m1"]}"#[..],
+        br#"{"voters": {"m1": "x", "m9": "no-port"}}"#,
+    ] {
+        let (st, b) = api(first, "POST", "/v1/members", bad);
+        assert_eq!(st, 400, "{}", String::from_utf8_lossy(&b));
+    }
+
+    let addrs = m["addrs"].as_object().unwrap().clone();
+    let keep: serde_json::Map<String, serde_json::Value> =
+        addrs.into_iter().filter(|(id, _)| id != "m3").collect();
+    let mut body = serde_json::json!({ "voters": keep });
+    // The local node's own address is optional.
+    for id in ["m1", "m2"] {
+        body["voters"]
+            .as_object_mut()
+            .unwrap()
+            .entry(id)
+            .or_insert("127.0.0.1:1".into());
+    }
+    let (_, b) = c.on_leader("POST", "/v1/members", body.to_string().as_bytes(), 200);
+    assert_eq!(
+        json(&b)["membership"]["voters"],
+        serde_json::json!(["m1", "m2"])
+    );
+
+    for (id, addr) in c.meta_addrs().into_iter().filter(|(id, _)| id != "m3") {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let m = json(&api(addr, "GET", "/v1/members", b"").1);
+            if m["membership"]["voters"] == serde_json::json!(["m1", "m2"]) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{id}: {m}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"name":"after","size_bytes":4096}"#,
+        201,
+    );
 }

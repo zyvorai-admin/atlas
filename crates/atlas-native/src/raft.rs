@@ -14,7 +14,14 @@
 //! Pre-vote keeps a partitioned node from inflating its term: it only starts a real election after
 //! a majority confirms it could win. Check-quorum makes a leader that has not heard from a
 //! majority within an election timeout step down, and lets nodes with a live leader ignore
-//! disruptive vote requests. Not implemented: membership changes (the voter set is fixed at open).
+//! disruptive vote requests.
+//!
+//! Membership changes use joint consensus ([`RaftNode::change_membership`]): a `Joint` config
+//! entry needs majorities of both the old and new voter sets; once it commits the leader appends
+//! the `Stable` new config, and steps down if it is not part of it. A config entry takes effect
+//! on every node as soon as it is in its log (and reverts if that entry is truncated). A node
+//! outside the current voter set never campaigns, so a new node can start with an empty log and
+//! wait to be added.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,13 +65,19 @@ pub enum RaftError {
     Shutdown,
     #[error("term changed from {expected} to {current} before the proposal")]
     TermChanged { expected: u64, current: u64 },
+    #[error("a membership change is already in progress, or this leader has not committed an entry in its term yet")]
+    MembershipBusy,
 }
 
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     pub id: NodeId,
-    /// The other voters (excluding `id`).
+    /// The other nodes this one knows of (excluding `id`). Unless `bootstrap` says otherwise,
+    /// they and `id` are the initial voters.
     pub peers: Vec<NodeId>,
+    /// Initial voter set, used until the log carries a membership change. A node not listed
+    /// starts as a non-voter that waits to be added. `None`: `peers` plus `id`.
+    pub bootstrap: Option<Vec<NodeId>>,
     pub root: PathBuf,
     /// Election timeout is drawn uniformly from `[min, max)` ticks.
     pub election_ticks: (u64, u64),
@@ -80,6 +93,7 @@ impl RaftConfig {
         Self {
             id: id.into(),
             peers,
+            bootstrap: None,
             root: root.into(),
             election_ticks: (10, 20),
             heartbeat_ticks: 3,
@@ -230,7 +244,9 @@ pub struct RaftCounters {
 #[derive(Debug)]
 pub struct RaftNode {
     cfg: RaftConfig,
+    /// The latest config in the log, else the applied catalog's, else `initial`.
     membership: Membership,
+    initial: Membership,
     counters: RaftCounters,
     role: Role,
     hard: HardState,
@@ -309,9 +325,20 @@ impl RaftNode {
         for b in cfg.id.bytes() {
             rng = (rng ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
-        let membership = Membership::stable(cfg.peers.iter().cloned().chain([cfg.id.clone()]));
+        let initial = match &cfg.bootstrap {
+            Some(b) => {
+                if b.is_empty() || b.iter().collect::<BTreeSet<_>>().len() != b.len() {
+                    return Err(RaftError::Config(
+                        "bootstrap voters must be non-empty and unique".into(),
+                    ));
+                }
+                Membership::stable(b.iter().cloned())
+            }
+            None => Membership::stable(cfg.peers.iter().cloned().chain([cfg.id.clone()])),
+        };
         let mut node = Self {
-            membership,
+            membership: initial.clone(),
+            initial,
             counters: RaftCounters::default(),
             role: Role::Follower,
             hard,
@@ -334,6 +361,7 @@ impl RaftNode {
             outbox: Vec::new(),
             cfg,
         };
+        node.refresh_membership();
         node.reset_election_timer();
         Ok(node)
     }
@@ -373,6 +401,135 @@ impl RaftNode {
     }
     pub fn membership(&self) -> &Membership {
         &self.membership
+    }
+
+    /// Whether this node is in the current voter set.
+    pub fn is_voter(&self) -> bool {
+        self.membership.voters().contains(&self.cfg.id)
+    }
+
+    /// Transport addresses learned from membership changes (applied, then any in the log).
+    pub fn peer_addrs(&self) -> BTreeMap<NodeId, String> {
+        let mut addrs = self.catalog.raft_addrs.clone();
+        for e in &self.log {
+            if let MetaCommand::ChangeMembership { addrs: a, .. } = &e.command {
+                addrs.extend(a.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+        }
+        addrs
+    }
+
+    /// Index of the newest membership entry still in the log, 0 if there is none.
+    pub fn latest_config_index(&self) -> u64 {
+        self.config_index().unwrap_or(0)
+    }
+
+    /// Index of the newest membership entry still in the log (None if only the catalog's).
+    fn config_index(&self) -> Option<u64> {
+        self.log
+            .iter()
+            .rev()
+            .find(|e| matches!(e.command, MetaCommand::ChangeMembership { .. }))
+            .map(|e| e.index)
+    }
+
+    /// Every voter but this node: who to replicate to and ask for votes.
+    fn peers(&self) -> Vec<NodeId> {
+        self.membership
+            .voters()
+            .into_iter()
+            .filter(|p| *p != self.cfg.id)
+            .collect()
+    }
+
+    fn refresh_membership(&mut self) {
+        let latest = self.log.iter().rev().find_map(|e| match &e.command {
+            MetaCommand::ChangeMembership { membership, .. } => Some(membership.clone()),
+            _ => None,
+        });
+        self.membership = latest
+            .or_else(|| self.catalog.membership.clone())
+            .unwrap_or_else(|| self.initial.clone());
+        if self.role == Role::Leader {
+            let peers = self.peers();
+            let next = self.last_index() + 1;
+            self.next_index.retain(|p, _| peers.contains(p));
+            self.match_index.retain(|p, _| peers.contains(p));
+            for p in peers {
+                self.next_index.entry(p.clone()).or_insert(next);
+                self.match_index.entry(p).or_insert(0);
+            }
+        }
+    }
+
+    /// Starts moving the voter set to `voters` (joint consensus); `addrs` supplies transport
+    /// addresses for nodes not yet known. Returns the index of the `Joint` entry; the change is
+    /// complete once the follow-up `Stable` entry applies (see [`Self::membership`]). Refused
+    /// while another change is in flight or before this leader has committed an entry in its term.
+    pub fn change_membership(
+        &mut self,
+        voters: BTreeSet<NodeId>,
+        addrs: BTreeMap<NodeId, String>,
+    ) -> Result<u64, RaftError> {
+        if self.role != Role::Leader {
+            return Err(RaftError::NotLeader {
+                leader: self.leader.clone(),
+            });
+        }
+        if voters.is_empty() {
+            return Err(RaftError::Config("the new voter set is empty".into()));
+        }
+        let Membership::Stable { voters: old } = self.membership.clone() else {
+            return Err(RaftError::MembershipBusy);
+        };
+        if self.config_index().is_some_and(|i| i > self.commit_index)
+            || self.term_at(self.commit_index) != Some(self.hard.term)
+        {
+            return Err(RaftError::MembershipBusy);
+        }
+        if old == voters {
+            return Ok(self.commit_index);
+        }
+        let known = self.peer_addrs();
+        if let Some(missing) = voters.iter().find(|v| {
+            **v != self.cfg.id
+                && !addrs.contains_key(*v)
+                && !known.contains_key(*v)
+                && !self.cfg.peers.contains(*v)
+        }) {
+            return Err(RaftError::Config(format!(
+                "no address for new voter {missing}"
+            )));
+        }
+        let index = self.append_validated(MetaCommand::ChangeMembership {
+            membership: Membership::Joint { old, new: voters },
+            addrs,
+        })?;
+        self.broadcast_append();
+        self.advance_commit()?;
+        Ok(index)
+    }
+
+    /// Leader only: once a `Joint` config commits, append the `Stable` one; once a `Stable`
+    /// config that excludes this leader commits, step down.
+    fn finish_membership_change(&mut self) -> Result<(), RaftError> {
+        if self.role != Role::Leader || self.config_index().is_some_and(|i| i > self.commit_index) {
+            return Ok(());
+        }
+        match self.membership.clone() {
+            Membership::Joint { new, .. } => {
+                self.append_validated(MetaCommand::ChangeMembership {
+                    membership: Membership::Stable { voters: new },
+                    addrs: BTreeMap::new(),
+                })?;
+                self.broadcast_append();
+            }
+            Membership::Stable { voters } if !voters.contains(&self.cfg.id) => {
+                self.become_follower(self.hard.term, None)?;
+            }
+            Membership::Stable { .. } => {}
+        }
+        Ok(())
     }
     pub fn counters(&self) -> RaftCounters {
         self.counters
@@ -430,17 +587,27 @@ impl RaftNode {
                 leader: self.leader.clone(),
             });
         }
+        if matches!(command, MetaCommand::ChangeMembership { .. }) {
+            return Err(RaftError::Config(
+                "membership changes go through change_membership".into(),
+            ));
+        }
+        let index = self.append_validated(command)?;
+        self.broadcast_append();
+        self.advance_commit()?;
+        Ok(index)
+    }
+
+    /// Appends `command` after checking it applies on top of the applied state plus every
+    /// uncommitted entry.
+    fn append_validated(&mut self, command: MetaCommand) -> Result<u64, RaftError> {
         let mut spec = self.catalog.clone();
         let applied = spec.applied_index;
         for e in self.log.iter().filter(|e| e.index > applied) {
             let _ = spec.apply_committed(e.term, e.index, &e.command);
         }
-        let index = self.last_index() + 1;
-        spec.apply(self.hard.term, index, &command)?;
-        self.append_local(command)?;
-        self.broadcast_append();
-        self.advance_commit()?;
-        Ok(index)
+        spec.apply(self.hard.term, self.last_index() + 1, &command)?;
+        self.append_local(command)
     }
 
     pub fn step(&mut self, env: Envelope) -> Result<(), RaftError> {
@@ -555,7 +722,10 @@ impl RaftNode {
                 success,
                 match_index,
             } => {
-                if self.role != Role::Leader || term != self.hard.term {
+                if self.role != Role::Leader
+                    || term != self.hard.term
+                    || !self.next_index.contains_key(&from)
+                {
                     return Ok(());
                 }
                 self.recent_active.insert(from.clone());
@@ -594,7 +764,10 @@ impl RaftNode {
                 );
             }
             Message::InstallSnapshotResponse { term, match_index } => {
-                if self.role != Role::Leader || term != self.hard.term {
+                if self.role != Role::Leader
+                    || term != self.hard.term
+                    || !self.next_index.contains_key(&from)
+                {
                     return Ok(());
                 }
                 self.recent_active.insert(from.clone());
@@ -660,6 +833,7 @@ impl RaftNode {
             self.wal.append(&e)?;
             self.log.push(e);
         }
+        self.refresh_membership();
         if leader_commit > self.commit_index {
             self.commit_index = leader_commit.min(match_index).max(self.commit_index);
             self.apply_committed()?;
@@ -686,6 +860,7 @@ impl RaftNode {
         self.snapshot_index = si;
         self.snapshot_term = st;
         self.commit_index = si;
+        self.refresh_membership();
         Ok(())
     }
 
@@ -702,6 +877,10 @@ impl RaftNode {
     }
 
     fn pre_campaign(&mut self) -> Result<(), RaftError> {
+        if !self.is_voter() {
+            self.reset_election_timer();
+            return Ok(());
+        }
         self.role = Role::PreCandidate;
         self.leader = None;
         self.votes = BTreeSet::from([self.cfg.id.clone()]);
@@ -714,7 +893,7 @@ impl RaftNode {
             last_log_index: self.last_index(),
             last_log_term: self.last_term(),
         };
-        for p in self.cfg.peers.clone() {
+        for p in self.peers() {
             self.send(p, msg.clone());
         }
         Ok(())
@@ -737,7 +916,7 @@ impl RaftNode {
             last_log_index: self.last_index(),
             last_log_term: self.last_term(),
         };
-        for p in self.cfg.peers.clone() {
+        for p in self.peers() {
             self.send(p, msg.clone());
         }
         Ok(())
@@ -764,8 +943,8 @@ impl RaftNode {
         self.check_quorum_elapsed = 0;
         self.recent_active.clear();
         let next = self.last_index() + 1;
-        self.next_index = self.cfg.peers.iter().map(|p| (p.clone(), next)).collect();
-        self.match_index = self.cfg.peers.iter().map(|p| (p.clone(), 0)).collect();
+        self.next_index = self.peers().into_iter().map(|p| (p, next)).collect();
+        self.match_index = self.peers().into_iter().map(|p| (p, 0)).collect();
         // Entries from earlier terms only commit once an entry of the current term does.
         self.append_local(MetaCommand::Noop)?;
         self.broadcast_append();
@@ -774,6 +953,7 @@ impl RaftNode {
 
     fn append_local(&mut self, command: MetaCommand) -> Result<u64, RaftError> {
         let index = self.last_index() + 1;
+        let config = matches!(command, MetaCommand::ChangeMembership { .. });
         let e = Entry {
             term: self.hard.term,
             index,
@@ -781,11 +961,14 @@ impl RaftNode {
         };
         self.wal.append(&e)?;
         self.log.push(e);
+        if config {
+            self.refresh_membership();
+        }
         Ok(index)
     }
 
     fn broadcast_append(&mut self) {
-        for p in self.cfg.peers.clone() {
+        for p in self.peers() {
             self.send_append(&p);
         }
     }
@@ -826,27 +1009,37 @@ impl RaftNode {
     }
 
     fn advance_commit(&mut self) -> Result<(), RaftError> {
-        let mut new_commit = self.commit_index;
-        for n in (self.commit_index + 1..=self.last_index()).rev() {
-            if self.term_at(n) != Some(self.hard.term) {
+        // Committing a config entry can append the next one, which may commit at once (e.g. a
+        // single-voter group), hence the loop.
+        while self.role == Role::Leader {
+            let mut new_commit = self.commit_index;
+            for n in (self.commit_index + 1..=self.last_index()).rev() {
+                if self.term_at(n) != Some(self.hard.term) {
+                    break;
+                }
+                let acks: BTreeSet<NodeId> = self
+                    .match_index
+                    .iter()
+                    .filter(|(_, m)| **m >= n)
+                    .map(|(p, _)| p.clone())
+                    .chain([self.cfg.id.clone()])
+                    .collect();
+                if self.membership.has_quorum(&acks) {
+                    new_commit = n;
+                    break;
+                }
+            }
+            if new_commit <= self.commit_index {
                 break;
             }
-            let acks: BTreeSet<NodeId> = self
-                .match_index
-                .iter()
-                .filter(|(_, m)| **m >= n)
-                .map(|(p, _)| p.clone())
-                .chain([self.cfg.id.clone()])
-                .collect();
-            if self.membership.has_quorum(&acks) {
-                new_commit = n;
-                break;
-            }
-        }
-        if new_commit > self.commit_index {
             self.commit_index = new_commit;
             self.apply_committed()?;
             self.broadcast_append();
+            let last = self.last_index();
+            self.finish_membership_change()?;
+            if self.last_index() == last {
+                break;
+            }
         }
         Ok(())
     }

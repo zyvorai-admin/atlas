@@ -9,9 +9,15 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
-# Number of pods = metadata voters = data nodes. Use an odd number (3 or 5). Adding or removing
-# members of a running cluster is not handled by a plain `helm upgrade` of this value.
+# Number of pods = data nodes = Raft metadata members. Use an odd number of voters (3 or 5).
+# Scaling a running cluster is a two-step procedure (README "Scaling"): new pods start as
+# non-voters and are promoted through `POST /v1/members`.
 replicas: 3
+
+membership:
+  # Initial Raft voters: pods 0..N-1. Empty: kept from the release's existing ConfigMap, else
+  # `replicas` on first install. Only consulted until the first membership change commits.
+  bootstrapReplicas: 0
 
 node:
   # Copies of each extent, on distinct pods. At most `replicas`.
