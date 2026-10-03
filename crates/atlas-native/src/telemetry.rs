@@ -12,6 +12,8 @@ pub struct NativeIoCounters {
     checksum_failures: AtomicU64,
     replica_fallbacks: AtomicU64,
     gc_reclaimed: AtomicU64,
+    replica_write_failures: AtomicU64,
+    replicas_repaired: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +25,8 @@ pub struct NativeIoSnapshot {
     pub checksum_failures: u64,
     pub replica_fallbacks: u64,
     pub gc_reclaimed: u64,
+    pub replica_write_failures: u64,
+    pub replicas_repaired: u64,
 }
 
 impl NativeIoCounters {
@@ -43,6 +47,13 @@ impl NativeIoCounters {
     pub fn gc_reclaimed(&self, extents: u64) {
         self.gc_reclaimed.fetch_add(extents, Ordering::Relaxed);
     }
+    /// A replica write that failed and was retried on another node.
+    pub fn replica_write_failure(&self) {
+        self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn replica_repaired(&self) {
+        self.replicas_repaired.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn snapshot(&self) -> NativeIoSnapshot {
         NativeIoSnapshot {
             reads: self.reads.load(Ordering::Relaxed),
@@ -52,6 +63,8 @@ impl NativeIoCounters {
             checksum_failures: self.checksum_failures.load(Ordering::Relaxed),
             replica_fallbacks: self.replica_fallbacks.load(Ordering::Relaxed),
             gc_reclaimed: self.gc_reclaimed.load(Ordering::Relaxed),
+            replica_write_failures: self.replica_write_failures.load(Ordering::Relaxed),
+            replicas_repaired: self.replicas_repaired.load(Ordering::Relaxed),
         }
     }
 }

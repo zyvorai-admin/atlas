@@ -169,14 +169,51 @@ all configured with the same node ids and data-node addresses:
 - `checkpoint` is refused: the Raft node compacts its own log. `wal_records` reports the Raft log
   length above its compaction point.
 
-Writes still need `placement.replicas` reachable data nodes; there is no automatic health tracking
-(a node's `healthy` flag is static), so a down data node fails writes until it returns. Reads fall
-back to the next replica.
+Node health and repair are described in the next section.
 
 `tests/data_node.rs` covers the remote device and its bounds, fencing across a data-node restart, an
 engine on remote data nodes losing one, and three Raft-backed engines sharing three data nodes
 through a leader failover, followed by an overwrite and GC on the new leader that reuse space freed
 under the old one. A write with the old leader's term is then fenced.
+
+### Node health, write failover and repair
+
+Each engine keeps a per-node circuit breaker. Any data-node I/O failure (a fenced write excepted:
+that means this engine was deposed and is returned to the caller) counts a failure and backs the
+node off for `EngineConfig::node_retry_after` (default 5 s); any success clears the back-off. After
+the window the node is eligible again, so a recovered node rejoins on its next successful I/O.
+Health is local to each engine and never replicated; a node's configured `healthy: false` still
+excludes it permanently.
+
+- **Writes** walk every eligible node in placement preference order (rack spread first, distinct
+  hosts if required) and stop once `placement.replicas` writes succeed. A node that fails is backed
+  off and the replica goes to the next node, so with a spare node a write survives a data node
+  dying mid-write. With fewer eligible nodes than replicas the write fails with
+  `InsufficientReplicas` before any I/O. Data already written to other replicas of a failed attempt
+  is not referenced (the same leak as a crash between data write and commit).
+- **Reads** try replicas on eligible nodes first and backed-off nodes last (they may hold the only
+  good copy).
+- **`repair_once`** scrubs every extent: it reads each replica and verifies its checksum. A replica
+  that is unreachable or corrupt is rewritten from a verified copy onto an eligible node that holds
+  none of the extent's other replicas (and, when distinct hosts are required, none of their hosts);
+  a corrupt replica on a reachable node can move to a fresh range on the same node. The move commits
+  as `MetaCommand::ReplaceReplica { extent_id, old, new }`, which reserves the new range and returns
+  the old one to the free list, so it replicates through Raft and replays from the WAL like any
+  other command. Under Raft it runs on the leader behind the same `leader_ready` barrier and fence
+  as writes. It reports `extents_checked`, `replicas_repaired`, `unrecoverable` (no good copy left)
+  and `deferred` (no eligible target, or the extent changed underneath; retried on the next pass).
+  The engine does not schedule it; the hosting process decides how often to call it.
+
+Metrics: `atlas_native_node_up{node}`, `atlas_native_node_failures_total{node}`,
+`atlas_native_replica_write_failures_total`, `atlas_native_replicas_repaired_total`;
+`atlas_native_device_bytes{node}` omits unreachable nodes instead of failing the scrape.
+
+`tests/health.rs` covers failing over a write to a spare node, skipping a backed-off node and
+reusing it after recovery, refusing writes with too few nodes, re-replicating after losing a node
+(then surviving the loss of a second original), rewriting a corrupt replica in place and freeing
+its old range (across reopen), reporting an extent with no good copy, and `ReplaceReplica`
+validation. `tests/data_node.rs` also repairs a lost replica on a Raft leader and checks every
+replica's engine reads through the new copy.
 
 ### Mutual TLS (`tls` module)
 
@@ -205,7 +242,7 @@ Raft-backed engines writing to TLS data nodes.
 Not implemented yet:
 
 - per-client authorization on data nodes, certificate hot reload and revocation;
-- data-node health tracking (marking nodes down and re-placing writes);
+- a background repair schedule and repair rate limiting (`repair_once` is a full scan per call);
 - membership changes: the voter set is fixed at open (quorum math already supports joint
   configurations);
 - linearizable reads (read index / leases).
@@ -221,14 +258,14 @@ Not implemented yet:
 - monotonic WAL indexes across compaction;
 - metadata leader crash, minority partition, rejoin without disruption, isolated-leader step-down
   and full restart (Raft);
-- data-node loss (reads fall back), stale-leader data writes (fenced, including across a data-node
+- data-node loss (reads fall back, writes move to a spare node, repair re-replicates), corrupt
+  replicas (repair rewrites them), stale-leader data writes (fenced, including across a data-node
   restart) and engine continuity through a metadata leader failover.
 
 ## Next phase
 
-- data-node health tracking and re-placement;
 - a native node binary hosting `RaftServer` + `DataNodeServer` + `/metrics`;
 - joint-consensus membership changes;
-- background scrub and replica repair;
+- incremental, rate-limited background scrub (today `repair_once` scans everything);
 - hole punching for freed ranges at the device tail;
 - io_uring/raw-NVMe data path.

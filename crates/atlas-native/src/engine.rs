@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -57,6 +61,9 @@ pub struct EngineConfig {
     pub placement: PlacementPolicy,
     /// Compact the WAL once it retains this many records (0 disables automatic compaction).
     pub wal_compact_after: u64,
+    /// After an I/O failure a node is skipped for placement (and tried last for reads) for this
+    /// long, then given another chance.
+    pub node_retry_after: Duration,
 }
 
 impl EngineConfig {
@@ -66,6 +73,7 @@ impl EngineConfig {
             extent_bytes: 4 * 1024 * 1024,
             placement: PlacementPolicy::default(),
             wal_compact_after: 1024,
+            node_retry_after: Duration::from_secs(5),
         }
     }
 }
@@ -104,10 +112,36 @@ impl std::fmt::Debug for Meta {
     }
 }
 
+#[derive(Debug, Default)]
+struct NodeHealth {
+    failures: AtomicU64,
+    down_until: Mutex<Option<Instant>>,
+}
+
 #[derive(Debug)]
 struct NodeRuntime {
     spec: Node,
     devices: Vec<Arc<dyn BlockStore>>,
+    health: NodeHealth,
+}
+
+/// A node's health as the engine currently sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeStatus {
+    pub id: String,
+    /// Configured healthy and not inside an I/O-failure back-off window.
+    pub up: bool,
+    pub failures: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RepairStats {
+    pub extents_checked: u64,
+    pub replicas_repaired: u64,
+    /// Extents with no replica that still reads back with a valid checksum.
+    pub unrecoverable: u64,
+    /// Bad replicas left for a later pass: no eligible target, or the extent changed meanwhile.
+    pub deferred: u64,
 }
 
 #[derive(Debug)]
@@ -148,6 +182,7 @@ impl NativeEngine {
             .map(|(spec, d)| NodeRuntime {
                 spec,
                 devices: vec![d],
+                health: NodeHealth::default(),
             })
             .collect();
         let meta = match meta {
@@ -239,43 +274,30 @@ impl NativeEngine {
             return Err(NativeError::Invalid("write exceeds volume size".into()));
         }
 
+        let needed = self.cfg.placement.replicas;
         for (idx, chunk) in data.chunks(self.cfg.extent_bytes).enumerate() {
             let logical = offset + (idx * self.cfg.extent_bytes) as u64;
-            let selected = select_replicas(
-                &self
-                    .nodes
-                    .iter()
-                    .map(|n| n.spec.clone())
-                    .collect::<Vec<_>>(),
-                chunk.len() as u64,
-                self.cfg.placement,
-            );
-            if selected.len() < self.cfg.placement.replicas {
+            let order = self.placement_order(chunk.len() as u64, |_| false);
+            if order.len() < needed {
                 return Err(NativeError::InsufficientReplicas {
-                    needed: self.cfg.placement.replicas,
-                    found: selected.len(),
+                    needed,
+                    found: order.len(),
                 });
             }
-            let reuse: Vec<Option<u64>> = self.with_catalog(|c| {
-                selected
-                    .iter()
-                    .map(|id| c.free.find(id, 0, chunk.len() as u64))
-                    .collect()
-            })?;
+            // Walk the preference order so a node that fails is replaced by the next eligible one.
             let mut replicas = Vec::new();
-            for (node_id, free_off) in selected.into_iter().zip(reuse) {
-                let device = &self.node(&node_id)?.devices[0];
-                let off = match free_off {
-                    Some(off) => {
-                        device.write_at(fence, off, chunk)?;
-                        off
-                    }
-                    None => device.append(fence, chunk)?,
-                };
-                replicas.push(ReplicaRef {
-                    node_id,
-                    device_index: 0,
-                    offset: off,
+            for node_id in order {
+                if replicas.len() == needed {
+                    break;
+                }
+                if let Some(r) = self.place_replica(&node_id, fence, chunk)? {
+                    replicas.push(r);
+                }
+            }
+            if replicas.len() < needed {
+                return Err(NativeError::InsufficientReplicas {
+                    needed,
+                    found: replicas.len(),
                 });
             }
             let extent = ExtentRef {
@@ -372,6 +394,120 @@ impl NativeEngine {
         Ok(stats)
     }
 
+    /// Scrubs every extent (reads each replica and verifies its checksum) and re-replicates
+    /// replicas that are unreachable or corrupt onto healthy nodes, preserving host diversity.
+    /// Under Raft only the leader's engine can repair.
+    pub fn repair_once(&self) -> Result<RepairStats, NativeError> {
+        let _write = self
+            .write_lock
+            .lock()
+            .map_err(|_| NativeError::Poisoned("write"))?;
+        let fence = match &self.meta {
+            Meta::Local { .. } => 0,
+            Meta::Raft { server, timeout } => server.leader_ready(*timeout)?,
+        };
+        let extents: Vec<ExtentRef> =
+            self.with_catalog(|c| c.extents.values().map(|e| e.extent.clone()).collect())?;
+        let mut st = RepairStats::default();
+        for ext in extents {
+            st.extents_checked += 1;
+            let mut good: Option<Vec<u8>> = None;
+            let mut bad = Vec::new();
+            for r in &ext.replicas {
+                let Some((node, device)) = self
+                    .nodes
+                    .iter()
+                    .find(|n| n.spec.id == r.node_id && n.spec.healthy)
+                    .and_then(|n| n.devices.get(r.device_index).map(|d| (n, d)))
+                else {
+                    bad.push(r.clone());
+                    continue;
+                };
+                match device.read_exact_at(r.offset, ext.len) {
+                    Ok(buf) if checksum::verify(&buf, &ext.checksum) => {
+                        self.mark_up(node);
+                        good.get_or_insert(buf);
+                    }
+                    Ok(_) => {
+                        self.telemetry.checksum_failure();
+                        bad.push(r.clone());
+                    }
+                    Err(_) => {
+                        self.mark_down(node);
+                        bad.push(r.clone());
+                    }
+                }
+            }
+            if bad.is_empty() {
+                continue;
+            }
+            let Some(data) = good else {
+                st.unrecoverable += 1;
+                continue;
+            };
+            let mut current = ext.replicas.clone();
+            for old in bad {
+                let others: Vec<&ReplicaRef> = current.iter().filter(|r| **r != old).collect();
+                let taken_nodes: BTreeSet<&str> =
+                    others.iter().map(|r| r.node_id.as_str()).collect();
+                let taken_hosts: BTreeSet<&str> = others
+                    .iter()
+                    .filter_map(|r| self.node(&r.node_id).ok())
+                    .map(|n| n.spec.failure_domain.host.as_str())
+                    .collect();
+                let distinct = self.cfg.placement.require_distinct_hosts;
+                let order = self.placement_order(ext.len as u64, |n| {
+                    taken_nodes.contains(n.id.as_str())
+                        || (distinct && taken_hosts.contains(n.failure_domain.host.as_str()))
+                });
+                let mut placed = None;
+                for node_id in order {
+                    if let Some(r) = self.place_replica(&node_id, fence, &data)? {
+                        placed = Some(r);
+                        break;
+                    }
+                }
+                let Some(new) = placed else {
+                    st.deferred += 1;
+                    continue;
+                };
+                let cmd = MetaCommand::ReplaceReplica {
+                    extent_id: ext.id.clone(),
+                    old: old.clone(),
+                    new: new.clone(),
+                };
+                match self.commit(cmd, Some(fence)) {
+                    Ok(()) => {
+                        st.replicas_repaired += 1;
+                        self.telemetry.replica_repaired();
+                        if let Some(slot) = current.iter_mut().find(|r| **r == old) {
+                            *slot = new;
+                        }
+                    }
+                    // The extent was reclaimed or rewritten meanwhile; the next pass sees the new state.
+                    Err(NativeError::Metadata(_) | NativeError::Raft(RaftError::Rejected(_))) => {
+                        st.deferred += 1;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(st)
+    }
+
+    /// Current per-node health.
+    pub fn node_status(&self) -> Vec<NodeStatus> {
+        self.nodes
+            .iter()
+            .map(|n| NodeStatus {
+                id: n.spec.id.clone(),
+                up: self.is_up(n),
+                failures: n.health.failures.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
     pub fn applied_index(&self) -> Result<u64, NativeError> {
         self.with_catalog(|c| c.applied_index)
     }
@@ -441,6 +577,16 @@ impl NativeEngine {
                 "Extents reclaimed by GC.",
                 t.gc_reclaimed,
             ),
+            (
+                "atlas_native_replica_write_failures_total",
+                "Replica writes that failed and moved to another node.",
+                t.replica_write_failures,
+            ),
+            (
+                "atlas_native_replicas_repaired_total",
+                "Replicas re-created by repair.",
+                t.replicas_repaired,
+            ),
         ] {
             p.single(name, "counter", help, v);
         }
@@ -489,13 +635,40 @@ impl NativeEngine {
         p.family(
             "atlas_native_device_bytes",
             "gauge",
-            "Size of each node's backing device.",
+            "Size of each reachable node's backing device.",
         );
         for n in &self.nodes {
+            // An unreachable data node has no sample rather than failing the whole scrape.
+            if let Ok(len) = n.devices[0].len() {
+                p.sample(
+                    "atlas_native_device_bytes",
+                    &[("node", n.spec.id.as_str())],
+                    len,
+                );
+            }
+        }
+        p.family(
+            "atlas_native_node_up",
+            "gauge",
+            "1 if the node is eligible for placement, 0 while it is backed off after failures.",
+        );
+        for st in self.node_status() {
             p.sample(
-                "atlas_native_device_bytes",
-                &[("node", n.spec.id.as_str())],
-                n.devices[0].len()?,
+                "atlas_native_node_up",
+                &[("node", st.id.as_str())],
+                u8::from(st.up),
+            );
+        }
+        p.family(
+            "atlas_native_node_failures_total",
+            "counter",
+            "I/O failures observed against each node.",
+        );
+        for st in self.node_status() {
+            p.sample(
+                "atlas_native_node_failures_total",
+                &[("node", st.id.as_str())],
+                st.failures,
             );
         }
         Ok(p.finish())
@@ -515,6 +688,78 @@ impl NativeEngine {
             .map_err(|_| NativeError::Poisoned("catalog"))?;
         self.persist_locked(&c)?;
         Ok(wal.compact_through(c.applied_index)?)
+    }
+
+    fn is_up(&self, n: &NodeRuntime) -> bool {
+        n.spec.healthy
+            && n.health
+                .down_until
+                .lock()
+                .map(|d| d.is_none_or(|t| Instant::now() >= t))
+                .unwrap_or(false)
+    }
+
+    fn mark_down(&self, n: &NodeRuntime) {
+        n.health.failures.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut d) = n.health.down_until.lock() {
+            *d = Some(Instant::now() + self.cfg.node_retry_after);
+        }
+    }
+
+    fn mark_up(&self, n: &NodeRuntime) {
+        if let Ok(mut d) = n.health.down_until.lock() {
+            *d = None;
+        }
+    }
+
+    /// Every eligible node not excluded by `skip`, in placement preference order (rack spread
+    /// first, distinct hosts when the policy requires them).
+    fn placement_order(&self, len: u64, skip: impl Fn(&Node) -> bool) -> Vec<String> {
+        let specs: Vec<Node> = self
+            .nodes
+            .iter()
+            .filter(|n| self.is_up(n) && !skip(&n.spec))
+            .map(|n| n.spec.clone())
+            .collect();
+        let policy = PlacementPolicy {
+            replicas: specs.len(),
+            ..self.cfg.placement
+        };
+        select_replicas(&specs, len, policy)
+    }
+
+    /// Writes one replica of `data` to `node_id`, reusing free space when there is some. An I/O
+    /// failure backs the node off and returns `None` so the caller can try the next node; a
+    /// fenced write means this engine was deposed and is returned as an error.
+    fn place_replica(
+        &self,
+        node_id: &str,
+        fence: u64,
+        data: &[u8],
+    ) -> Result<Option<ReplicaRef>, NativeError> {
+        let node = self.node(node_id)?;
+        let free_off = self.with_catalog(|c| c.free.find(node_id, 0, data.len() as u64))?;
+        let device = &node.devices[0];
+        let written = match free_off {
+            Some(off) => device.write_at(fence, off, data).map(|()| off),
+            None => device.append(fence, data),
+        };
+        match written {
+            Ok(offset) => {
+                self.mark_up(node);
+                Ok(Some(ReplicaRef {
+                    node_id: node_id.to_string(),
+                    device_index: 0,
+                    offset,
+                }))
+            }
+            Err(e @ NativeError::Fenced { .. }) => Err(e),
+            Err(_) => {
+                self.mark_down(node);
+                self.telemetry.replica_write_failure();
+                Ok(None)
+            }
+        }
     }
 
     fn node(&self, node_id: &str) -> Result<&NodeRuntime, NativeError> {
@@ -595,17 +840,26 @@ impl NativeEngine {
                 "cross-extent reads are not implemented in phase 2".into(),
             ));
         }
-        for (i, r) in ext.replicas.iter().enumerate() {
-            let Some(device) = self
-                .nodes
-                .iter()
-                .find(|n| n.spec.id == r.node_id && n.spec.healthy)
-                .and_then(|n| n.devices.get(r.device_index))
-            else {
+        let mut order: Vec<(usize, &ReplicaRef, &NodeRuntime)> = ext
+            .replicas
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                self.nodes
+                    .iter()
+                    .find(|n| n.spec.id == r.node_id && n.spec.healthy)
+                    .map(|n| (i, r, n))
+            })
+            .collect();
+        // Backed-off nodes are tried last rather than skipped: they may be the only copy left.
+        order.sort_by_key(|(_, _, n)| !self.is_up(n));
+        for (i, r, node) in order {
+            let Some(device) = node.devices.get(r.device_index) else {
                 continue;
             };
             match device.read_exact_at(r.offset, ext.len) {
                 Ok(buf) if checksum::verify(&buf, &ext.checksum) => {
+                    self.mark_up(node);
                     if i > 0 {
                         self.telemetry.replica_fallback();
                     }
@@ -613,7 +867,7 @@ impl NativeEngine {
                     return Ok(buf[..len].to_vec());
                 }
                 Ok(_) => self.telemetry.checksum_failure(),
-                Err(_) => continue,
+                Err(_) => self.mark_down(node),
             }
         }
         Err(NativeError::Checksum(ext.id.clone()))

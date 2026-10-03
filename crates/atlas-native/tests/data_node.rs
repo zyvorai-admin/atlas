@@ -175,8 +175,12 @@ struct RaftGroup {
 
 impl RaftGroup {
     fn new() -> Self {
+        Self::with_data_nodes(3)
+    }
+
+    fn with_data_nodes(n: usize) -> Self {
         let td = tempfile::tempdir().unwrap();
-        let dns = DataNodes::start(td.path(), 3);
+        let dns = DataNodes::start(td.path(), n);
         let ids: Vec<String> = (1..=3).map(|i| format!("m{i}")).collect();
         let listeners: BTreeMap<String, TcpListener> =
             ids.iter().map(|id| (id.clone(), bind())).collect();
@@ -330,4 +334,21 @@ fn raft_engines_share_data_nodes_across_leader_failover() {
         stale.write_at(old_term, 0, &[0u8; 4096]),
         Err(NativeError::Fenced { current }) if current == new_term
     ));
+}
+
+#[test]
+fn raft_leader_repairs_a_lost_replica_and_followers_follow_it() {
+    let mut g = RaftGroup::with_data_nodes(4);
+    let (_, v) = g.on_leader(|e| e.create_volume("v", 4096));
+    g.on_leader(|e| e.write(&v, 0, &[3u8; 4096]));
+
+    g.dns.servers[1].take().unwrap().shutdown();
+    let (_, st) = g.on_leader(|e| e.repair_once());
+    assert_eq!((st.replicas_repaired, st.unrecoverable), (1, 0));
+
+    // With a second original replica gone, every replica's engine still reads via the copy on n4.
+    g.dns.servers[0].take().unwrap().shutdown();
+    for id in g.raft_addrs.keys().cloned().collect::<Vec<_>>() {
+        g.wait_readable(&id, &v, 0, &[3u8; 4096]);
+    }
 }

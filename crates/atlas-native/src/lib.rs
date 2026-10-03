@@ -30,7 +30,7 @@ pub mod wal;
 pub use alloc::{FreeList, FreeRange};
 pub use data_node::{DataNodeServer, RemoteDevice};
 pub use device::{BlockStore, DeviceId, FileDevice};
-pub use engine::{EngineConfig, MetaBackend, NativeEngine, NativeError};
+pub use engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, NodeStatus, RepairStats};
 pub use gc::GcStats;
 pub use membership::Membership;
 pub use metadata::{Catalog, MetaCommand, SnapshotId, VolumeId};

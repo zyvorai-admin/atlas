@@ -87,6 +87,13 @@ pub enum MetaCommand {
     MarkExtentReclaimed {
         extent_id: ExtentId,
     },
+    /// Moves one replica of an extent to `new` (already written and verified by the repairer):
+    /// reserves the new range and returns the old one to the free list.
+    ReplaceReplica {
+        extent_id: ExtentId,
+        old: ReplicaRef,
+        new: ReplicaRef,
+    },
     /// Appended by a new Raft leader so entries from earlier terms can be committed.
     Noop,
 }
@@ -218,6 +225,50 @@ impl Catalog {
                         .release(&r.node_id, r.device_index, r.offset, e.extent.len as u64)
                         .map_err(MetaError::Invalid)?;
                 }
+            }
+            MetaCommand::ReplaceReplica {
+                extent_id,
+                old,
+                new,
+            } => {
+                if old == new {
+                    return Err(MetaError::Invalid(
+                        "replacement replica is the same range".into(),
+                    ));
+                }
+                let e = self
+                    .extents
+                    .get_mut(extent_id)
+                    .ok_or_else(|| MetaError::NotFound(extent_id.clone()))?;
+                let pos = e
+                    .extent
+                    .replicas
+                    .iter()
+                    .position(|r| r == old)
+                    .ok_or_else(|| {
+                        MetaError::Invalid(format!(
+                            "extent {extent_id} has no replica on {} at {}",
+                            old.node_id, old.offset
+                        ))
+                    })?;
+                if e.extent
+                    .replicas
+                    .iter()
+                    .enumerate()
+                    .any(|(i, r)| i != pos && r.node_id == new.node_id)
+                {
+                    return Err(MetaError::Invalid(format!(
+                        "extent {extent_id} already has a replica on {}",
+                        new.node_id
+                    )));
+                }
+                let len = e.extent.len as u64;
+                e.extent.replicas[pos] = new.clone();
+                self.free
+                    .reserve(&new.node_id, new.device_index, new.offset, len);
+                self.free
+                    .release(&old.node_id, old.device_index, old.offset, len)
+                    .map_err(MetaError::Invalid)?;
             }
             MetaCommand::Noop => {}
         }
