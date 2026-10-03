@@ -125,6 +125,7 @@ fn start_node(root: &Path, server: &(String, String), client_ca: &str) -> Native
         metadata: Some(MetadataRole {
             listen: raft_l.local_addr().unwrap(),
             peers: BTreeMap::from([("n1".into(), raft_l.local_addr().unwrap().to_string())]),
+            bootstrap: None,
             data_nodes: vec![DataNodeSpec {
                 id: "n1".into(),
                 addr: data_l.local_addr().unwrap().to_string(),

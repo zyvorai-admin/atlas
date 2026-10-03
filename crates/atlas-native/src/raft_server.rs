@@ -29,6 +29,7 @@ use std::{
 use rustls::{pki_types::ServerName, ClientConfig, ServerConfig};
 
 use crate::{
+    membership::Membership,
     metadata::{Catalog, MetaCommand},
     metrics::PromText,
     raft::{Envelope, Message, NodeId, RaftConfig, RaftError, RaftNode, Role},
@@ -50,6 +51,8 @@ pub struct RaftStatus {
     pub leader: Option<NodeId>,
     pub commit_index: u64,
     pub applied_index: u64,
+    /// Whether this node is in the current voter set.
+    pub voter: bool,
 }
 
 #[derive(Debug, Default)]
@@ -114,14 +117,35 @@ impl PeerLiveness {
     }
 }
 
+/// An outbound peer: its send queue (drained by a dedicated sender thread) and bookkeeping.
+struct Peer {
+    tx: SyncSender<Envelope>,
+    stats: Arc<PeerStats>,
+    live: Arc<PeerLiveness>,
+    target: Arc<Mutex<String>>,
+}
+
+/// Everything needed to start a sender for a peer learned at runtime (a membership change).
+struct PeerSpawner {
+    tls_client: Option<Arc<ClientConfig>>,
+    handshake_failures: Arc<AtomicU64>,
+    epoch: Instant,
+    stale_after: Duration,
+    /// Set once the drive loop exits; senders stop on it.
+    stop: Arc<AtomicBool>,
+    senders: Mutex<Vec<JoinHandle<()>>>,
+    /// Addresses from the local config; they win over addresses learned from the log.
+    configured: BTreeMap<NodeId, String>,
+}
+
 struct Shared {
+    id: NodeId,
     node: Mutex<RaftNode>,
     changed: Condvar,
     stop: AtomicBool,
     fatal: Mutex<Option<String>>,
-    outbound: BTreeMap<NodeId, SyncSender<Envelope>>,
-    peer_stats: BTreeMap<NodeId, Arc<PeerStats>>,
-    liveness: BTreeMap<NodeId, Arc<PeerLiveness>>,
+    peers: Mutex<BTreeMap<NodeId, Peer>>,
+    spawner: PeerSpawner,
     /// Inbound frames dropped for a wrong addressee, an unknown sender, or a sender the
     /// connection's certificate does not vouch for.
     rejected_frames: AtomicU64,
@@ -142,15 +166,101 @@ impl Shared {
     }
 
     fn flush(&self, node: &mut RaftNode) {
-        for env in node.take_messages() {
-            let to = env.to.clone();
-            if let Some(tx) = self.outbound.get(&to) {
+        let msgs = node.take_messages();
+        if msgs.is_empty() {
+            return;
+        }
+        let Ok(peers) = self.peers.lock() else {
+            return;
+        };
+        for env in msgs {
+            if let Some(p) = peers.get(&env.to) {
                 // A full queue means the peer is unreachable; Raft retransmits.
-                if tx.try_send(env).is_err() {
-                    if let Some(st) = self.peer_stats.get(&to) {
-                        st.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
+                if p.tx.try_send(env).is_err() {
+                    p.stats.dropped.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+        }
+    }
+
+    fn is_known_peer(&self, id: &str) -> bool {
+        self.peers.lock().is_ok_and(|p| p.contains_key(id))
+    }
+
+    fn with_liveness(&self, id: &str, f: impl FnOnce(&PeerLiveness)) {
+        if let Some(live) = self
+            .peers
+            .lock()
+            .ok()
+            .and_then(|p| p.get(id).map(|p| p.live.clone()))
+        {
+            f(&live);
+        }
+    }
+
+    /// Starts a sender for `id`, or points the existing one at `addr`.
+    fn ensure_peer(&self, id: &NodeId, addr: &str) -> Result<(), RaftError> {
+        let mut peers = self.peers.lock().map_err(|_| RaftError::Shutdown)?;
+        if let Some(p) = peers.get(id) {
+            if let Ok(mut t) = p.target.lock() {
+                if *t != addr {
+                    *t = addr.to_string();
+                }
+            }
+            return Ok(());
+        }
+        let sp = &self.spawner;
+        let tls = match &sp.tls_client {
+            Some(c) => Some((
+                c.clone(),
+                tls::server_name(id).map_err(|e| RaftError::Config(e.to_string()))?,
+            )),
+            None => None,
+        };
+        let (tx, rx) = mpsc::sync_channel(PEER_QUEUE);
+        let stats = Arc::new(PeerStats::default());
+        let live = Arc::new(PeerLiveness {
+            epoch: sp.epoch,
+            last_response_ms: AtomicU64::new(0),
+            inbound_conns: AtomicU64::new(0),
+            last_reconnect_ms: AtomicU64::new(0),
+            stale_after: sp.stale_after,
+        });
+        let target = Arc::new(Mutex::new(addr.to_string()));
+        let pt = PeerTarget {
+            target: target.clone(),
+            tls,
+            handshake_failures: sp.handshake_failures.clone(),
+        };
+        let (stop, st, lv) = (sp.stop.clone(), stats.clone(), live.clone());
+        let h = thread::spawn(move || peer_sender(&pt, rx, &stop, &st, &lv));
+        if let Ok(mut senders) = sp.senders.lock() {
+            senders.push(h);
+        }
+        peers.insert(
+            id.clone(),
+            Peer {
+                tx,
+                stats,
+                live,
+                target,
+            },
+        );
+        Ok(())
+    }
+
+    /// Makes sure every voter (and every configured peer) has a sender with a current address.
+    fn sync_peers(&self, node: &RaftNode) {
+        let mut addrs = node.peer_addrs();
+        addrs.extend(
+            self.spawner
+                .configured
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        for (id, addr) in addrs {
+            if id != self.id {
+                let _ = self.ensure_peer(&id, &addr);
             }
         }
     }
@@ -200,11 +310,9 @@ impl RaftServer {
             Some(id) => (Some(id.server_config()?), Some(id.client_config()?)),
             None => (None, None),
         };
-        let mut peer_names = BTreeMap::new();
         if tls.is_some() {
             for p in cfg.peers.iter().chain([&cfg.id]) {
-                let name = tls::server_name(p).map_err(|e| RaftError::Config(e.to_string()))?;
-                peer_names.insert(p.clone(), name);
+                tls::server_name(p).map_err(|e| RaftError::Config(e.to_string()))?;
             }
         }
         let tls_handshake_failures = Arc::new(AtomicU64::new(0));
@@ -214,43 +322,25 @@ impl RaftServer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
-        let mut outbound = BTreeMap::new();
-        let mut peer_stats = BTreeMap::new();
-        let mut liveness = BTreeMap::new();
-        let epoch = Instant::now();
-        let stale_after = (tick * 40).max(Duration::from_secs(1));
-        for p in &cfg.peers {
-            let (tx, rx) = mpsc::sync_channel(PEER_QUEUE);
-            outbound.insert(p.clone(), tx);
-            let stats = Arc::new(PeerStats::default());
-            peer_stats.insert(p.clone(), stats.clone());
-            let live = Arc::new(PeerLiveness {
-                epoch,
-                last_response_ms: AtomicU64::new(0),
-                inbound_conns: AtomicU64::new(0),
-                last_reconnect_ms: AtomicU64::new(0),
-                stale_after,
-            });
-            liveness.insert(p.clone(), live.clone());
-            let target = PeerTarget {
-                target: peers[p].to_string(),
-                tls: tls_client.clone().zip(peer_names.get(p).cloned()),
-                handshake_failures: tls_handshake_failures.clone(),
-            };
-            let stop = stop.clone();
-            threads.push(thread::spawn(move || {
-                peer_sender(&target, rx, &stop, &stats, &live)
-            }));
-        }
-
         let shared = Arc::new(Shared {
+            id: cfg.id.clone(),
             node: Mutex::new(node),
             changed: Condvar::new(),
             stop: AtomicBool::new(false),
             fatal: Mutex::new(None),
-            outbound,
-            peer_stats,
-            liveness,
+            peers: Mutex::new(BTreeMap::new()),
+            spawner: PeerSpawner {
+                tls_client,
+                handshake_failures: tls_handshake_failures.clone(),
+                epoch: Instant::now(),
+                stale_after: (tick * 40).max(Duration::from_secs(1)),
+                stop: stop.clone(),
+                senders: Mutex::new(Vec::new()),
+                configured: peers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_string()))
+                    .collect(),
+            },
             rejected_frames: AtomicU64::new(0),
             tls_server,
             tls_handshake_failures,
@@ -258,15 +348,15 @@ impl RaftServer {
             next_conn: AtomicU64::new(0),
             readers: Mutex::new(Vec::new()),
         });
+        {
+            let node = shared.lock()?;
+            shared.sync_peers(&node);
+        }
 
         let (in_tx, in_rx) = mpsc::channel();
         {
             let shared = shared.clone();
-            let peer_ids: Vec<NodeId> = cfg.peers.clone();
-            let id = cfg.id.clone();
-            threads.push(thread::spawn(move || {
-                accept_loop(listener, &shared, in_tx, &id, &peer_ids)
-            }));
+            threads.push(thread::spawn(move || accept_loop(listener, &shared, in_tx)));
         }
         {
             let shared = shared.clone();
@@ -296,7 +386,71 @@ impl RaftServer {
             leader: n.leader().map(str::to_string),
             commit_index: n.commit_index(),
             applied_index: n.applied_index(),
+            voter: n.is_voter(),
         })
+    }
+
+    /// The current voter configuration and every known peer transport address.
+    pub fn membership(&self) -> Result<(Membership, BTreeMap<NodeId, String>), RaftError> {
+        let n = self.shared.lock()?;
+        let mut addrs = n.peer_addrs();
+        addrs.extend(
+            self.shared
+                .spawner
+                .configured
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        Ok((n.membership().clone(), addrs))
+    }
+
+    /// Moves the voter set to the keys of `voters` (values: their Raft `host:port`; this node's
+    /// own entry is ignored) through joint consensus, and blocks until the final configuration
+    /// has applied here. A leader that removes itself steps down once that happens.
+    pub fn change_membership(
+        &self,
+        voters: BTreeMap<NodeId, String>,
+        timeout: Duration,
+    ) -> Result<Membership, RaftError> {
+        let deadline = Instant::now() + timeout;
+        let term = self.leader_ready(timeout)?;
+        let mut node = self.shared.lock()?;
+        if node.term() != term {
+            return Err(RaftError::NotLeader {
+                leader: node.leader().map(str::to_string),
+            });
+        }
+        let target: std::collections::BTreeSet<NodeId> = voters.keys().cloned().collect();
+        let addrs = voters
+            .into_iter()
+            .filter(|(id, _)| id != node.id())
+            .collect();
+        let index = node.change_membership(target.clone(), addrs)?;
+        self.shared.sync_peers(&node);
+        self.shared.flush(&mut node);
+        loop {
+            if self.shared.stop.load(Ordering::SeqCst) {
+                return Err(RaftError::Shutdown);
+            }
+            let done = node.commit_index() >= index.max(node.latest_config_index())
+                && matches!(node.membership(), Membership::Stable { voters } if *voters == target);
+            if done {
+                return Ok(node.membership().clone());
+            }
+            if !node.is_leader() || node.term() != term {
+                return Err(RaftError::LeadershipLost { index });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RaftError::Timeout { index });
+            }
+            node = self
+                .shared
+                .changed
+                .wait_timeout(node, deadline - now)
+                .map_err(|_| RaftError::Shutdown)?
+                .0;
+        }
     }
 
     pub fn catalog(&self) -> Result<Catalog, RaftError> {
@@ -451,6 +605,16 @@ impl RaftServer {
             );
         }
         drop(n);
+        let stats: Vec<(NodeId, Arc<PeerStats>)> = self
+            .shared
+            .peers
+            .lock()
+            .map(|p| {
+                p.iter()
+                    .map(|(k, v)| (k.clone(), v.stats.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         for (name, help, get) in [
             (
                 "atlas_native_transport_sent_total",
@@ -479,7 +643,7 @@ impl RaftServer {
             ),
         ] {
             p.family(name, "counter", help);
-            for (peer, st) in &self.shared.peer_stats {
+            for (peer, st) in &stats {
                 p.sample(
                     name,
                     &[("node", id.as_str()), ("peer", peer.as_str())],
@@ -582,6 +746,16 @@ impl RaftServer {
         for r in readers {
             let _ = r.join();
         }
+        let senders: Vec<_> = self
+            .shared
+            .spawner
+            .senders
+            .lock()
+            .map(|mut s| s.drain(..).collect())
+            .unwrap_or_default();
+        for s in senders {
+            let _ = s.join();
+        }
     }
 }
 
@@ -593,6 +767,7 @@ impl Drop for RaftServer {
 
 fn drive(shared: &Shared, inbound: Receiver<Envelope>, tick: Duration) {
     let mut next_tick = Instant::now() + tick;
+    let mut config_seen = None;
     while !shared.stop.load(Ordering::SeqCst) {
         let wait = next_tick.saturating_duration_since(Instant::now());
         let first = match inbound.recv_timeout(wait) {
@@ -606,9 +781,7 @@ fn drive(shared: &Shared, inbound: Receiver<Envelope>, tick: Duration) {
         let mut result = Ok(());
         for env in first.into_iter().chain(inbound.try_iter()) {
             if env.msg.is_response() {
-                if let Some(l) = shared.liveness.get(&env.from) {
-                    l.responded();
-                }
+                shared.with_liveness(&env.from, PeerLiveness::responded);
             }
             result = result.and_then(|_| node.step(env));
         }
@@ -618,6 +791,15 @@ fn drive(shared: &Shared, inbound: Receiver<Envelope>, tick: Duration) {
             if next_tick < Instant::now() {
                 next_tick = Instant::now() + tick;
             }
+        }
+        let key = (
+            node.latest_config_index(),
+            node.membership().clone(),
+            node.catalog().raft_addrs.len(),
+        );
+        if config_seen.as_ref() != Some(&key) {
+            shared.sync_peers(&node);
+            config_seen = Some(key);
         }
         shared.flush(&mut node);
         drop(node);
@@ -629,13 +811,7 @@ fn drive(shared: &Shared, inbound: Receiver<Envelope>, tick: Duration) {
     }
 }
 
-fn accept_loop(
-    listener: TcpListener,
-    shared: &Arc<Shared>,
-    inbound: Sender<Envelope>,
-    id: &str,
-    peers: &[NodeId],
-) {
+fn accept_loop(listener: TcpListener, shared: &Arc<Shared>, inbound: Sender<Envelope>) {
     while !shared.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -651,21 +827,11 @@ fn accept_loop(
                     conns.insert(conn_id, clone);
                 }
                 let inbound = inbound.clone();
-                let id = id.to_string();
-                let peers = peers.to_vec();
                 let reader_shared = shared.clone();
                 let handle = thread::spawn(move || {
                     match Conn::accept(stream, reader_shared.tls_server.as_ref(), HANDSHAKE_TIMEOUT)
                     {
-                        Ok(conn) => {
-                            // A TLS sender may only speak for the peers its certificate names.
-                            let allowed: Vec<NodeId> = if conn.is_tls() {
-                                conn.peer_names(&peers).into_iter().cloned().collect()
-                            } else {
-                                peers
-                            };
-                            read_loop(conn, &inbound, &id, &allowed, &reader_shared);
-                        }
+                        Ok(conn) => read_loop(conn, &inbound, &reader_shared),
                         Err(_) => {
                             reader_shared
                                 .tls_handshake_failures
@@ -689,23 +855,26 @@ fn accept_loop(
     }
 }
 
-fn read_loop(
-    mut stream: Conn,
-    inbound: &Sender<Envelope>,
-    id: &str,
-    peers: &[NodeId],
-    shared: &Shared,
-) {
-    let mut seen = std::collections::BTreeSet::new();
+/// Delivers frames addressed to this node from known peers. Over TLS a sender may only speak
+/// for node ids its certificate is valid for (checked once per id per connection).
+fn read_loop(mut stream: Conn, inbound: &Sender<Envelope>, shared: &Shared) {
+    let mut vouched: BTreeMap<NodeId, bool> = BTreeMap::new();
     while let Ok(env) = read_frame(&mut stream) {
-        if env.to != id || !peers.contains(&env.from) {
+        let ok = env.to == shared.id
+            && shared.is_known_peer(&env.from)
+            && *vouched.entry(env.from.clone()).or_insert_with(|| {
+                let ok = !stream.is_tls()
+                    || !stream
+                        .peer_names(std::slice::from_ref(&env.from))
+                        .is_empty();
+                if ok {
+                    shared.with_liveness(&env.from, PeerLiveness::inbound_connected);
+                }
+                ok
+            });
+        if !ok {
             shared.rejected_frames.fetch_add(1, Ordering::Relaxed);
             continue;
-        }
-        if seen.insert(env.from.clone()) {
-            if let Some(l) = shared.liveness.get(&env.from) {
-                l.inbound_connected();
-            }
         }
         if inbound.send(env).is_err() {
             return;
@@ -714,14 +883,19 @@ fn read_loop(
 }
 
 struct PeerTarget {
-    target: String,
+    target: Arc<Mutex<String>>,
     tls: Option<(Arc<ClientConfig>, ServerName<'static>)>,
     handshake_failures: Arc<AtomicU64>,
 }
 
 impl PeerTarget {
     fn connect(&self) -> io::Result<Conn> {
-        let s = TcpStream::connect_timeout(&tls::resolve(&self.target)?, CONNECT_TIMEOUT)?;
+        let target = self
+            .target
+            .lock()
+            .map_err(|_| io::Error::other("peer target lock poisoned"))?
+            .clone();
+        let s = TcpStream::connect_timeout(&tls::resolve(&target)?, CONNECT_TIMEOUT)?;
         s.set_nodelay(true)?;
         s.set_write_timeout(Some(WRITE_TIMEOUT))?;
         s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;

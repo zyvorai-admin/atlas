@@ -65,6 +65,23 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- if gt $free 0 }}{{ $_ := set $spec "free_bytes" $free }}{{ end -}}
 {{- $dataNodes = append $dataNodes $spec -}}
 {{- end -}}
+{{- $bootstrap := list -}}
+{{- if .Values.membership.bootstrapReplicas -}}
+{{- range $i := until (int .Values.membership.bootstrapReplicas) -}}
+{{- $bootstrap = append $bootstrap (printf "%s-%d" $full $i) -}}
+{{- end -}}
+{{- else -}}
+{{- $existing := lookup "v1" "ConfigMap" .Release.Namespace (printf "%s-config" $full) -}}
+{{- if and $existing $existing.data (index $existing.data "node.json") -}}
+{{- $old := index $existing.data "node.json" | fromJson -}}
+{{- $bootstrap = (dig "metadata" "bootstrap" list $old) -}}
+{{- end -}}
+{{- if not $bootstrap -}}
+{{- range $i := until $n -}}
+{{- $bootstrap = append $bootstrap (printf "%s-%d" $full $i) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- $cfg := dict
   "node_id" "${POD_NAME}"
   "data_dir" "/var/lib/atlas-native/state"
@@ -75,6 +92,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
   "metadata" (dict
     "listen" "0.0.0.0:7482"
     "peers" $peers
+    "bootstrap" $bootstrap
     "data_nodes" $dataNodes
     "replicas" (.Values.node.replicationFactor | int)
     "extent_bytes" (.Values.node.extentBytes | int64)

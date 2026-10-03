@@ -3,7 +3,7 @@
 
 //! Voter configuration for Raft quorum decisions. `Joint` is the intermediate configuration of a
 //! joint-consensus membership change: every decision needs a majority of the old *and* the new
-//! voter set. Only `Stable` is produced today; the change protocol itself is not implemented yet.
+//! voter set. See `RaftNode::change_membership` for the change protocol.
 
 use std::collections::BTreeSet;
 
@@ -35,6 +35,14 @@ impl Membership {
         match self {
             Self::Stable { voters } => voters.clone(),
             Self::Joint { old, new } => old.union(new).cloned().collect(),
+        }
+    }
+
+    /// The configuration being moved to (`Stable`'s voters, or `Joint`'s `new`).
+    pub fn target(&self) -> &BTreeSet<NodeId> {
+        match self {
+            Self::Stable { voters } => voters,
+            Self::Joint { new, .. } => new,
         }
     }
 

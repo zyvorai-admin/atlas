@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::alloc::FreeList;
+use crate::{alloc::FreeList, membership::Membership};
 
 pub type VolumeId = String;
 pub type SnapshotId = String;
@@ -62,6 +62,13 @@ pub struct Catalog {
     pub current_term: u64,
     #[serde(default)]
     pub free: FreeList,
+    /// The Raft voter configuration as of `applied_index` (None until the first change; the
+    /// bootstrap voters apply until then).
+    #[serde(default)]
+    pub membership: Option<Membership>,
+    /// Raft transport address (`host:port`) of every node named by a membership change.
+    #[serde(default)]
+    pub raft_addrs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +104,14 @@ pub enum MetaCommand {
         extent_id: ExtentId,
         old: ReplicaRef,
         new: ReplicaRef,
+    },
+    /// Raft voter configuration change (joint consensus: a `Joint` entry, then the leader
+    /// appends the `Stable` one once it commits). Takes effect in the Raft layer as soon as it
+    /// is appended; `addrs` adds or updates transport addresses.
+    ChangeMembership {
+        membership: Membership,
+        #[serde(default)]
+        addrs: BTreeMap<String, String>,
     },
     /// Appended by a new Raft leader so entries from earlier terms can be committed.
     Noop,
@@ -274,6 +289,21 @@ impl Catalog {
                 self.free
                     .release(&old.node_id, old.device_index, old.offset, len)
                     .map_err(MetaError::Invalid)?;
+            }
+            MetaCommand::ChangeMembership { membership, addrs } => {
+                if membership.voters().is_empty() {
+                    return Err(MetaError::Invalid("membership has no voters".into()));
+                }
+                if let Membership::Joint { old, new } = membership {
+                    if old.is_empty() || new.is_empty() {
+                        return Err(MetaError::Invalid(
+                            "joint membership needs voters on both sides".into(),
+                        ));
+                    }
+                }
+                self.raft_addrs
+                    .extend(addrs.iter().map(|(k, v)| (k.clone(), v.clone())));
+                self.membership = Some(membership.clone());
             }
             MetaCommand::Noop => {}
         }

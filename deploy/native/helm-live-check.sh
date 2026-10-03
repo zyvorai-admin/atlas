@@ -4,8 +4,8 @@
 #
 # Installs deploy/helm/atlas-native on the current kube context with Raft/data mutual TLS and
 # HTTPS + client-certificate auth (throwaway openssl PKI), then checks: auth refusals, unaligned
-# I/O through the leader, leader-pod failover, and that an unchanged `helm upgrade` restarts no
-# pods. Run from the repo root on a host with kubectl, helm, openssl and curl.
+# I/O through the leader, leader-pod failover, that an unchanged `helm upgrade` restarts no
+# pods, and scaling 3 -> 5 -> 3 through Raft membership changes without losing data. Run from the repo root on a host with kubectl, helm, openssl and curl.
 #
 #   deploy/native/helm-live-check.sh <image-repository> <image-tag> [namespace]
 set -euo pipefail
@@ -32,10 +32,12 @@ leaf() { # name sans eku
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=atlas-native-test-ca" \
   -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
   -keyout "$PKI/ca.key" -out "$PKI/ca.crt" 2>/dev/null
-leaf raft "DNS:$REL-0,DNS:$REL-1,DNS:$REL-2" "serverAuth,clientAuth"
+leaf raft "DNS:$REL-0,DNS:$REL-1,DNS:$REL-2,DNS:$REL-3,DNS:$REL-4" "serverAuth,clientAuth"
 leaf http "DNS:localhost,DNS:$REL-api.$NS.svc" "serverAuth"
 leaf client "DNS:ops" "clientAuth"
 
+# Every run issues a new PKI, which pods of an earlier run would not trust: start clean.
+kubectl delete namespace "$NS" --ignore-not-found --wait --timeout=300s >/dev/null
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 for s in raft http; do
   kubectl -n "$NS" create secret generic "$REL-$s-tls" --from-file=ca.crt="$PKI/ca.crt" \
@@ -48,7 +50,7 @@ install() {
     --set image.repository="$REPO",image.tag="$TAG",image.pullPolicy=Never \
     --set tls.enabled=true,tls.existingSecret="$REL-raft-tls" \
     --set httpTls.enabled=true,httpTls.existingSecret="$REL-http-tls",httpTls.requireClientCert=true \
-    --set persistence.size=1Gi >/dev/null
+    --set persistence.size=1Gi "$@" >/dev/null
 }
 install
 kubectl -n "$NS" rollout status statefulset/$REL --timeout=300s
@@ -117,4 +119,76 @@ install
 after=$(kubectl -n "$NS" get pods -l app.kubernetes.io/instance=$REL -o jsonpath='{range .items[*]}{.metadata.uid} {end}')
 [ "$before" = "$after" ] || { echo "unchanged upgrade restarted pods" >&2; exit 1; }
 echo "unchanged helm upgrade kept every pod: ok"
+
+# Leader seen from pod $1 through local port $2, waiting out elections.
+wait_leader() {
+  local l=""
+  for _ in $(seq 1 150); do
+    l=$(leader_of "$2" || true)
+    [ -n "$l" ] && { echo "$l"; return 0; }
+    sleep 0.2
+  done
+  echo "no leader seen from $1" >&2
+  return 1
+}
+voters() { # count
+  local i sep="" out='{"voters":{'
+  for i in $(seq 0 $(($1 - 1))); do
+    out+="$sep\"$REL-$i\":\"$REL-$i.$REL.$NS.svc.cluster.local:7482\""
+    sep=,
+  done
+  echo "$out}}"
+}
+change_members() { # count port
+  local code
+  for _ in $(seq 1 20); do
+    L=$(wait_leader "$REL-0" "$2")
+    forward "$L" $((PORT += 1))
+    code=$(call "$PORT" /v1/members -X POST -d "$(voters "$1")" -o "$PKI/members" -w '%{http_code}')
+    [ "$code" = 200 ] && return 0
+    sleep 1
+  done
+  echo "membership change to $1 voters failed ($code): $(cat "$PKI/members")" >&2
+  return 1
+}
+PORT=18500
+
+install --set replicas=5
+kubectl -n "$NS" rollout status statefulset/$REL --timeout=300s >/dev/null
+forward "$REL-4" $((PORT += 1))
+P4=$PORT
+call "$P4" /v1/status | grep -q '"voter":false' || { echo "$REL-4 should start as a non-voter" >&2; exit 1; }
+forward "$REL-0" $((PORT += 1))
+P0=$PORT
+change_members 5 "$P0"
+for _ in $(seq 1 100); do call "$P4" /v1/status | grep -q '"voter":true' && break; sleep 0.2; done
+call "$P4" /v1/status | grep -q '"voter":true' || { echo "$REL-4 was not promoted" >&2; exit 1; }
+call "$PORT" /v1/members | grep -q "\"$REL-4\"" || { echo "members lack $REL-4" >&2; exit 1; }
+L=$(wait_leader "$REL-0" "$P0")
+forward "$L" $((PORT += 1))
+call "$PORT" "/v1/volumes/$VOL/data?offset=0" -X PUT --data-binary @"$PKI/block"
+call "$PORT" "/v1/volumes/$VOL/data?offset=0&len=100000" -o "$PKI/back4"
+cmp "$PKI/block" "$PKI/back4"
+echo "scaled to 5 pods, promoted $REL-3/$REL-4 to voters, wrote via $L: ok"
+
+change_members 3 "$P0"
+install --set replicas=3
+kubectl -n "$NS" rollout status statefulset/$REL --timeout=300s >/dev/null
+kubectl -n "$NS" delete pvc "state-$REL-3" "state-$REL-4" --wait=false >/dev/null 2>&1 || true
+forward "$REL-0" $((PORT += 1))
+P0=$PORT
+L=$(wait_leader "$REL-0" "$P0")
+forward "$L" $((PORT += 1))
+want="\"voters\":[\"$REL-0\",\"$REL-1\",\"$REL-2\"]"
+call "$PORT" /v1/members | grep -qF "$want" || { echo "voters not back to 0..2: $(call "$PORT" /v1/members)" >&2; exit 1; }
+for _ in $(seq 1 20); do
+  call "$PORT" /v1/repair -X POST -o "$PKI/repair" -w '%{http_code}' | grep -q 200 && break
+  sleep 1
+done
+grep -q '"unrecoverable":0' "$PKI/repair" || { echo "repair: $(cat "$PKI/repair")" >&2; exit 1; }
+for off in 0 4194000; do
+  call "$PORT" "/v1/volumes/$VOL/data?offset=$off&len=100000" -o "$PKI/back5"
+  cmp "$PKI/block" "$PKI/back5"
+done
+echo "scaled back to 3 voters/pods, repair re-replicated, data intact via $L: ok"
 echo "helm live check: ok"

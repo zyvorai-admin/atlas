@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use atlas_native::{MetaCommand, RaftConfig, RaftError, RaftServer, Role};
+use atlas_native::{Membership, MetaCommand, RaftConfig, RaftError, RaftServer, Role};
 
 const TICK: Duration = Duration::from_millis(10);
 const WAIT: Duration = Duration::from_secs(15);
@@ -319,4 +319,94 @@ fn tcp_metrics_expose_role_replication_and_transport_failures() {
         );
         thread::sleep(TICK);
     }
+}
+
+fn has_volume(s: &RaftServer, name: &str) -> bool {
+    s.catalog()
+        .unwrap()
+        .volumes
+        .contains_key(&format!("vol-{name}"))
+}
+
+/// Applies `voters` through whichever node leads, retrying across leader changes.
+fn change_on_leader(c: &TcpCluster, voters: &BTreeMap<String, String>) {
+    let target: Vec<&String> = voters.keys().collect();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let l = c.wait_leader();
+        let s = c.servers[&l].as_ref().unwrap();
+        let (m, _) = s.membership().unwrap();
+        if matches!(&m, Membership::Stable { voters } if voters.iter().collect::<Vec<_>>() == target)
+        {
+            return;
+        }
+        match s.change_membership(voters.clone(), WAIT) {
+            Ok(_) => return,
+            Err(
+                RaftError::NotLeader { .. }
+                | RaftError::LeadershipLost { .. }
+                | RaftError::MembershipBusy,
+            ) if Instant::now() < deadline => thread::sleep(TICK),
+            Err(e) => panic!("change_membership: {e}"),
+        }
+    }
+}
+
+fn wait_for(what: &str, f: impl Fn() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(TICK);
+    }
+}
+
+#[test]
+fn tcp_membership_grows_then_drops_the_leader() {
+    let mut c = TcpCluster::new(3);
+    c.propose_on_leader(create("a"));
+
+    // m4 knows the bootstrap voters; they learn its address from the log.
+    let l4 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a4 = l4.local_addr().unwrap();
+    let mut cfg = RaftConfig::new(
+        "m4",
+        c.addrs.keys().cloned().collect(),
+        c._td.path().join("m4"),
+    );
+    cfg.bootstrap = Some(c.addrs.keys().cloned().collect());
+    let m4 = RaftServer::start(cfg, l4, c.addrs.clone(), TICK).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    assert!(!m4.status().unwrap().voter);
+    assert_eq!(m4.status().unwrap().term, 0, "a non-voter campaigned");
+
+    let mut voters: BTreeMap<String, String> = c
+        .addrs
+        .iter()
+        .map(|(id, a)| (id.clone(), a.to_string()))
+        .collect();
+    voters.insert("m4".into(), a4.to_string());
+    change_on_leader(&c, &voters);
+    wait_for("m4 to become a voter with the data", || {
+        m4.status().unwrap().voter && has_volume(&m4, "a")
+    });
+    c.servers.insert("m4".into(), Some(m4));
+    c.propose_on_leader(create("b"));
+    c.wait_converged(&["a", "b"]);
+
+    // The leader removes itself: the other three carry on.
+    let l = c.wait_leader();
+    voters.remove(&l);
+    let rest: Vec<String> = voters.keys().cloned().collect();
+    change_on_leader(&c, &voters);
+    wait_for("the removed node to stop leading", || {
+        c.servers[&l].as_ref().unwrap().status().unwrap().role != Role::Leader
+    });
+    c.stop(&l);
+    let new = c.wait_leader();
+    assert!(rest.contains(&new));
+    c.propose_on_leader(create("c"));
+    c.wait_converged(&["a", "b", "c"]);
+    let (m, addrs) = c.servers[&new].as_ref().unwrap().membership().unwrap();
+    assert_eq!(m.voters().into_iter().collect::<Vec<_>>(), rest);
+    assert!(addrs.contains_key("m4"));
 }

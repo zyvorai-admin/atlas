@@ -116,7 +116,8 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   not embedded in `atlas-gateway` (see `docs/IO_EBPF.md`).
 - `crates/atlas-native` — native data plane (library only, not yet wired into the gateway): replicated
   extent engine, metadata WAL + checkpoint/compaction, refcounted extents with free-list space reuse,
-  and a Raft core for the metadata log (pre-vote, check-quorum) with a std-only TCP server
+  and a Raft core for the metadata log (pre-vote, check-quorum, joint-consensus membership changes via
+  `POST /v1/members`) with a std-only TCP server
   (`raft_server`), plus networked data nodes (`data_node`, term-fenced writes) so the engine can
   commit through Raft (`MetaBackend::Raft`) with replicas on other hosts. Per-node circuit breaker,
   write failover and scrub/repair (`repair_once`); both transports support optional mutual TLS.

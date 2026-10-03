@@ -88,6 +88,10 @@ pub struct MetadataRole {
     /// Every metadata voter: Raft node id to `host:port` (resolved on each connect). This node's
     /// own entry, if listed, is ignored, so one file can describe the whole group.
     pub peers: BTreeMap<String, String>,
+    /// Initial voters, used until the first membership change (default: every `peers` entry).
+    /// A node not listed starts as a non-voter and waits to be added through `POST /v1/members`.
+    #[serde(default)]
+    pub bootstrap: Option<Vec<String>>,
     pub data_nodes: Vec<DataNodeSpec>,
     #[serde(default = "default_replicas")]
     pub replicas: usize,
@@ -187,11 +191,21 @@ impl NodeConfig {
                     .iter()
                     .map(|d| ("metadata.data_nodes", &d.addr)),
             ) {
-                let port_ok = addr
-                    .rsplit_once(':')
-                    .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
-                if !port_ok {
+                if !valid_host_port(addr) {
                     return invalid(format!("{what}: {addr:?} is not host:port"));
+                }
+            }
+            if let Some(b) = &m.bootstrap {
+                if b.is_empty() {
+                    return invalid("metadata.bootstrap must not be empty".into());
+                }
+                if let Some(id) = b
+                    .iter()
+                    .find(|id| **id != self.node_id && !m.peers.contains_key(*id))
+                {
+                    return invalid(format!(
+                        "metadata.bootstrap: {id} has no metadata.peers entry"
+                    ));
                 }
             }
             if m.replicas == 0 || m.replicas > m.data_nodes.len() {
@@ -217,6 +231,11 @@ impl NodeConfig {
     }
 }
 
+fn valid_host_port(addr: &str) -> bool {
+    addr.rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+}
+
 /// Pre-bound sockets, for callers (tests, socket activation) that must know addresses up front.
 /// A missing listener is bound from the config.
 #[derive(Debug, Default)]
@@ -238,6 +257,8 @@ struct NodeShared {
     /// Caps request bodies and read lengths alike.
     max_io_bytes: usize,
     require_client_cert: bool,
+    /// Bounds `POST /v1/members` (joint and final entries, including a new voter catching up).
+    membership_timeout: Duration,
     raft: Option<Arc<RaftServer>>,
     engine: Option<NativeEngine>,
     data: Mutex<Option<DataNodeServer>>,
@@ -317,11 +338,12 @@ impl NativeNode {
                     None => TcpListener::bind(m.listen)?,
                 };
                 let peers = cfg.raft_peers();
-                let rcfg = RaftConfig::new(
+                let mut rcfg = RaftConfig::new(
                     cfg.node_id.clone(),
                     peers.keys().cloned().collect(),
                     cfg.data_dir.join("raft"),
                 );
+                rcfg.bootstrap = m.bootstrap.clone();
                 let server = Arc::new(RaftServer::start_with(
                     rcfg,
                     l,
@@ -378,6 +400,11 @@ impl NativeNode {
             id: cfg.node_id.clone(),
             token,
             max_io_bytes: cfg.max_request_bytes,
+            membership_timeout: cfg
+                .metadata
+                .as_ref()
+                .map(|m| Duration::from_millis(m.proposal_timeout_ms.saturating_mul(6)))
+                .unwrap_or_default(),
             require_client_cert: cfg.http_tls.as_ref().is_some_and(|t| t.client_ca.is_some()),
             raft,
             engine,
@@ -547,7 +574,9 @@ fn error_response(e: NativeError) -> Response {
         NativeError::NotFound(_) => (404, None),
         NativeError::Invalid(_) => (400, None),
         NativeError::Raft(RaftError::NotLeader { leader }) => (421, leader.clone()),
-        NativeError::Raft(RaftError::Rejected(_)) | NativeError::Metadata(_) => (409, None),
+        NativeError::Raft(RaftError::Rejected(_) | RaftError::MembershipBusy)
+        | NativeError::Metadata(_) => (409, None),
+        NativeError::Raft(RaftError::Config(_)) => (400, None),
         NativeError::InsufficientReplicas { .. }
         | NativeError::Fenced { .. }
         | NativeError::Raft(
@@ -579,6 +608,34 @@ fn read_range(sh: &NodeShared, req: &Request) -> Result<(u64, usize), Response> 
     Ok((offset, len as usize))
 }
 
+/// `{"voters": {"<id>": "<raft host:port>", ...}}`: the complete new voter set.
+fn change_members(sh: &NodeShared, r: &RaftServer, req: &Request) -> Response {
+    let body = match body_json(req) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let Some(voters) = body["voters"].as_object().and_then(|o| {
+        o.iter()
+            .map(|(k, v)| v.as_str().map(|a| (k.clone(), a.to_string())))
+            .collect::<Option<BTreeMap<String, String>>>()
+    }) else {
+        return Response::text(
+            400,
+            "body must be {\"voters\": {\"<id>\": \"<host:port>\"}}",
+        );
+    };
+    if let Some((id, a)) = voters
+        .iter()
+        .find(|(id, a)| **id != sh.id && !valid_host_port(a))
+    {
+        return Response::text(400, format!("voter {id}: address {a:?} is not host:port"));
+    }
+    match r.change_membership(voters, sh.membership_timeout) {
+        Ok(m) => Response::json(200, &json!({ "membership": m })),
+        Err(e) => error_response(e.into()),
+    }
+}
+
 fn body_json(req: &Request) -> Result<serde_json::Value, Response> {
     serde_json::from_slice(&req.body)
         .map_err(|e| Response::text(400, format!("invalid JSON body: {e}")))
@@ -605,6 +662,16 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
     let segs: Vec<&str> = req.path.trim_matches('/').split('/').collect();
     if let ("GET", ["v1", "status"]) = (req.method.as_str(), segs.as_slice()) {
         return status(sh);
+    }
+    if let (Some(r), ["v1", "members"]) = (&sh.raft, segs.as_slice()) {
+        return match req.method.as_str() {
+            "GET" => match r.membership() {
+                Ok((m, addrs)) => Response::json(200, &json!({ "membership": m, "addrs": addrs })),
+                Err(e) => error_response(e.into()),
+            },
+            "POST" => change_members(sh, r, &req),
+            _ => Response::text(405, "GET or POST"),
+        };
     }
     let Some(e) = &sh.engine else {
         return Response::text(404, "the metadata role is not enabled on this node");
@@ -684,7 +751,8 @@ fn readiness(sh: &NodeShared) -> Response {
             return Response::text(503, format!("metadata replica stopped: {err}"));
         }
         match r.status() {
-            Ok(s) if s.leader.is_some() => {}
+            // A non-voter hears from no leader until it is added; it is ready to be added.
+            Ok(s) if s.leader.is_some() || !s.voter => {}
             _ => return Response::text(503, "no metadata leader known"),
         }
     }
@@ -702,6 +770,7 @@ fn status(sh: &NodeShared) -> Response {
             "leader": s.leader,
             "commit_index": s.commit_index,
             "applied_index": s.applied_index,
+            "voter": s.voter,
         })
     });
     let nodes = sh.engine.as_ref().map(NativeEngine::node_status);

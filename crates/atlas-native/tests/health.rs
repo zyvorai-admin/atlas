@@ -105,7 +105,7 @@ fn write_moves_a_replica_off_a_failed_node_and_retries_it_after_backoff() {
     let td = tempfile::tempdir().unwrap();
     let mut c = Cluster::start(td.path(), 4);
     let mut ec = cfg(&td.path().join("meta"));
-    ec.node_retry_after = Duration::from_millis(300);
+    ec.node_retry_after = Duration::from_millis(1500);
     let e = c.engine(ec);
     let v = e.create_volume("v", 3 * 4096).unwrap();
 
@@ -128,7 +128,7 @@ fn write_moves_a_replica_off_a_failed_node_and_retries_it_after_backoff() {
 
     // After the back-off window a recovered node is used again.
     c.restart(1);
-    thread::sleep(Duration::from_millis(350));
+    thread::sleep(Duration::from_millis(1600));
     e.write(&v, 8192, &[3u8; 4096]).unwrap();
     assert_eq!(status(&e, "n1"), (true, 1));
     assert_eq!(e.device_len("n1").unwrap(), 4096);

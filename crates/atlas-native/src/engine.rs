@@ -94,7 +94,7 @@ pub enum MetaBackend {
 
 enum Meta {
     Local {
-        catalog: RwLock<Catalog>,
+        catalog: Box<RwLock<Catalog>>,
         wal: Mutex<Wal>,
     },
     Raft {
@@ -210,7 +210,7 @@ impl NativeEngine {
                 }
                 wal.raise_floor(catalog.applied_index);
                 Meta::Local {
-                    catalog: RwLock::new(catalog),
+                    catalog: Box::new(RwLock::new(catalog)),
                     wal: Mutex::new(wal),
                 }
             }
