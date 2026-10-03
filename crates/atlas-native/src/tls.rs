@@ -48,25 +48,63 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+fn roots_from_pem(ca_pem: &[u8]) -> io::Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    for ca in CertificateDer::pem_slice_iter(ca_pem) {
+        roots
+            .add(ca.map_err(|e| invalid(format!("CA bundle: {e}")))?)
+            .map_err(|e| invalid(format!("CA certificate: {e}")))?;
+    }
+    if roots.is_empty() {
+        return Err(invalid("CA bundle has no certificates"));
+    }
+    Ok(roots)
+}
+
+fn chain_and_key(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let chain = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| invalid(format!("certificate: {e}")))?;
+    if chain.is_empty() {
+        return Err(invalid("certificate file has no certificates"));
+    }
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| invalid(format!("key: {e}")))?;
+    Ok((chain, key))
+}
+
+/// Server config for the HTTPS API. With `client_ca`, client certificates signed by it are
+/// verified when presented but not required; the caller decides which requests need one (see
+/// [`Conn::client_verified`]).
+pub(crate) fn http_server_config(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca: Option<&[u8]>,
+) -> io::Result<Arc<ServerConfig>> {
+    let (chain, key) = chain_and_key(cert_pem, key_pem)?;
+    let builder = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(invalid)?;
+    let builder = match client_ca {
+        Some(ca) => builder.with_client_cert_verifier(
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots_from_pem(ca)?), provider())
+                .allow_unauthenticated()
+                .build()
+                .map_err(invalid)?,
+        ),
+        None => builder.with_no_client_auth(),
+    };
+    Ok(Arc::new(
+        builder.with_single_cert(chain, key).map_err(invalid)?,
+    ))
+}
+
 impl TlsIdentity {
     pub fn from_pem(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Self> {
-        let mut roots = RootCertStore::empty();
-        for ca in CertificateDer::pem_slice_iter(ca_pem) {
-            roots
-                .add(ca.map_err(|e| invalid(format!("CA bundle: {e}")))?)
-                .map_err(|e| invalid(format!("CA certificate: {e}")))?;
-        }
-        if roots.is_empty() {
-            return Err(invalid("CA bundle has no certificates"));
-        }
-        let chain = CertificateDer::pem_slice_iter(cert_pem)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| invalid(format!("certificate: {e}")))?;
-        if chain.is_empty() {
-            return Err(invalid("certificate file has no certificates"));
-        }
-        let key =
-            PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| invalid(format!("key: {e}")))?;
+        let roots = roots_from_pem(ca_pem)?;
+        let (chain, key) = chain_and_key(cert_pem, key_pem)?;
         Ok(Self {
             roots: Arc::new(roots),
             chain,
@@ -198,6 +236,24 @@ impl Conn {
 
     pub(crate) fn is_tls(&self) -> bool {
         !matches!(self, Self::Plain(_))
+    }
+
+    /// Whether the peer presented a certificate that the server's client verifier accepted
+    /// (rustls aborts the handshake on an invalid one).
+    pub(crate) fn client_verified(&self) -> bool {
+        matches!(self, Self::Server(s) if s.conn.peer_certificates().is_some_and(|c| !c.is_empty()))
+    }
+
+    /// Sends TLS close_notify (best effort) so the peer sees a clean end of stream.
+    pub(crate) fn close_notify(&mut self) {
+        if let Self::Server(s) = self {
+            s.conn.send_close_notify();
+            while s.conn.wants_write() {
+                if s.conn.write_tls(&mut s.sock).is_err() {
+                    break;
+                }
+            }
+        }
     }
 }
 

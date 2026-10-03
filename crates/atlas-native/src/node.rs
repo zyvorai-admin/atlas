@@ -44,6 +44,9 @@ pub struct NodeConfig {
     /// Mutual TLS for the Raft and data-node transports (not the HTTP endpoint).
     #[serde(default)]
     pub tls: Option<TlsFiles>,
+    /// Serve the HTTP API over TLS.
+    #[serde(default)]
+    pub http_tls: Option<HttpTlsFiles>,
     #[serde(default)]
     pub data_node: Option<DataNodeRole>,
     #[serde(default)]
@@ -58,6 +61,18 @@ pub struct TlsFiles {
     pub ca: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpTlsFiles {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// When set, every `/v1/*` request must present a client certificate signed by this CA
+    /// (on top of the bearer token, if one is configured). `/healthz`, `/readyz` and `/metrics`
+    /// stay reachable without one so probes and scrapers keep working.
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +237,7 @@ struct NodeShared {
     token: Option<String>,
     /// Caps request bodies and read lengths alike.
     max_io_bytes: usize,
+    require_client_cert: bool,
     raft: Option<Arc<RaftServer>>,
     engine: Option<NativeEngine>,
     data: Mutex<Option<DataNodeServer>>,
@@ -261,6 +277,18 @@ impl NativeNode {
         if token.as_deref() == Some("") {
             return Err(NativeError::Invalid("api_token_file is empty".into()));
         }
+        let http_tls = cfg
+            .http_tls
+            .as_ref()
+            .map(|t| -> Result<_, NativeError> {
+                let ca = t.client_ca.as_ref().map(std::fs::read).transpose()?;
+                Ok(crate::tls::http_server_config(
+                    &std::fs::read(&t.cert)?,
+                    &std::fs::read(&t.key)?,
+                    ca.as_deref(),
+                )?)
+            })
+            .transpose()?;
 
         let mut data_addr = None;
         let data = match &cfg.data_node {
@@ -350,6 +378,7 @@ impl NativeNode {
             id: cfg.node_id.clone(),
             token,
             max_io_bytes: cfg.max_request_bytes,
+            require_client_cert: cfg.http_tls.as_ref().is_some_and(|t| t.client_ca.is_some()),
             raft,
             engine,
             data: Mutex::new(data),
@@ -399,7 +428,7 @@ impl NativeNode {
             let sh = shared.clone();
             Arc::new(move |req| handle(&sh, req))
         };
-        let http = HttpServer::start(http_listener, cfg.max_request_bytes, handler)?;
+        let http = HttpServer::start_with(http_listener, cfg.max_request_bytes, handler, http_tls)?;
         Ok(Self {
             shared,
             http_addr: http.local_addr(),
@@ -561,6 +590,12 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
         ("GET", "/readyz") => return readiness(sh),
         ("GET", "/metrics") => return metrics(sh),
         _ => {}
+    }
+    if sh.require_client_cert && !req.client_verified {
+        return Response::text(
+            401,
+            "a client certificate signed by http_tls.client_ca is required",
+        );
     }
     if let Some(t) = &sh.token {
         if !token_ok(t, req.headers.get("authorization")) {
