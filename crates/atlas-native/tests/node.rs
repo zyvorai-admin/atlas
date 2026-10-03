@@ -74,16 +74,16 @@ impl Cluster {
             .iter()
             .map(|(id, l)| DataNodeSpec {
                 id: id.clone(),
-                addr: l.local_addr().unwrap(),
+                addr: l.local_addr().unwrap().to_string(),
                 zone: None,
                 rack: None,
                 host: None,
                 free_bytes: 1 << 30,
             })
             .collect();
-        let raft_addrs: BTreeMap<String, SocketAddr> = meta_l
+        let raft_addrs: BTreeMap<String, String> = meta_l
             .iter()
-            .map(|(id, l)| (id.clone(), l.local_addr().unwrap()))
+            .map(|(id, l)| (id.clone(), l.local_addr().unwrap().to_string()))
             .collect();
         let base = |id: &str, root: &Path| NodeConfig {
             node_id: id.into(),
@@ -117,11 +117,8 @@ impl Cluster {
             let mut cfg = base(&id, td.path());
             cfg.metadata = Some(MetadataRole {
                 listen: l.local_addr().unwrap(),
-                peers: raft_addrs
-                    .iter()
-                    .filter(|(p, _)| **p != id)
-                    .map(|(p, a)| (p.clone(), *a))
-                    .collect(),
+                // Every voter, this node included: the node ignores its own entry.
+                peers: raft_addrs.clone(),
                 data_nodes: specs.clone(),
                 replicas: 3,
                 extent_bytes: 4096,
@@ -389,10 +386,15 @@ fn config_validation_rejects_bad_files() {
                 "data_nodes":[{"id":"d1","addr":"127.0.0.1:1"}]}}"#,
         ),
         (
-            "selfpeer.json",
+            "badaddr.json",
             r#"{"node_id":"m1","data_dir":"/tmp/x","http_listen":"127.0.0.1:0",
-                "metadata":{"listen":"127.0.0.1:0","peers":{"m1":"127.0.0.1:2"},"replicas":1,
-                "data_nodes":[{"id":"d1","addr":"127.0.0.1:1"}]}}"#,
+                "metadata":{"listen":"127.0.0.1:0","peers":{"m2":"no-port"},"replicas":1,
+                "data_nodes":[{"id":"d1","addr":"d1.svc:7481"}]}}"#,
+        ),
+        (
+            "unsetenv.json",
+            r#"{"node_id":"${ATLAS_NATIVE_TEST_UNSET_VAR}","data_dir":"/tmp/x",
+                "http_listen":"127.0.0.1:0","data_node":{"listen":"127.0.0.1:0"}}"#,
         ),
     ] {
         assert!(

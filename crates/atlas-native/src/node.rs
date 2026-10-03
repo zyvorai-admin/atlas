@@ -70,8 +70,9 @@ pub struct DataNodeRole {
 #[serde(deny_unknown_fields)]
 pub struct MetadataRole {
     pub listen: SocketAddr,
-    /// The other metadata replicas: Raft node id to address.
-    pub peers: BTreeMap<String, SocketAddr>,
+    /// Every metadata voter: Raft node id to `host:port` (resolved on each connect). This node's
+    /// own entry, if listed, is ignored, so one file can describe the whole group.
+    pub peers: BTreeMap<String, String>,
     pub data_nodes: Vec<DataNodeSpec>,
     #[serde(default = "default_replicas")]
     pub replicas: usize,
@@ -94,7 +95,8 @@ pub struct MetadataRole {
 pub struct DataNodeSpec {
     /// Must equal that data node's `node_id` (it is also its TLS server name).
     pub id: String,
-    pub addr: SocketAddr,
+    /// `host:port`, resolved on each connect.
+    pub addr: String,
     #[serde(default)]
     pub zone: Option<String>,
     #[serde(default)]
@@ -132,10 +134,28 @@ fn default_free_bytes() -> u64 {
 }
 
 impl NodeConfig {
+    /// Reads a JSON config, first replacing every `${NAME}` with the environment variable
+    /// `NAME` (e.g. `${POD_NAME}` in a StatefulSet); an unset variable is an error.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, NativeError> {
-        let cfg: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        let raw = std::fs::read_to_string(path)?;
+        let expanded = expand_env(&raw, |k| std::env::var(k).ok())?;
+        let cfg: Self = serde_json::from_str(&expanded)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The other voters (this node's own entry removed).
+    pub fn raft_peers(&self) -> BTreeMap<String, String> {
+        self.metadata
+            .as_ref()
+            .map(|m| {
+                m.peers
+                    .iter()
+                    .filter(|(id, _)| **id != self.node_id)
+                    .map(|(id, a)| (id.clone(), a.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn validate(&self) -> Result<(), NativeError> {
@@ -147,8 +167,17 @@ impl NodeConfig {
             return invalid("enable at least one of data_node or metadata".into());
         }
         if let Some(m) = &self.metadata {
-            if m.peers.contains_key(&self.node_id) {
-                return invalid("metadata.peers must not include this node".into());
+            for (what, addr) in m.peers.values().map(|a| ("metadata.peers", a)).chain(
+                m.data_nodes
+                    .iter()
+                    .map(|d| ("metadata.data_nodes", &d.addr)),
+            ) {
+                let port_ok = addr
+                    .rsplit_once(':')
+                    .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+                if !port_ok {
+                    return invalid(format!("{what}: {addr:?} is not host:port"));
+                }
             }
             if m.replicas == 0 || m.replicas > m.data_nodes.len() {
                 return invalid(format!(
@@ -257,15 +286,16 @@ impl NativeNode {
                     Some(l) => l,
                     None => TcpListener::bind(m.listen)?,
                 };
+                let peers = cfg.raft_peers();
                 let rcfg = RaftConfig::new(
                     cfg.node_id.clone(),
-                    m.peers.keys().cloned().collect(),
+                    peers.keys().cloned().collect(),
                     cfg.data_dir.join("raft"),
                 );
                 let server = Arc::new(RaftServer::start_with(
                     rcfg,
                     l,
-                    m.peers.clone(),
+                    peers,
                     Duration::from_millis(m.tick_ms),
                     tls.clone(),
                 )?);
@@ -275,9 +305,9 @@ impl NativeNode {
                 for d in &m.data_nodes {
                     let dev: Arc<dyn BlockStore> = match &tls {
                         Some(id) => {
-                            Arc::new(RemoteDevice::with_tls(d.addr, &d.id, id, io_timeout)?)
+                            Arc::new(RemoteDevice::with_tls(&d.addr, &d.id, id, io_timeout)?)
                         }
-                        None => Arc::new(RemoteDevice::new(d.addr, io_timeout)),
+                        None => Arc::new(RemoteDevice::new(&d.addr, io_timeout)),
                     };
                     let spec = Node {
                         id: d.id.clone(),
@@ -447,6 +477,29 @@ fn maintenance(
             }
         }
     }
+}
+
+/// Replaces `${NAME}` with `lookup(NAME)`. `$` not followed by `{` is left alone.
+fn expand_env(raw: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, NativeError> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| NativeError::Invalid("unterminated ${ in config".into()))?;
+        let name = &after[..end];
+        let value = lookup(name).ok_or_else(|| {
+            NativeError::Invalid(format!(
+                "config references unset environment variable {name}"
+            ))
+        })?;
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn token_ok(expected: &str, header: Option<&String>) -> bool {
@@ -662,5 +715,21 @@ fn metrics(sh: &NodeShared) -> Response {
         status: 200,
         content_type: "text/plain; version=0.0.4",
         body: out.into_bytes(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_env;
+
+    #[test]
+    fn expands_environment_references() {
+        let env = |k: &str| (k == "POD_NAME").then(|| "atlas-native-1".to_string());
+        assert_eq!(
+            expand_env(r#"{"id":"${POD_NAME}","cost":"$5"}"#, env).unwrap(),
+            r#"{"id":"atlas-native-1","cost":"$5"}"#
+        );
+        assert!(expand_env("${MISSING}", env).is_err());
+        assert!(expand_env("${POD_NAME", env).is_err());
     }
 }

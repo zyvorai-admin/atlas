@@ -1,0 +1,23 @@
+# Copyright (c) 2026 ZyvorAI Labs Private Limited.
+# SPDX-License-Identifier: Apache-2.0
+# atlas-native-node: the native storage node (crates/atlas-native, docs/NATIVE_NODE.md). Only the
+# one binary: it speaks its own TCP protocols plus a small HTTP endpoint, so the runtime image needs
+# nothing beyond CA certificates.
+# ---- builder ----
+FROM docker.io/library/rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release --locked -p atlas-native --bin atlas-native-node
+
+# ---- runtime ----
+FROM docker.io/library/debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home /var/lib/atlas-native atlas-native \
+    && mkdir -p /var/lib/atlas-native && chown atlas-native:atlas-native /var/lib/atlas-native
+COPY --from=builder /build/target/release/atlas-native-node /usr/local/bin/atlas-native-node
+USER atlas-native
+WORKDIR /var/lib/atlas-native
+EXPOSE 7480 7481 7482
+ENTRYPOINT ["/usr/local/bin/atlas-native-node"]
+CMD ["--config", "/etc/atlas-native/node.json"]

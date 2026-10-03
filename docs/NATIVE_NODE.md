@@ -40,7 +40,7 @@ Unknown fields are rejected. A combined node (`m1` running both roles):
   "data_node": { "listen": "10.0.0.1:7481" },
   "metadata": {
     "listen": "10.0.0.1:7482",
-    "peers": { "m2": "10.0.0.2:7482", "m3": "10.0.0.3:7482" },
+    "peers": { "m1": "10.0.0.1:7482", "m2": "10.0.0.2:7482", "m3": "10.0.0.3:7482" },
     "data_nodes": [
       { "id": "m1", "addr": "10.0.0.1:7481", "rack": "r1" },
       { "id": "m2", "addr": "10.0.0.2:7481", "rack": "r2" },
@@ -53,6 +53,12 @@ Unknown fields are rejected. A combined node (`m1` running both roles):
   }
 }
 ```
+
+`${NAME}` anywhere in the file is replaced with the environment variable `NAME` before parsing; an
+unset variable or an unterminated `${` is a config error. `metadata.peers` may list every voter
+including this node (its own entry is ignored), so one file can be shared by all members. Peer and
+data-node addresses are `host:port` and resolved on every connect, so DNS names that move to a new IP
+(a rescheduled pod) keep working.
 
 | Field | Default | Notes |
 | --- | --- | --- |
@@ -109,6 +115,29 @@ of it if it leaves the host).
 - **Logging**: startup prints the bound addresses to stderr; everything else is in `/metrics` and
   `/v1/status`.
 
+## Kubernetes
+
+`Dockerfile.native` builds a slim image (`atlas-native-node`, uid 10001). `deploy/k8s/atlas-native.yaml`
+runs it as a 3-replica StatefulSet in namespace `atlas-native`, each pod a combined metadata + data
+node:
+
+- one shared ConfigMap with `node_id: "${POD_NAME}"` (downward API) and peers/data nodes addressed by
+  stable DNS `atlas-native-N.atlas-native.atlas-native.svc.cluster.local` through a headless Service
+  with `publishNotReadyAddresses` (members must find each other before any is ready);
+- per-pod state on a `volumeClaimTemplate` (5 Gi, default StorageClass), so Raft log, catalog and
+  extents survive rescheduling;
+- the API token from Secret `atlas-native-api`; ClusterIP Service `atlas-native-api:7480` for clients
+  (mutations sent to a follower get 421 with the leader's pod name);
+- probes on `/healthz` (startup, liveness) and `/readyz` (readiness), a PDB of `maxUnavailable: 1`,
+  non-root, read-only root filesystem, all capabilities dropped.
+
+`scripts/deploy-native-remote.sh <host> [user] [--verify-failover]` builds the image with podman on a
+k3s host, tags it by content id, imports it into containerd, creates the token Secret if missing and
+applies the manifest with the image pinned to that tag and the pod template stamped with a manifest
+hash. Pods therefore roll only when the image or manifest changed; re-running it is a no-op. It then
+writes and reads a block through the leader, and with `--verify-failover` deletes the leader pod and
+reads the block back from the newly elected one.
+
 ## Smoke test
 
 `deploy/native/smoke.sh [path/to/atlas-native-node]` starts three metadata and three data node
@@ -125,4 +154,4 @@ repair after losing a data node, and config validation.
   TLS-terminating proxy);
 - cross-extent reads and unaligned I/O in the volume API;
 - Raft membership changes (the voter set is fixed by config);
-- a container image, Helm chart and gateway integration.
+- a Helm chart and gateway integration (the raw manifest above is the only deployment).

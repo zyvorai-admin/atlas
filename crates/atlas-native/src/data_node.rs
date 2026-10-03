@@ -401,7 +401,7 @@ fn serve(mut stream: Conn, sh: &Shared) {
 
 /// Client for a [`DataNodeServer`]. Keeps one connection open and reconnects on failure.
 pub struct RemoteDevice {
-    addr: SocketAddr,
+    target: String,
     timeout: Duration,
     tls: Option<(Arc<ClientConfig>, ServerName<'static>)>,
     conn: Mutex<Option<Conn>>,
@@ -410,18 +410,18 @@ pub struct RemoteDevice {
 impl std::fmt::Debug for RemoteDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteDevice")
-            .field("addr", &self.addr)
+            .field("target", &self.target)
             .field("tls", &self.tls.as_ref().map(|(_, n)| n))
             .finish()
     }
 }
 
 impl RemoteDevice {
-    /// Plaintext client. `timeout` bounds connecting, the handshake and each socket read or
-    /// write.
-    pub fn new(addr: SocketAddr, timeout: Duration) -> Self {
+    /// Plaintext client for `target`: a socket address or a `host:port` re-resolved on every
+    /// connection. `timeout` bounds connecting, the handshake and each socket read or write.
+    pub fn new(target: impl std::fmt::Display, timeout: Duration) -> Self {
         Self {
-            addr,
+            target: target.to_string(),
             timeout,
             tls: None,
             conn: Mutex::new(None),
@@ -430,25 +430,25 @@ impl RemoteDevice {
 
     /// Mutual-TLS client that requires the data node's certificate to be valid for `node_id`.
     pub fn with_tls(
-        addr: SocketAddr,
+        target: impl std::fmt::Display,
         node_id: &str,
         identity: &TlsIdentity,
         timeout: Duration,
     ) -> Result<Self, NativeError> {
         Ok(Self {
-            addr,
+            target: target.to_string(),
             timeout,
             tls: Some((identity.client_config()?, tls::server_name(node_id)?)),
             conn: Mutex::new(None),
         })
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    pub fn target(&self) -> &str {
+        &self.target
     }
 
     fn connect(&self) -> io::Result<Conn> {
-        let s = TcpStream::connect_timeout(&self.addr, self.timeout)?;
+        let s = TcpStream::connect_timeout(&tls::resolve(&self.target)?, self.timeout)?;
         s.set_nodelay(true)?;
         s.set_read_timeout(Some(self.timeout))?;
         s.set_write_timeout(Some(self.timeout))?;

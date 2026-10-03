@@ -118,21 +118,22 @@ pub struct RaftServer {
 
 impl RaftServer {
     /// Starts serving `cfg` on an already-bound `listener` without TLS. `peers` maps every id
-    /// in `cfg.peers` to its address.
-    pub fn start(
+    /// in `cfg.peers` to its address: a socket address or a `host:port` re-resolved on every
+    /// connection attempt.
+    pub fn start<A: std::fmt::Display>(
         cfg: RaftConfig,
         listener: TcpListener,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, A>,
         tick: Duration,
     ) -> Result<Self, RaftError> {
         Self::start_with(cfg, listener, peers, tick, None)
     }
 
     /// Like [`Self::start`], with mutual TLS when `tls` is set. Node ids must then be DNS names.
-    pub fn start_with(
+    pub fn start_with<A: std::fmt::Display>(
         cfg: RaftConfig,
         listener: TcpListener,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, A>,
         tick: Duration,
         tls: Option<TlsIdentity>,
     ) -> Result<Self, RaftError> {
@@ -167,7 +168,7 @@ impl RaftServer {
             let stats = Arc::new(PeerStats::default());
             peer_stats.insert(p.clone(), stats.clone());
             let target = PeerTarget {
-                addr: peers[p],
+                target: peers[p].to_string(),
                 tls: tls_client.clone().zip(peer_names.get(p).cloned()),
                 handshake_failures: tls_handshake_failures.clone(),
             };
@@ -637,14 +638,14 @@ fn read_loop(
 }
 
 struct PeerTarget {
-    addr: SocketAddr,
+    target: String,
     tls: Option<(Arc<ClientConfig>, ServerName<'static>)>,
     handshake_failures: Arc<AtomicU64>,
 }
 
 impl PeerTarget {
     fn connect(&self) -> io::Result<Conn> {
-        let s = TcpStream::connect_timeout(&self.addr, CONNECT_TIMEOUT)?;
+        let s = TcpStream::connect_timeout(&tls::resolve(&self.target)?, CONNECT_TIMEOUT)?;
         s.set_nodelay(true)?;
         s.set_write_timeout(Some(WRITE_TIMEOUT))?;
         s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;

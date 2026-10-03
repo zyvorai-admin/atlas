@@ -9,7 +9,7 @@
 
 use std::{
     io::{self, Read, Write},
-    net::TcpStream,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
@@ -110,6 +110,17 @@ impl TlsIdentity {
             .map_err(invalid)?;
         Ok(Arc::new(cfg))
     }
+}
+
+/// Resolves `host:port` (or a literal socket address) now. Callers resolve on every connect so a
+/// peer whose IP changes (e.g. a rescheduled pod behind a stable DNS name) is found again.
+pub(crate) fn resolve(target: &str) -> io::Result<SocketAddr> {
+    target.to_socket_addrs()?.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{target} resolved to no addresses"),
+        )
+    })
 }
 
 /// `name` as a TLS server name; node ids must be valid DNS names to be used with TLS.

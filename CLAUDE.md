@@ -121,7 +121,9 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   commit through Raft (`MetaBackend::Raft`) with replicas on other hosts. Per-node circuit breaker,
   write failover and scrub/repair (`repair_once`); both transports support optional mutual TLS.
   Bin `atlas-native-node` (`node` module) runs either role with an HTTP health/metrics/volume API
-  (`deploy/native/smoke.sh`). See `docs/NATIVE_STORAGE.md`, `docs/NATIVE_METADATA.md`,
+  (`deploy/native/smoke.sh`); `Dockerfile.native` + `deploy/k8s/atlas-native.yaml` (3-pod
+  StatefulSet, verified live on the lab k3s incl. leader-pod failover) deployed by
+  `scripts/deploy-native-remote.sh <host> [user]`. See `docs/NATIVE_STORAGE.md`, `docs/NATIVE_METADATA.md`,
   `docs/NATIVE_NODE.md`.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
