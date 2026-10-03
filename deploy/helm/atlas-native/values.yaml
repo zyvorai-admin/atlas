@@ -1,0 +1,84 @@
+# Copyright (c) 2026 ZyvorAI Labs Private Limited.
+# SPDX-License-Identifier: Apache-2.0
+# atlas-native-node StatefulSet (docs/NATIVE_NODE.md). Every pod is a Raft metadata voter and a
+# data node serving its own PVC.
+
+image:
+  repository: ghcr.io/zyvorai/atlas-native-node
+  tag: ""          # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Number of pods = metadata voters = data nodes. Use an odd number (3 or 5). Adding or removing
+# members of a running cluster is not handled by a plain `helm upgrade` of this value.
+replicas: 3
+
+node:
+  # Copies of each extent, on distinct pods. At most `replicas`.
+  replicationFactor: 3
+  extentBytes: 4194304
+  maxRequestBytes: 16777216
+  tickMs: 50
+  proposalTimeoutMs: 5000
+  repairIntervalSecs: 300
+  gcIntervalSecs: 60
+  # Placement capacity hint per data node (bytes); defaults to the PVC size.
+  freeBytes: 0
+
+apiToken:
+  # Secret with key `token`. Empty: the chart creates "<fullname>-api" with a random token that is
+  # kept across upgrades.
+  existingSecret: ""
+
+# Mutual TLS for the Raft and data-node transports. Node ids are pod names, so the certificate
+# must carry every pod name ("<fullname>-0", "<fullname>-1", ...) as a DNS SAN.
+tls:
+  enabled: false
+  # Secret with ca.crt, tls.crt and tls.key (cert-manager layout).
+  existingSecret: ""
+  certManager:
+    # Render a cert-manager Certificate with the right SANs into "<fullname>-tls".
+    enabled: false
+    issuerRef: {}   # e.g. { name: atlas-ca, kind: ClusterIssuer }
+    duration: 2160h
+    renewBefore: 360h
+
+# TLS for the HTTP API.
+httpTls:
+  enabled: false
+  # Secret with tls.crt and tls.key (and ca.crt when requireClientCert).
+  existingSecret: ""
+  # Require a client certificate signed by the Secret's ca.crt on every /v1/* request.
+  # /healthz, /readyz and /metrics stay open for probes and scrapers.
+  requireClientCert: false
+
+persistence:
+  size: 5Gi
+  storageClass: ""   # cluster default when empty
+  accessModes: ["ReadWriteOnce"]
+
+service:
+  type: ClusterIP
+  port: 7480
+
+podDisruptionBudget:
+  maxUnavailable: 1
+
+# soft: prefer one pod per node; hard: require it (pods stay Pending without enough nodes).
+podAntiAffinity: soft
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 512Mi }
+
+nodeSelector: {}
+tolerations: []
+podAnnotations: {}
+podLabels: {}
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+clusterDomain: cluster.local
