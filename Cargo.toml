@@ -19,6 +19,7 @@ members = [
     "crates/atlas-jobs",
     "crates/atlas-gateway",
     "crates/atlas-io",
+    "crates/atlas-native",
     "crates/atlasctl",
 ]
 resolver = "2"
@@ -46,6 +47,7 @@ atlas-inventory = { path = "crates/atlas-inventory" }
 atlas-discovery = { path = "crates/atlas-discovery" }
 atlas-monitor = { path = "crates/atlas-monitor" }
 atlas-io = { path = "crates/atlas-io" }
+atlas-native = { path = "crates/atlas-native" }
 atlas-jobs = { path = "crates/atlas-jobs" }
 
 # Async / runtime
