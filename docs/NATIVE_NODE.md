@@ -83,7 +83,7 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `GET /healthz` | no | Process is up. |
 | `GET /readyz` | no | 200 once a metadata leader is known (metadata role; a non-voter waiting to be added counts as ready) or the data node is serving; 503 otherwise, including after a fatal storage error. |
 | `GET /metrics` | no | Prometheus text: Raft/transport, engine, data node, and `atlas_native_{repair,gc}_{runs,errors}_total`. |
-| `GET /v1/status` | yes | Raft role/term/leader/indexes, per-data-node health, last repair result, data-node fence. |
+| `GET /v1/status` | yes | Raft role/term/leader/indexes and voter flag, `layout` (`extent_bytes`, `replicas`), per-data-node health, last repair result, data-node fence. |
 | `GET /v1/volumes` | yes | Volumes in the applied catalog. |
 | `POST /v1/volumes` | yes | `{"name": "...", "size_bytes": N}` → 201 `{"id": "..."}`. |
 | `DELETE /v1/volumes/{id}` | yes | 204. |
@@ -185,6 +185,35 @@ and checks the new leader still serves the block and accepts writes.
 421 with the leader hint, volume/snapshot round trips, request validation, metrics, background
 repair after losing a data node, and config validation.
 
+## Atlas gateway
+
+`atlas-driver-native` is the gateway's `StorageDriver` for a native cluster. With
+`ATLAS_NATIVE_ENABLE=1` (Helm: `native.enabled` in `deploy/helm/atlas`) the gateway registers
+backend `bkd_native`, discovers it at startup and every `ATLAS_MONITOR_INTERVAL_SECS`, and serves:
+
+- inventory: one cluster `cls_native_bkd_native`, one replicated pool `native` (replica size from
+  `/v1/status` `layout`), block volumes `vol_native_<native id>`; health is critical without a
+  metadata leader and warn while a data node is down. Capacity is not reported (the nodes do not
+  know their disks' size), so it stays empty instead of being invented;
+- `POST /volumes` with `"kubernetes": {"backend_id": "bkd_native"}`: created synchronously through
+  the leader (201, no job), recorded under the request's tenant (quota admission and product
+  bindings as for any volume); `DELETE /volumes/{id}`, `POST /volumes/{id}/snapshots` and
+  `DELETE /snapshots/{id}` likewise go straight to the cluster. Resize and clone/restore are
+  refused with 400 until the node API has them.
+
+Real mode (`ATLAS_NATIVE_DRIVER_MODE=real`) needs `ATLAS_NATIVE_ENDPOINTS` (comma-separated
+`https://pod:7480` URLs of metadata nodes). Mutations are retried across the endpoints until the
+leader accepts them; reads use any node. `ATLAS_NATIVE_TOKEN_FILE` is the API token,
+`ATLAS_NATIVE_CA_CERT` a private CA for `http_tls`, and `ATLAS_NATIVE_CLIENT_CERT`/`_KEY` a client
+certificate for clusters with `client_ca`. Fake mode keeps volumes in memory for demos and tests.
+
+Verified live (2026-10-03) on the k3s lab: a gateway in real mode against a 3-pod Helm release
+discovered `bkd_native` (pool `native`, 3 replicas, ok), created a 16 MiB volume (201, visible on
+the nodes), showed its used extent after a write, took and deleted a snapshot, refused resize with
+400 and deleted the volume on the cluster.
+
 ## Not implemented yet
 
-- gateway integration.
+- volume resize and clones (node API and driver);
+- the data path through the gateway (volumes are created and listed via Atlas; block I/O goes to
+  the node API directly).

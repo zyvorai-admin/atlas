@@ -144,6 +144,7 @@ fn backend_type_str(t: BackendType) -> &'static str {
         BackendType::San => "san",
         BackendType::CloudBlock => "cloud_block",
         BackendType::Kubernetes => "kubernetes",
+        BackendType::Native => "native",
     }
 }
 fn backend_type_from(s: &str) -> BackendType {
@@ -155,6 +156,7 @@ fn backend_type_from(s: &str) -> BackendType {
         "san" => BackendType::San,
         "cloud_block" => BackendType::CloudBlock,
         "kubernetes" => BackendType::Kubernetes,
+        "native" => BackendType::Native,
         _ => BackendType::Ceph,
     }
 }
@@ -776,7 +778,11 @@ pub async fn list_policy_drift(pool: &AnyPool) -> Result<Vec<serde_json::Value>>
         let expected: Option<String> = placement.as_deref().and_then(|p| {
             serde_json::from_str::<serde_json::Value>(p)
                 .ok()
-                .and_then(|v| v.get("storage_class").and_then(|s| s.as_str()).map(str::to_string))
+                .and_then(|v| {
+                    v.get("storage_class")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                })
         });
         let missing: i64 = r.get("policy_missing");
         let drifted = missing == 1 || (expected.is_some() && actual != expected);
@@ -845,8 +851,8 @@ pub async fn delete_volumes_by_backend(pool: &AnyPool, backend_id: &str) -> Resu
 }
 
 fn row_to_backend(r: sqlx::any::AnyRow) -> StorageBackend {
-    let caps: Capabilities = serde_json::from_str(r.get::<String, _>("capabilities").as_str())
-        .unwrap_or_default();
+    let caps: Capabilities =
+        serde_json::from_str(r.get::<String, _>("capabilities").as_str()).unwrap_or_default();
     StorageBackend {
         id: r.get("id"),
         name: r.get("name"),
@@ -1056,6 +1062,16 @@ pub async fn get_volume_labels(pool: &AnyPool, id: &str) -> Result<serde_json::V
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     Ok(v.get("labels").cloned().unwrap_or(serde_json::json!({})))
+}
+
+/// The backend a volume belongs to (the DTO omits it).
+pub async fn volume_backend_id(pool: &AnyPool, id: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT backend_id FROM storage_volumes WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 /// The owning tenant of a volume (the DTO omits it); defaults to `global` if the volume is gone.

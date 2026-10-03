@@ -24,6 +24,8 @@ pub enum BackendType {
     CloudBlock,
     /// Kubernetes CSI / StorageClass view (not a physical backend of its own).
     Kubernetes,
+    /// An atlas-native-node cluster (`atlas-driver-native`).
+    Native,
 }
 
 /// How a backend is operated (PDF §6).

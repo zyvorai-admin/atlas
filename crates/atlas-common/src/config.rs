@@ -21,7 +21,7 @@ pub enum CephDriverMode {
 }
 
 impl CephDriverMode {
-    fn from_env_str(s: &str) -> Self {
+    pub fn from_env_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "real" => CephDriverMode::Real,
             _ => CephDriverMode::Fake,
@@ -46,7 +46,7 @@ pub enum DriverMode {
 }
 
 impl DriverMode {
-    fn from_env_str(s: &str) -> Self {
+    pub fn from_env_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "real" => DriverMode::Real,
             _ => DriverMode::Fake,

@@ -19,7 +19,7 @@ mod oidc;
 mod protection;
 mod rbd;
 mod rook;
-mod util;
+pub(crate) mod util;
 mod volumes;
 mod zfs;
 

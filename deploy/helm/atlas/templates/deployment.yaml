@@ -244,6 +244,28 @@ spec:
             - name: ATLAS_NFS_DRIVER_MODE
               value: {{ .Values.nfs.driverMode | default "fake" | quote }}
             {{- end }}
+            {{- if .Values.native.enabled }}
+            - name: ATLAS_NATIVE_ENABLE
+              value: "1"
+            - name: ATLAS_NATIVE_DRIVER_MODE
+              value: {{ .Values.native.driverMode | default "fake" | quote }}
+            - name: ATLAS_NATIVE_ENDPOINTS
+              value: {{ .Values.native.endpoints | quote }}
+            {{- if .Values.native.tokenSecret }}
+            - name: ATLAS_NATIVE_TOKEN_FILE
+              value: /etc/atlas-native-token/token
+            {{- end }}
+            {{- if .Values.native.tlsSecret }}
+            - name: ATLAS_NATIVE_CA_CERT
+              value: /etc/atlas-native-tls/ca.crt
+            {{- if .Values.native.clientCert }}
+            - name: ATLAS_NATIVE_CLIENT_CERT
+              value: /etc/atlas-native-tls/tls.crt
+            - name: ATLAS_NATIVE_CLIENT_KEY
+              value: /etc/atlas-native-tls/tls.key
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if or .Values.zfs.enabled .Values.disks.enabled }}
             - name: ATLAS_ZFS_ENABLE
               value: "1"
@@ -337,6 +359,16 @@ spec:
               mountPath: /etc/atlas-s3-ca
               readOnly: true
             {{- end }}
+            {{- if and .Values.native.enabled .Values.native.tokenSecret }}
+            - name: native-token
+              mountPath: /etc/atlas-native-token
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.native.enabled .Values.native.tlsSecret }}
+            - name: native-tls
+              mountPath: /etc/atlas-native-tls
+              readOnly: true
+            {{- end }}
             {{- if .Values.disks.enabled }}
             - name: host-dev
               mountPath: /dev
@@ -367,6 +399,16 @@ spec:
         - name: s3-ca
           secret:
             secretName: {{ .Values.s3.caSecretName }}
+        {{- end }}
+        {{- if and .Values.native.enabled .Values.native.tokenSecret }}
+        - name: native-token
+          secret:
+            secretName: {{ .Values.native.tokenSecret }}
+        {{- end }}
+        {{- if and .Values.native.enabled .Values.native.tlsSecret }}
+        - name: native-tls
+          secret:
+            secretName: {{ .Values.native.tlsSecret }}
         {{- end }}
         {{- if .Values.disks.enabled }}
         - name: host-dev

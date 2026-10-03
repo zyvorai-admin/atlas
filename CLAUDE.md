@@ -114,7 +114,7 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
 - `crates/atlas-io` — optional node sensor (bin `atlas-io-agent`): fake/live bio source, device-map
   attribution, histograms, workload accounting, RCA, fail-open leases; own HTTP API + `/metrics`,
   not embedded in `atlas-gateway` (see `docs/IO_EBPF.md`).
-- `crates/atlas-native` — native data plane (library only, not yet wired into the gateway): replicated
+- `crates/atlas-native` — native data plane (served to the gateway by `atlas-driver-native`): replicated
   extent engine, metadata WAL + checkpoint/compaction, refcounted extents with free-list space reuse,
   and a Raft core for the metadata log (pre-vote, check-quorum, joint-consensus membership changes via
   `POST /v1/members`) with a std-only TCP server
@@ -127,6 +127,9 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   `scripts/deploy-native-remote.sh <host> [user]`; Helm chart `deploy/helm/atlas-native` (mTLS +
   HTTPS client-cert auth verified live by `deploy/native/helm-live-check.sh`). See `docs/NATIVE_STORAGE.md`, `docs/NATIVE_METADATA.md`,
   `docs/NATIVE_NODE.md`.
+- `crates/atlas-driver-native` — `StorageDriver` over the `atlas-native-node` HTTP API (backend
+  `bkd_native`, `ATLAS_NATIVE_*`); the one driver whose write methods the gateway calls
+  (synchronous volume/snapshot create/delete). Tested against in-process native nodes.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
   DB-backed rate-limit counters (`rate_limit.rs`).

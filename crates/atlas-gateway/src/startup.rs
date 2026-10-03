@@ -26,9 +26,111 @@ pub const NFS_BACKEND_ID: &str = "bkd_nfs_lab";
 /// Optional third ZFS backend id (enabled via `ATLAS_ZFS_ENABLE`).
 pub const ZFS_BACKEND_ID: &str = "bkd_zfs_lab";
 pub const LONGHORN_BACKEND_ID: &str = "bkd_longhorn";
+/// atlas-native cluster backend id (enabled via `ATLAS_NATIVE_ENABLE`).
+pub const NATIVE_BACKEND_ID: &str = "bkd_native";
 /// Retired RustFS backend id. Kept so persisted inventory / jobs still parse.
 /// New buckets default to [`CEPH_BACKEND_ID`] (RGW).
 pub const RUSTFS_BACKEND_ID: &str = "bkd_rustfs_lab";
+
+/// Builds the atlas-native driver when `ATLAS_NATIVE_ENABLE=1`:
+/// `ATLAS_NATIVE_DRIVER_MODE` (`fake` default, `real`), `ATLAS_NATIVE_ENDPOINTS` (comma-separated
+/// node API base URLs), `ATLAS_NATIVE_TOKEN_FILE`, `ATLAS_NATIVE_CA_CERT`,
+/// `ATLAS_NATIVE_CLIENT_CERT` + `ATLAS_NATIVE_CLIENT_KEY`, `ATLAS_NATIVE_TIMEOUT_SECS` (10).
+pub fn native_driver_from_env() -> Result<Option<Arc<dyn StorageDriver>>> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    if !var("ATLAS_NATIVE_ENABLE").is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes")) {
+        return Ok(None);
+    }
+    let mode = var("ATLAS_NATIVE_DRIVER_MODE").unwrap_or_default();
+    if atlas_common::config::DriverMode::from_env_str(&mode)
+        == atlas_common::config::DriverMode::Fake
+    {
+        return Ok(Some(Arc::new(atlas_driver_native::FakeNativeDriver::new(
+            NATIVE_BACKEND_ID,
+        ))));
+    }
+    let read = |k: &str| -> Result<Option<Vec<u8>>> {
+        var(k)
+            .map(|p| std::fs::read(&p).with_context(|| format!("{k}={p}")))
+            .transpose()
+    };
+    let token =
+        read("ATLAS_NATIVE_TOKEN_FILE")?.map(|t| String::from_utf8_lossy(&t).trim().to_string());
+    let identity = match (
+        read("ATLAS_NATIVE_CLIENT_CERT")?,
+        read("ATLAS_NATIVE_CLIENT_KEY")?,
+    ) {
+        (Some(mut cert), Some(key)) => {
+            cert.push(b'\n');
+            cert.extend_from_slice(&key);
+            Some(cert)
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("set both ATLAS_NATIVE_CLIENT_CERT and ATLAS_NATIVE_CLIENT_KEY"),
+    };
+    let api = atlas_driver_native::HttpApi::new(atlas_driver_native::HttpApiConfig {
+        endpoints: var("ATLAS_NATIVE_ENDPOINTS")
+            .context("ATLAS_NATIVE_ENDPOINTS is required in real mode")?
+            .split(',')
+            .map(str::to_string)
+            .collect(),
+        token,
+        ca_pem: read("ATLAS_NATIVE_CA_CERT")?,
+        identity_pem: identity,
+        timeout: std::time::Duration::from_secs(
+            var("ATLAS_NATIVE_TIMEOUT_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+        ),
+    })
+    .map_err(|e| anyhow::anyhow!("atlas-native driver: {e}"))?;
+    Ok(Some(Arc::new(atlas_driver_native::RealNativeDriver::new(
+        NATIVE_BACKEND_ID,
+        api,
+    ))))
+}
+
+/// Records the atlas-native backend row and registers its driver.
+pub async fn attach_native_driver(
+    pool: &sqlx::AnyPool,
+    registry: &DriverRegistry,
+    driver: Arc<dyn StorageDriver>,
+) -> Result<()> {
+    atlas_inventory::upsert_backend(
+        pool,
+        &StorageBackend {
+            id: driver.backend_id().into(),
+            name: "atlas-native".into(),
+            backend_type: BackendType::Native,
+            mode: BackendMode::External,
+            status: "active".into(),
+            capabilities: crate::routes::util::ceph_default_caps(BackendType::Native),
+            connection_ref: None,
+            cordoned: false,
+        },
+    )
+    .await?;
+    registry.register(driver);
+    Ok(())
+}
+
+/// Periodic discovery for a driver the Ceph monitor does not cover.
+fn spawn_rediscovery(pool: sqlx::AnyPool, driver: Arc<dyn StorageDriver>, interval_secs: u64) {
+    if interval_secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = atlas_discovery::run_discovery(&pool, driver.clone(), None, None).await
+            {
+                tracing::warn!(backend = driver.backend_id(), "rediscovery failed: {e:#}");
+            }
+        }
+    });
+}
 
 pub struct BuildOptions {
     /// Attempt to attach a live Kubernetes driver (disable in unit/integration tests).
@@ -273,28 +375,46 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
     // Use the same in-cluster/kubeconfig identity as the Kubernetes PVC driver. Only register
     // a live Longhorn driver when requested and when Kubernetes is reachable; never fake data.
     let longhorn_driver: Option<Arc<dyn StorageDriver>> = if std::env::var("ATLAS_LONGHORN_ENABLE")
-        .ok().is_some_and(|v| v == "1")
+        .ok()
+        .is_some_and(|v| v == "1")
     {
-        let namespace = std::env::var("ATLAS_LONGHORN_NAMESPACE")
-            .unwrap_or_else(|_| "longhorn-system".into());
+        let namespace =
+            std::env::var("ATLAS_LONGHORN_NAMESPACE").unwrap_or_else(|_| "longhorn-system".into());
         if !opts.enable_k8s || k8s.is_none() {
             anyhow::bail!("ATLAS_LONGHORN_ENABLE=1 requires a working Kubernetes client");
         }
-        let client = kube::Client::try_default().await
+        let client = kube::Client::try_default()
+            .await
             .context("Longhorn Kubernetes client initialization failed")?;
-        let longhorn: Arc<dyn StorageDriver> = Arc::new(LonghornDriver::new(
-            LONGHORN_BACKEND_ID, namespace, client,
-        ));
-        atlas_inventory::upsert_backend(&pool, &StorageBackend {
-            id: LONGHORN_BACKEND_ID.into(), name: "longhorn".into(),
-            backend_type: BackendType::Longhorn, mode: BackendMode::External,
-            status: "active".into(),
-            capabilities: Capabilities { block: true, ..Capabilities::default() },
-            connection_ref: None, cordoned: false,
-        }).await?;
+        let longhorn: Arc<dyn StorageDriver> =
+            Arc::new(LonghornDriver::new(LONGHORN_BACKEND_ID, namespace, client));
+        atlas_inventory::upsert_backend(
+            &pool,
+            &StorageBackend {
+                id: LONGHORN_BACKEND_ID.into(),
+                name: "longhorn".into(),
+                backend_type: BackendType::Longhorn,
+                mode: BackendMode::External,
+                status: "active".into(),
+                capabilities: Capabilities {
+                    block: true,
+                    ..Capabilities::default()
+                },
+                connection_ref: None,
+                cordoned: false,
+            },
+        )
+        .await?;
         registry.register(longhorn.clone());
         Some(longhorn)
-    } else { None };
+    } else {
+        None
+    };
+
+    let native_driver = native_driver_from_env()?;
+    if let Some(native) = &native_driver {
+        attach_native_driver(&pool, &registry, native.clone()).await?;
+    }
 
     // Start the async job engine (write path) over the same pool + k8s driver.
     // Durable DB poller (ATLAS_JOB_POLL_SECS) keeps queued work alive across channel loss;
@@ -363,6 +483,12 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
                 Err(e) => tracing::warn!("initial longhorn discovery failed: {e:#}"),
             }
         }
+        if let Some(native) = &native_driver {
+            match atlas_discovery::run_discovery(&state.pool, native.clone(), None, None).await {
+                Ok(sum) => tracing::info!(?sum, "initial atlas-native discovery complete"),
+                Err(e) => tracing::warn!("initial atlas-native discovery failed: {e:#}"),
+            }
+        }
     }
 
     // Start the monitor/alerts worker (periodic discovery + alert-rule evaluation).
@@ -389,6 +515,13 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
         );
+        if let Some(native) = native_driver.clone() {
+            spawn_rediscovery(
+                state.pool.clone(),
+                native,
+                state.config.monitor_interval_secs,
+            );
+        }
         // Protection-schedule worker: periodic snapshots + retention (shares the job engine).
         atlas_jobs::spawn_scheduler(
             state.pool.clone(),
@@ -630,10 +763,13 @@ async fn backup_state_once(
     } else {
         // VACUUM INTO writes a transactionally-consistent copy while the DB stays in use.
         // `snap` is a temp path this function itself built from a numeric timestamp — never user input.
-        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{}'", snap.display())))
-            .execute(pool)
-            .await
-            .context("VACUUM INTO snapshot")?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "VACUUM INTO '{}'",
+            snap.display()
+        )))
+        .execute(pool)
+        .await
+        .context("VACUUM INTO snapshot")?;
     }
     // Ensure the destination bucket exists so the first backup does not fail on a missing name.
     if !s3.bucket_exists().await {
