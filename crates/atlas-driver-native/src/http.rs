@@ -240,8 +240,18 @@ fn path_id(id: &str) -> Result<&str, DriverError> {
 
 #[async_trait]
 impl NativeApi for HttpApi {
+    /// Waits up to [`ELECTION_WAIT`] for a metadata leader, so an election in progress isn't
+    /// reported as a leaderless (critical) cluster.
     async fn status(&self) -> Result<NodeStatus, DriverError> {
-        self.get("/v1/status").await
+        let deadline = Instant::now() + ELECTION_WAIT;
+        loop {
+            let s: NodeStatus = self.get("/v1/status").await?;
+            let electing = s.metadata.as_ref().is_some_and(|m| m.leader.is_none());
+            if !electing || Instant::now() >= deadline {
+                return Ok(s);
+            }
+            tokio::time::sleep(ELECTION_RETRY).await;
+        }
     }
 
     async fn volumes(&self) -> Result<Vec<NativeVolume>, DriverError> {

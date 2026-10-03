@@ -171,7 +171,7 @@ async fn real_driver_manages_volumes_on_a_live_cluster() {
         ids.push(d.create_volume(create(&format!("vol{i}"))).await.unwrap());
     }
     let disc = d.discover().await.unwrap();
-    assert_eq!(disc.health.status, Health::Ok);
+    assert_eq!(disc.health.status, Health::Ok, "{}", disc.health.summary);
     assert_eq!(disc.pools[0].name, POOL_NAME);
     assert_eq!(disc.pools[0].replica_size, Some(3));
     assert_eq!(disc.volumes.len(), 4);
