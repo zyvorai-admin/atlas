@@ -565,52 +565,8 @@ pub async fn start_cdc(
     .await
     .map_err(|e| anyhow!("apply Debezium source connector: {e}"))?;
 
-    // 3. Sink connector -> edge DB. Relational engines use the Aiven JDBC sink (targeting the edge
-    // engine — Postgres for heterogeneous sources — with auto.create for heterogeneous); MongoDB uses
-    // the MongoDB Kafka sink into the edge PSMDB replica set.
-    let edge_db = if kind.homogeneous() { db } else { "appdb" };
-    let pk_fields =
-        std::env::var("ATLAS_DATABRIDGE_SINK_PK_FIELDS").unwrap_or_else(|_| "id".into());
-    let sink_spec = match kind.edge_operator() {
-        crate::connector::EdgeOperator::Cnpg => {
-            let url = format!("jdbc:postgresql://{cr_name}-rw.{ns}.svc:5432/{edge_db}");
-            streaming::jdbc_sink_spec(
-                &s,
-                &url,
-                ns,
-                edge_secret,
-                "app",
-                "password",
-                &pk_fields,
-                !kind.homogeneous(),
-            )
-        }
-        crate::connector::EdgeOperator::Percona => {
-            let url = format!("jdbc:mysql://{cr_name}-haproxy.{ns}.svc:3306/{edge_db}");
-            streaming::jdbc_sink_spec(
-                &s,
-                &url,
-                ns,
-                edge_secret,
-                "root",
-                "root",
-                &pk_fields,
-                !kind.homogeneous(),
-            )
-        }
-        crate::connector::EdgeOperator::Psmdb => {
-            let edge_host = format!("{cr_name}-rs0.{ns}.svc:27017");
-            streaming::mongo_sink_spec(
-                &s,
-                &edge_host,
-                edge_db,
-                ns,
-                edge_secret,
-                "MONGODB_DATABASE_ADMIN_USER",
-                "MONGODB_DATABASE_ADMIN_PASSWORD",
-            )
-        }
-    };
+    // 3. Sink connector -> edge DB.
+    let sink_spec = sink_spec_for(kind, &s, cr_name, ns, edge_secret, db);
     k8s.apply_cr_labeled(
         streaming::GROUP,
         streaming::VERSION,
@@ -786,40 +742,7 @@ pub async fn restart_cdc(
     .await
     .map_err(|e| anyhow!("re-apply Debezium source connector: {e}"))?;
 
-    let edge_db = if kind.homogeneous() { db } else { "appdb" };
-    let pk_fields =
-        std::env::var("ATLAS_DATABRIDGE_SINK_PK_FIELDS").unwrap_or_else(|_| "id".into());
-    let sink_spec = match kind.edge_operator() {
-        crate::connector::EdgeOperator::Cnpg => streaming::jdbc_sink_spec(
-            &s,
-            &format!("jdbc:postgresql://{cr_name}-rw.{ns}.svc:5432/{edge_db}"),
-            ns,
-            edge_secret,
-            "app",
-            "password",
-            &pk_fields,
-            !kind.homogeneous(),
-        ),
-        crate::connector::EdgeOperator::Percona => streaming::jdbc_sink_spec(
-            &s,
-            &format!("jdbc:mysql://{cr_name}-haproxy.{ns}.svc:3306/{edge_db}"),
-            ns,
-            edge_secret,
-            "root",
-            "root",
-            &pk_fields,
-            !kind.homogeneous(),
-        ),
-        crate::connector::EdgeOperator::Psmdb => streaming::mongo_sink_spec(
-            &s,
-            &format!("{cr_name}-rs0.{ns}.svc:27017"),
-            edge_db,
-            ns,
-            edge_secret,
-            "MONGODB_DATABASE_ADMIN_USER",
-            "MONGODB_DATABASE_ADMIN_PASSWORD",
-        ),
-    };
+    let sink_spec = sink_spec_for(kind, &s, cr_name, ns, edge_secret, db);
     k8s.apply_cr_labeled(
         streaming::GROUP,
         streaming::VERSION,
@@ -1088,4 +1011,52 @@ pub async fn rollback(pool: &AnyPool, plan_id: &str) -> Result<serde_json::Value
     }
     atlas_inventory::databridge::plans::set_state(pool, plan_id, "rolled_back").await?;
     Ok(serde_json::json!({ "plan_id": plan.id, "state": "rolled_back" }))
+}
+
+/// The sink connector applying the CDC topics to the edge. Postgres edges use the Aiven JDBC sink
+/// (with auto.create for heterogeneous sources); MySQL-family edges use the Debezium JDBC sink
+/// (TIMESTAMP columns arrive as Debezium ZonedTimestamp, which only it binds); MongoDB uses the
+/// MongoDB Kafka sink into the edge PSMDB replica set.
+fn sink_spec_for(
+    kind: crate::SourceKind,
+    short: &str,
+    cr_name: &str,
+    ns: &str,
+    edge_secret: &str,
+    db: &str,
+) -> serde_json::Value {
+    let edge_db = if kind.homogeneous() { db } else { "appdb" };
+    match kind.edge_operator() {
+        crate::connector::EdgeOperator::Cnpg => {
+            let pk_fields =
+                std::env::var("ATLAS_DATABRIDGE_SINK_PK_FIELDS").unwrap_or_else(|_| "id".into());
+            crate::cr::streaming::jdbc_sink_spec(
+                short,
+                &format!("jdbc:postgresql://{cr_name}-rw.{ns}.svc:5432/{edge_db}"),
+                ns,
+                edge_secret,
+                "app",
+                "password",
+                &pk_fields,
+                !kind.homogeneous(),
+            )
+        }
+        crate::connector::EdgeOperator::Percona => crate::cr::streaming::debezium_jdbc_sink_spec(
+            short,
+            &format!("jdbc:mysql://{cr_name}-haproxy.{ns}.svc:3306/{edge_db}"),
+            ns,
+            edge_secret,
+            "root",
+            "root",
+        ),
+        crate::connector::EdgeOperator::Psmdb => crate::cr::streaming::mongo_sink_spec(
+            short,
+            &format!("{cr_name}-rs0.{ns}.svc:27017"),
+            edge_db,
+            ns,
+            edge_secret,
+            "MONGODB_DATABASE_ADMIN_USER",
+            "MONGODB_DATABASE_ADMIN_PASSWORD",
+        ),
+    }
 }

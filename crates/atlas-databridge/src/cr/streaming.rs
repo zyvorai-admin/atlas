@@ -293,6 +293,47 @@ pub fn jdbc_sink_spec(
     json!({ "class": "io.aiven.connect.jdbc.JdbcSinkConnector", "tasksMax": 1, "config": config })
 }
 
+/// Debezium JDBC sink config for **MySQL-family edges** (Percona XtraDB). Unlike the Aiven sink it
+/// consumes the Debezium envelope as-is, so Debezium's own logical types bind correctly — notably
+/// `io.debezium.time.ZonedTimestamp`, which Debezium always uses for MySQL/MariaDB `TIMESTAMP`
+/// columns regardless of `time.precision.mode` and which the Aiven sink rejects
+/// (`Incorrect datetime value`). Primary keys come from the record key (every key column, so
+/// composite keys work without `pk.fields`), deletes are applied, and the edge tables (pre-created
+/// by the homogeneous full-load) gain new columns via `schema.evolution=basic`.
+pub fn debezium_jdbc_sink_spec(
+    short: &str,
+    jdbc_url: &str,
+    secret_ns: &str,
+    edge_secret: &str,
+    edge_user: &str,
+    edge_pass_key: &str,
+) -> Value {
+    let prefix = topic_prefix(short);
+    let config = json!({
+        "connector.class": DEBEZIUM_JDBC_SINK,
+        "tasks.max": 1,
+        "topics.regex": format!("{prefix}[.][^.]+[.].*"),
+        "connection.url": jdbc_url,
+        "connection.username": edge_user,
+        "connection.password": format!("${{secrets:{secret_ns}/{edge_secret}:{edge_pass_key}}}"),
+        "insert.mode": "upsert",
+        "primary.key.mode": "record_key",
+        "delete.enabled": true,
+        "schema.evolution": "basic",
+        "consumer.override.auto.offset.reset": "earliest",
+        "consumer.override.metadata.max.age.ms": "10000",
+        // `<prefix>.<db>.<table>` -> `<table>`; the sink then writes to the topic-named table.
+        "collection.name.format": "${topic}",
+        "transforms": "route",
+        "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+        "transforms.route.regex": format!("{prefix}[.][^.]+[.](.*)"),
+        "transforms.route.replacement": "$1"
+    });
+    json!({ "class": DEBEZIUM_JDBC_SINK, "tasksMax": 1, "config": config })
+}
+
+const DEBEZIUM_JDBC_SINK: &str = "io.debezium.connector.jdbc.JdbcSinkConnector";
+
 /// Whether a Strimzi `KafkaConnector` reports its connector `state == RUNNING`.
 pub fn connector_running(status: &Value) -> bool {
     status
@@ -448,6 +489,30 @@ mod tests {
             true,
         );
         assert_eq!(s["config"]["auto.create"], true);
+    }
+
+    #[test]
+    fn mysql_edge_sink_takes_the_debezium_envelope() {
+        let s = debezium_jdbc_sink_spec(
+            "abc123",
+            "jdbc:mysql://edge-haproxy:3306/shop",
+            "ns",
+            "edge-secrets",
+            "root",
+            "root",
+        );
+        let c = &s["config"];
+        assert_eq!(s["class"], "io.debezium.connector.jdbc.JdbcSinkConnector");
+        assert_eq!(c["connection.username"], "root");
+        assert_eq!(c["connection.password"], "${secrets:ns/edge-secrets:root}");
+        assert_eq!(c["primary.key.mode"], "record_key");
+        assert_eq!(c["delete.enabled"], true);
+        assert_eq!(c["topics.regex"], "dbabc123[.][^.]+[.].*");
+        assert_eq!(
+            c["transforms"], "route",
+            "no unwrap: the sink reads the envelope"
+        );
+        assert!(c.get("pk.fields").is_none());
     }
 
     #[test]

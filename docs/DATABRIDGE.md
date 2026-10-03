@@ -377,6 +377,16 @@ stream reports caught-up (0).
     either a Kafka Connect SMT that converts `io.debezium.time.ZonedTimestamp` fields to a
     JDBC-bindable type before the sink writes them, or documented customer guidance to avoid
     `TIMESTAMP` columns (prefer `DATETIME`) on tables enrolled in CDC until that SMT exists.
+    **Fixed (2026-10-03):** MySQL-family edges now use the **Debezium JDBC sink**
+    (`io.debezium.connector.jdbc.JdbcSinkConnector`, bundled in the Connect image), which reads
+    the Debezium envelope and binds `ZonedTimestamp` natively; it also takes every record-key
+    column as the primary key (composite keys work without `pk.fields`) and applies deletes.
+    Verified on `212.8.248.187` with the exact connector configs DataBridge generates (Debezium
+    source + Debezium JDBC sink in the `deploy/databridge/connect` image, KRaft Kafka, MySQL 8.4
+    edge, all in podman): for both a **MySQL 8.4** and a **MariaDB 11.4** source, `TIMESTAMP`
+    columns (`DEFAULT CURRENT_TIMESTAMP` and explicit values), `DATETIME`, an update, a delete
+    and a composite-key table all landed on the edge identical to the source. Postgres edges keep
+    the Aiven sink.
 
   With the column altered to `DATETIME` and the poisoned offset advanced, a fresh row
   (`'Jack CDC Datetime Fixed'`) was confirmed **physically present on the edge PXC**, proving
@@ -390,7 +400,7 @@ stream reports caught-up (0).
 | Engine | Discover | Full-load | Validate | CDC | Cutover |
 |---|---|---|---|---|---|
 | Postgres | **live** | **live** | **live** | **live** | **live** |
-| MySQL | **live** | **live** | **live** | **live** (DATETIME columns only — TIMESTAMP columns unsupported, see note) | pending |
+| MySQL | **live** | **live** | **live** | **live** (incl. TIMESTAMP columns via the Debezium JDBC sink, see note) | pending |
 | MariaDB | **live** | **live** | **live** | **live** | **live** |
 | MongoDB | **live** | **live** | **live** | **live** | **live** |
 | SQL Server | **live** | via Debezium `initial` | advisory | pending | pending |
@@ -403,13 +413,14 @@ Fake path covers **all six** engines discover→cutover in CI (`tests/databridge
   `ATLAS_DATABRIDGE_CONNECT_IMAGE=localhost/databridge-connect:dev`. Fake MySQL plan walked
   assess→provision→full-load→**cdc_streaming**. Real MariaDB/Mongo CDC+cutover later verified on
   `212.8.248.187` (2026-09-01).
-- **Follow-ups (verify on live infra)**: **MySQL cutover** (CDC already live for DATETIME;
-  TIMESTAMP columns need an SMT or schema guidance). Postgres, MariaDB, and MongoDB are verified
+- **Follow-ups (verify on live infra)**: **MySQL cutover** through the in-cluster pipeline (CDC,
+  including TIMESTAMP columns, is verified; the lab host currently has no Ceph/Percona/Strimzi
+  stack to run the full gateway pipeline). Postgres, MariaDB, and MongoDB are verified
   through live cutover.
 - **CDC Connect image — multi-engine** (`deploy/databridge/connect/Dockerfile`): one Strimzi-based
   image bundles Debezium PostgreSQL + MySQL + **MariaDB** + MongoDB + Oracle + SQL Server source
-  connectors, the Aiven JDBC sink (Postgres/MySQL/SQL Server/Oracle drivers), and the MongoDB Kafka
-  sink. `start_cdc` in real mode **refuses** without `ATLAS_DATABRIDGE_CONNECT_IMAGE` set. Lab Kafka
+  connectors, the Aiven JDBC sink (Postgres/MySQL/SQL Server/Oracle drivers; used for Postgres
+  edges), the Debezium JDBC sink (MySQL/MariaDB edges), and the MongoDB Kafka sink. `start_cdc` in real mode **refuses** without `ATLAS_DATABRIDGE_CONNECT_IMAGE` set. Lab Kafka
   CR: `deploy/databridge/10-kafka.yaml` (applied by `up.sh`). `up.sh` also installs the Percona
   Server for MongoDB operator for document-edge targets.
 

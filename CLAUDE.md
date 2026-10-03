@@ -62,7 +62,7 @@ Implemented:
   real db + table/collection names, PKs, counts). The gateway image now bundles the OCI Instant Client
   and builds the `oracle` feature. **Deeper stages: Postgres, MariaDB, and MongoDB are verified through
   real CDC + cutover** on the Rook Ceph lab (Kafka/Debezium + Connect image); MySQL is verified through
-  CDC for DATETIME columns (cutover still pending). Oracle / SQL Server remain discover-live (heterogeneous
+  CDC incl. TIMESTAMP columns (Debezium JDBC sink on MySQL-family edges; cutover still pending). Oracle / SQL Server remain discover-live (heterogeneous
   CDC path not yet run end-to-end on the shared lab). The Ceph gateway image (`Dockerfile.ceph`) now
   builds with `mongodb`/`sqlserver`/`oracle`/`kafka-lag` features to match the fake/k8s image.
   See `docs/DATABRIDGE.md` + `deploy/databridge/`.
