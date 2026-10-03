@@ -151,6 +151,17 @@ pub enum Message {
 }
 
 impl Message {
+    /// Whether this answers a request (votes, appends, snapshots) rather than asking.
+    pub fn is_response(&self) -> bool {
+        matches!(
+            self,
+            Message::PreVoteResponse { .. }
+                | Message::RequestVoteResponse { .. }
+                | Message::AppendEntriesResponse { .. }
+                | Message::InstallSnapshotResponse { .. }
+        )
+    }
+
     pub fn term(&self) -> u64 {
         match self {
             Message::PreVote { term, .. }

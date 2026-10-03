@@ -3,8 +3,13 @@
 
 use std::{
     collections::BTreeMap,
+    io::Read,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -153,6 +158,18 @@ fn tcp_cluster_elects_and_replicates() {
     c.propose_on_leader(create("a"));
     c.propose_on_leader(create("b"));
     c.wait_converged(&["a", "b"]);
+
+    // Healthy peers answer, so no connection is ever replaced as stale.
+    thread::sleep(Duration::from_secs(3));
+    for (id, s) in c.live() {
+        let m = s.render_metrics().unwrap();
+        for line in m
+            .lines()
+            .filter(|l| l.starts_with("atlas_native_transport_stale_reconnects_total{"))
+        {
+            assert!(line.ends_with(" 0"), "{id}: {line}");
+        }
+    }
 }
 
 #[test]
@@ -190,6 +207,73 @@ fn tcp_leader_failover_and_rejoin() {
 
     c.restart(&old);
     c.wait_converged(&["a", "b"]);
+}
+
+/// Accepts connections on `addr` and drains them without ever answering or closing: a peer that
+/// vanished without resetting its sockets (deleted pod, powered-off host), from the sender's side.
+/// Stops listening when `stop` is set; already-accepted sockets stay open until their peer
+/// closes them.
+fn zombie(addr: SocketAddr, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let l = loop {
+        match TcpListener::bind(addr) {
+            Ok(l) => break l,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("bind zombie on {addr}: {e}"),
+        }
+    };
+    l.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match l.accept() {
+                Ok((mut s, _)) => {
+                    s.set_nonblocking(false).unwrap();
+                    thread::spawn(move || {
+                        let mut sink = [0u8; 8192];
+                        while matches!(s.read(&mut sink), Ok(n) if n > 0) {}
+                    });
+                }
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    })
+}
+
+#[test]
+fn tcp_sender_replaces_a_connection_to_a_silent_peer() {
+    let mut c = TcpCluster::new(3);
+    c.propose_on_leader(create("a"));
+    c.wait_converged(&["a"]);
+    let l = c.wait_leader();
+    let gone = c
+        .live()
+        .map(|(id, _)| id.clone())
+        .find(|id| *id != l)
+        .unwrap();
+
+    // The follower disappears and something that never answers takes its address; the others
+    // reconnect to it and keep writing successfully.
+    c.stop(&gone);
+    let stop = Arc::new(AtomicBool::new(false));
+    let z = zombie(c.addrs[&gone], stop.clone());
+    c.propose_on_leader(create("b"));
+    thread::sleep(Duration::from_millis(300));
+
+    // The real node comes back on the same address: it only catches up if the others notice
+    // their connections lead nowhere.
+    stop.store(true, Ordering::SeqCst);
+    z.join().unwrap();
+    c.restart(&gone);
+    c.wait_converged(&["a", "b"]);
+
+    let l = c.wait_leader();
+    let m = c.servers[&l].as_ref().unwrap().render_metrics().unwrap();
+    let stale: u64 = m
+        .lines()
+        .filter(|line| line.starts_with("atlas_native_transport_stale_reconnects_total{"))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum();
+    assert!(stale > 0, "no stale reconnects recorded:\n{m}");
 }
 
 #[test]
