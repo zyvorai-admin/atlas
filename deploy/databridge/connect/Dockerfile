@@ -1,11 +1,12 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
 # SPDX-License-Identifier: Apache-2.0
 # Kafka Connect image for DataBridge CDC: Strimzi Kafka base + Debezium source connectors
-# (PostgreSQL, MySQL/MariaDB, MongoDB, Oracle, SQL Server) + the Aiven JDBC sink connector
-# (Postgres + MySQL + SQL Server + Oracle JDBC drivers) + the Debezium JDBC sink (MySQL/MariaDB
-# edges: it understands Debezium's own temporal types such as ZonedTimestamp for TIMESTAMP
-# columns, which the Aiven sink cannot bind) + the MongoDB Kafka sink. One image serves
-# every DataBridge engine. Point the gateway at it with ATLAS_DATABRIDGE_CONNECT_IMAGE so
+# (PostgreSQL, MySQL/MariaDB, MongoDB, Oracle, SQL Server) + the Debezium JDBC sink (every
+# relational edge: it understands Debezium's own temporal types such as ZonedTimestamp for MySQL
+# TIMESTAMP columns, and ships the Postgres/MySQL/MariaDB/SQL Server/Oracle drivers) + the
+# MongoDB Kafka sink. The Aiven JDBC sink stays for sink connectors created by DataBridge
+# releases before the Debezium sink; a re-apply moves them over. One image serves every
+# DataBridge engine. Point the gateway at it with ATLAS_DATABRIDGE_CONNECT_IMAGE so
 # start_cdc's KafkaConnect can instantiate the connectors.
 #
 # Build + import into k3s (on a cluster node):
@@ -17,10 +18,13 @@
 # every MySQL/MariaDB/Oracle/SQL Server source connector (any engine using schema history) fails at
 # task startup with `NoSuchMethodError: KafkaConsumer.poll(long)`. 3.3.0.Final is the first line on
 # this base image's Kafka 4.3 that's actually built/tested against Kafka Connect 4.x.
+# Oracle 26ai needs 3.7+: older Oracle connectors look the version up with
+# `BANNER_FULL LIKE 'Oracle Database%'`, which the "Oracle AI Database 26ai" banner never matches,
+# so validation fails with "Failed to resolve Oracle database version".
 FROM quay.io/strimzi/kafka:latest-kafka-4.3.1@sha256:8281821f074163ffef9344c4326f3ef587f433f6f28300726aa1e6f354510d40
 USER root
 
-ARG DEBEZIUM_VERSION=3.3.0.Final
+ARG DEBEZIUM_VERSION=3.7.0.Final
 ARG AIVEN_JDBC_VERSION=6.10.0
 ARG PG_JDBC_VERSION=42.7.3
 ARG MYSQL_JDBC_VERSION=8.4.0
@@ -48,7 +52,7 @@ RUN curl -fsSL "https://repo1.maven.org/maven2/io/debezium/debezium-connector-or
 RUN curl -fsSL "https://repo1.maven.org/maven2/io/debezium/debezium-connector-sqlserver/${DEBEZIUM_VERSION}/debezium-connector-sqlserver-${DEBEZIUM_VERSION}-plugin.tar.gz" \
     | tar -xz -C /opt/kafka/plugins/debezium-sqlserver --strip-components=1
 
-# Aiven JDBC sink connector + Postgres, MySQL, SQL Server, Oracle JDBC drivers.
+# Aiven JDBC sink connector (legacy sink connectors only, see above) + its JDBC drivers.
 RUN curl -fsSL -o /tmp/jdbc.tar "https://github.com/Aiven-Open/jdbc-connector-for-apache-kafka/releases/download/v${AIVEN_JDBC_VERSION}/jdbc-connector-for-apache-kafka-${AIVEN_JDBC_VERSION}.tar" \
     && tar -xf /tmp/jdbc.tar -C /opt/kafka/plugins/jdbc-sink --strip-components=1 \
     && rm -f /tmp/jdbc.tar \
@@ -57,12 +61,11 @@ RUN curl -fsSL -o /tmp/jdbc.tar "https://github.com/Aiven-Open/jdbc-connector-fo
     && curl -fsSL -o /opt/kafka/plugins/jdbc-sink/mssql-jdbc.jar "https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/${MSSQL_JDBC_VERSION}/mssql-jdbc-${MSSQL_JDBC_VERSION}.jar" \
     && curl -fsSL -o /opt/kafka/plugins/jdbc-sink/ojdbc11.jar "https://repo1.maven.org/maven2/com/oracle/database/jdbc/ojdbc11/${ORACLE_JDBC_VERSION}/ojdbc11-${ORACLE_JDBC_VERSION}.jar"
 
-# Debezium JDBC sink (io.debezium.connector.jdbc.JdbcSinkConnector) + the MySQL driver, which the
-# plugin archive does not ship.
+# Debezium JDBC sink (io.debezium.connector.jdbc.JdbcSinkConnector); the archive bundles its drivers.
 RUN curl -fsSL "https://repo1.maven.org/maven2/io/debezium/debezium-connector-jdbc/${DEBEZIUM_VERSION}/debezium-connector-jdbc-${DEBEZIUM_VERSION}-plugin.tar.gz" \
     | tar -xz -C /opt/kafka/plugins/debezium-jdbc-sink --strip-components=1 \
-    && (ls /opt/kafka/plugins/debezium-jdbc-sink | grep -q '^mysql-connector-j' \
-        || curl -fsSL -o /opt/kafka/plugins/debezium-jdbc-sink/mysql-connector-j.jar "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_JDBC_VERSION}/mysql-connector-j-${MYSQL_JDBC_VERSION}.jar")
+    && ls /opt/kafka/plugins/debezium-jdbc-sink | grep -q '^postgresql-' \
+    && ls /opt/kafka/plugins/debezium-jdbc-sink | grep -q '^mysql-connector-j'
 
 # MongoDB Kafka sink connector (com.mongodb.kafka.connect.MongoSinkConnector), fat "-all" jar.
 RUN curl -fsSL -o /opt/kafka/plugins/mongo-sink/mongo-kafka-connect-all.jar \

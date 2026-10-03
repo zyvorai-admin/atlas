@@ -127,11 +127,12 @@ fn build_oracle(
     user: &str,
     password: &str,
 ) -> anyhow::Result<Box<dyn SourceConnector>> {
+    let (cdb, pdb) = connector::oracle_containers(database);
     Ok(Box::new(connectors::oracle::OracleSourceConnector::new(
         source.id.clone(),
         host,
         port,
-        database,
+        pdb.unwrap_or(cdb),
         user,
         password,
     )))

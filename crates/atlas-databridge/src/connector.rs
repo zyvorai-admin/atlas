@@ -128,6 +128,16 @@ impl SourceKind {
     }
 }
 
+/// Splits an Oracle source `database` into the container database Debezium connects to and the
+/// pluggable database that holds the tables: `CDB/PDB` (e.g. `FREE/FREEPDB1`) for a multitenant
+/// Oracle, a bare service name for a non-CDB one.
+pub fn oracle_containers(database: &str) -> (&str, Option<&str>) {
+    match database.split_once('/') {
+        Some((cdb, pdb)) if !cdb.is_empty() && !pdb.is_empty() => (cdb, Some(pdb)),
+        _ => (database, None),
+    }
+}
+
 /// Which managed-cloud flavor the source is (affects TLS/auth/privilege preflight only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -227,5 +237,15 @@ mod tests {
         assert_eq!(SourceKind::Oracle.default_port(), 1521);
         assert_eq!(SourceKind::Sqlserver.default_port(), 1433);
         assert_eq!(SourceKind::Mongodb.default_port(), 27017);
+    }
+
+    #[test]
+    fn oracle_database_names_cdb_and_pdb() {
+        assert_eq!(
+            oracle_containers("FREE/FREEPDB1"),
+            ("FREE", Some("FREEPDB1"))
+        );
+        assert_eq!(oracle_containers("ORCL"), ("ORCL", None));
+        assert_eq!(oracle_containers("/PDB"), ("/PDB", None));
     }
 }

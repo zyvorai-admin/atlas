@@ -87,9 +87,10 @@ pub fn connect_spec(bootstrap_servers: &str, replicas: i64, image: Option<&str>)
 /// credentials Secret (keys `username`/`password`).
 ///
 /// Snapshot mode is derived from the engine: homogeneous sources (Postgres/MySQL/MariaDB) were
-/// already seeded by the dump→restore full-load, so Debezium streams from `never`. Heterogeneous
-/// sources (Oracle/SQL Server → Postgres) have no dump full-load — Debezium's `initial` snapshot
-/// seeds the edge (the JDBC sink runs with `auto.create`), then it streams changes.
+/// already seeded by the dump→restore full-load, so Debezium captures only the schema (`no_data`;
+/// Debezium 3.7 removed `never`) and streams from there. Heterogeneous sources (Oracle/SQL Server →
+/// Postgres) have no dump full-load — Debezium's `initial` snapshot seeds the edge (the JDBC sink
+/// creates the tables), then it streams changes.
 #[allow(clippy::too_many_arguments)]
 pub fn debezium_source_spec(
     kind: SourceKind,
@@ -111,7 +112,7 @@ pub fn debezium_source_spec(
     let prefix = topic_prefix(short);
     let bootstrap = "zyvor-kafka-kafka-bootstrap:9092";
     let snapshot_mode = if kind.homogeneous() {
-        "never"
+        "no_data"
     } else {
         "initial"
     };
@@ -122,18 +123,19 @@ pub fn debezium_source_spec(
         "database.port": port,
         "database.user": user,
         "database.password": pass,
-        "database.dbname": database,
+        "database.dbname": if kind == SourceKind::Oracle {
+            crate::connector::oracle_containers(database).0
+        } else {
+            database
+        },
         "topic.prefix": prefix,
         // Encode DECIMAL/NUMERIC as a double, not a VariableScaleDecimal STRUCT the JDBC sink can't
         // bind. Snapshot mode depends on the engine (see doc comment).
         "decimal.handling.mode": "double",
         "snapshot.mode": snapshot_mode,
-        // Debezium's default temporal encoding (adaptive_time_microseconds) emits DATE/TIME/TIMESTAMP
-        // columns as ISO-8601 strings (e.g. "2026-08-25T14:59:41Z") in the Kafka message — the Aiven
-        // JDBC sink binds a column's value with the JDBC driver's native setTimestamp/setDate, which
-        // rejects that string format outright (MysqlDataTruncation: "Incorrect datetime value"),
-        // failing every row with a temporal column. `connect` mode instead emits Kafka Connect's
-        // logical Date/Time/Timestamp types, which the JDBC sink binds correctly.
+        // `connect` mode emits DATE/TIME/DATETIME as Kafka Connect's logical Date/Time/Timestamp
+        // types, which every JDBC sink binds as native temporal values. (MySQL `TIMESTAMP` is still
+        // a Debezium ZonedTimestamp string — see jdbc_sink_spec.)
         "time.precision.mode": "connect",
     });
     match kind {
@@ -158,9 +160,12 @@ pub fn debezium_source_spec(
             config["schema.history.internal.kafka.topic"] = json!(format!("dbz-history-{short}"));
         }
         SourceKind::Oracle => {
-            // LogMiner adapter; `database` is treated as the PDB name for a multitenant Oracle.
+            // LogMiner mines the container database's redo; a multitenant source (`CDB/PDB`)
+            // also names the PDB whose tables are captured.
             config["database.connection.adapter"] = json!("logminer");
-            config["database.pdb.name"] = json!(database);
+            if let (_, Some(pdb)) = crate::connector::oracle_containers(database) {
+                config["database.pdb.name"] = json!(pdb);
+            }
             config["schema.history.internal.kafka.bootstrap.servers"] = json!(bootstrap);
             config["schema.history.internal.kafka.topic"] = json!(format!("dbz-history-{short}"));
         }
@@ -172,7 +177,7 @@ pub fn debezium_source_spec(
 
 /// Debezium **MongoDB** source connector config. Mongo takes a single `mongodb.connection.string`
 /// (not host/port/user fields), reading the source's change streams / oplog. `snapshot.mode=no_data`
-/// because `mongodump` seeds the edge in full-load (Mongo Debezium 3.x rejects `never`). Requires
+/// because `mongodump` seeds the edge in full-load. Requires
 /// the source to be a replica set.
 fn mongo_debezium_source_spec(
     short: &str,
@@ -196,8 +201,7 @@ fn mongo_debezium_source_spec(
         "topic.prefix": prefix,
         "database.include.list": database,
         "capture.mode": "change_streams_update_full",
-        // Debezium Mongo 3.x: `never` is not valid — use `no_data` (skip snapshot; full-load already
-        // seeded the edge via mongodump). Relational connectors still accept `never`.
+        // Skip the data snapshot; full-load already seeded the edge via mongodump.
         "snapshot.mode": "no_data",
     });
     json!({ "class": config["connector.class"], "tasksMax": 1, "config": config })
@@ -205,8 +209,8 @@ fn mongo_debezium_source_spec(
 
 /// **MongoDB** sink connector config: the MongoDB Kafka Connect sink applying the Debezium Mongo CDC
 /// topics to the edge Percona Server for MongoDB. `edge_host` is the edge replica-set service; the
-/// user/pass come from the PSMDB users Secret via Strimzi's config-provider. Topics `<prefix>.<db>.
-/// <collection>` are routed (RegexRouter) to `<collection>` so the sink writes into `edge_db`.
+/// user/pass come from the PSMDB users Secret via Strimzi's config-provider. Each change event is
+/// written to `edge_db`, into the collection named by the event's own `source.collection`.
 #[allow(clippy::too_many_arguments)]
 pub fn mongo_sink_spec(
     short: &str,
@@ -222,85 +226,37 @@ pub fn mongo_sink_spec(
     let pass = format!("${{secrets:{secret_ns}/{edge_secret}:{pass_key}}}");
     // authSource=admin, explicit — see mongo_debezium_source_spec / the loader authSource fix.
     let uri = format!("mongodb://{user}:{pass}@{edge_host}/?replicaSet=rs0&authSource=admin");
-    // RegexRouter rewrites `<prefix>.<db>.<collection>` → `<collection>` before the sink looks up
-    // per-topic config. MongoSinkConfig matches the *post-SMT* topic against `topics.regex`, so the
-    // pattern must accept both the original Debezium topic (consumer subscribe) and the bare
-    // collection name (config lookup after route). See MongoSinkConfig.getMongoSinkTopicConfig.
-    let topics_regex = format!("({prefix}[.][^.]+[.].*|[^.]+)");
     let config = json!({
         "connector.class": "com.mongodb.kafka.connect.MongoSinkConnector",
         "tasks.max": 1,
-        "topics.regex": topics_regex,
+        // Only `<prefix>.<db>.<collection>`. Routing topics to bare collection names would need a
+        // bare-name alternative here, which also subscribes Connect's own config/offset/status
+        // topics and kills the task on their non-JSON records.
+        "topics.regex": format!("{prefix}[.][^.]+[.].*"),
         "connection.uri": uri,
         "database": edge_db,
-        // Interpret Debezium MongoDB change events and apply the corresponding insert/update/delete.
-        "change.data.capture.handler": "com.mongodb.kafka.connect.sink.cdc.debezium.mongodb.MongoDbHandler",
+        // Apply Debezium MongoDB change-stream events (the source's capture.mode) as insert/update/
+        // delete. MongoDbHandler is for the removed oplog mode and fails updates ("missing `patch`").
+        "change.data.capture.handler": "com.mongodb.kafka.connect.sink.cdc.debezium.mongodb.ChangeStreamHandler",
+        "namespace.mapper": "com.mongodb.kafka.connect.sink.namespace.mapping.FieldPathNamespaceMapper",
+        "namespace.mapper.value.collection.field": "source.collection",
+        // Delete tombstones carry no value to map; they fall back to the default namespace, and
+        // the CDC handler skips them (the preceding delete event already removed the document).
+        "namespace.mapper.error": false,
         "consumer.override.auto.offset.reset": "earliest",
-        "consumer.override.metadata.max.age.ms": "10000",
-        // Route `<prefix>.<db>.<collection>` -> `<collection>`; DefaultNamespaceMapper then uses
-        // `database` + topic(=collection) as the write namespace.
-        "transforms": "route",
-        "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
-        "transforms.route.regex": format!("{prefix}[.][^.]+[.](.*)"),
-        "transforms.route.replacement": "$1"
+        "consumer.override.metadata.max.age.ms": "10000"
     });
     json!({ "class": "com.mongodb.kafka.connect.MongoSinkConnector", "tasksMax": 1, "config": config })
 }
 
-/// JDBC sink connector config applying the source topics to the edge DB. `edge_secret` is the
-/// operator app Secret (CNPG `uri`/Percona `root`); we build a JDBC URL to the edge service.
-#[allow(clippy::too_many_arguments)]
+/// JDBC sink config applying the relational CDC topics to the edge DB (CNPG Postgres or Percona
+/// XtraDB), using the Debezium JDBC sink. It consumes the Debezium envelope as-is, so Debezium's own
+/// logical types bind — notably `io.debezium.time.ZonedTimestamp`, which Debezium always emits for
+/// MySQL/MariaDB `TIMESTAMP` columns and which the Aiven sink cannot bind. Rows upsert on the record
+/// key (every key column, so composite keys and Oracle's upper-case names need no `pk.fields`),
+/// deletes are applied, and `schema.evolution=basic` creates the edge tables of a heterogeneous
+/// migration (no dump full-load) and adds new columns to the pre-created ones of a homogeneous one.
 pub fn jdbc_sink_spec(
-    short: &str,
-    jdbc_url: &str,
-    secret_ns: &str,
-    edge_secret: &str,
-    edge_user: &str,
-    edge_pass_key: &str,
-    pk_fields: &str,
-    auto_create: bool,
-) -> Value {
-    let prefix = topic_prefix(short);
-    let config = json!({
-        "connector.class": "io.aiven.connect.jdbc.JdbcSinkConnector",
-        "tasks.max": 1,
-        "topics.regex": format!("{prefix}[.][^.]+[.].*"),
-        "connection.url": jdbc_url,
-        "connection.user": edge_user,
-        "connection.password": format!("${{secrets:{secret_ns}/{edge_secret}:{edge_pass_key}}}"),
-        "insert.mode": "upsert",
-        // A single Aiven sink connector takes one pk.fields for all its tables (the record-key PK
-        // column name(s)); default `id`, override with ATLAS_DATABRIDGE_SINK_PK_FIELDS.
-        "pk.mode": "record_key",
-        "pk.fields": pk_fields,
-        // Homogeneous migrations pre-create the edge tables in full-load, so auto.create is off.
-        // Heterogeneous (Oracle/SQL Server → Postgres) has no dump full-load — the sink creates the
-        // edge tables from the Debezium snapshot records.
-        "auto.create": auto_create,
-        "auto.evolve": true,
-        "consumer.override.auto.offset.reset": "earliest",
-        // topics.regex discovers new Debezium topics on a metadata refresh; shorten it from the 5min
-        // default so a table's topic (created on first change) is picked up promptly (no restart).
-        "consumer.override.metadata.max.age.ms": "10000",
-        // Flatten the Debezium envelope to the row image, and route `<prefix>.<schema>.<table>` topics
-        // to the bare `<table>` name so the sink writes to the matching edge table.
-        "transforms": "unwrap,route",
-        "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-        "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
-        "transforms.route.regex": format!("{prefix}[.][^.]+[.](.*)"),
-        "transforms.route.replacement": "$1"
-    });
-    json!({ "class": "io.aiven.connect.jdbc.JdbcSinkConnector", "tasksMax": 1, "config": config })
-}
-
-/// Debezium JDBC sink config for **MySQL-family edges** (Percona XtraDB). Unlike the Aiven sink it
-/// consumes the Debezium envelope as-is, so Debezium's own logical types bind correctly — notably
-/// `io.debezium.time.ZonedTimestamp`, which Debezium always uses for MySQL/MariaDB `TIMESTAMP`
-/// columns regardless of `time.precision.mode` and which the Aiven sink rejects
-/// (`Incorrect datetime value`). Primary keys come from the record key (every key column, so
-/// composite keys work without `pk.fields`), deletes are applied, and the edge tables (pre-created
-/// by the homogeneous full-load) gain new columns via `schema.evolution=basic`.
-pub fn debezium_jdbc_sink_spec(
     short: &str,
     jdbc_url: &str,
     secret_ns: &str,
@@ -321,15 +277,25 @@ pub fn debezium_jdbc_sink_spec(
         "delete.enabled": true,
         "schema.evolution": "basic",
         "consumer.override.auto.offset.reset": "earliest",
+        // topics.regex discovers new Debezium topics on a metadata refresh; shorten it from the 5min
+        // default so a table's topic (created on first change) is picked up promptly (no restart).
         "consumer.override.metadata.max.age.ms": "10000",
-        // `<prefix>.<db>.<table>` -> `<table>`; the sink then writes to the topic-named table.
+        // The routed topic is the bare table name; the sink writes to the table of that name.
         "collection.name.format": "${topic}",
         "transforms": "route",
         "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
-        "transforms.route.regex": format!("{prefix}[.][^.]+[.](.*)"),
+        "transforms.route.regex": table_route_regex(&prefix),
         "transforms.route.replacement": "$1"
     });
     json!({ "class": DEBEZIUM_JDBC_SINK, "tasksMax": 1, "config": config })
+}
+
+/// Routes a relational CDC topic to its last segment, the bare table name. Topic shapes differ per
+/// source: `<prefix>.<schema>.<table>` (Postgres, Oracle), `<prefix>.<db>.<table>` (MySQL/MariaDB)
+/// and `<prefix>.<db>.<schema>.<table>` (SQL Server); keeping everything after the first segment
+/// would make SQL Server rows target a `dbo.<table>` the edge does not have.
+fn table_route_regex(prefix: &str) -> String {
+    format!("{prefix}[.].*[.]([^.]+)")
 }
 
 const DEBEZIUM_JDBC_SINK: &str = "io.debezium.connector.jdbc.JdbcSinkConnector";
@@ -373,7 +339,7 @@ mod tests {
         );
         assert_eq!(s["config"]["plugin.name"], "pgoutput");
         assert_eq!(s["config"]["topic.prefix"], "dbabc123");
-        assert_eq!(s["config"]["snapshot.mode"], "never"); // homogeneous — full-load seeded it
+        assert_eq!(s["config"]["snapshot.mode"], "no_data"); // homogeneous — full-load seeded it
         assert_eq!(
             s["config"]["database.password"],
             "${secrets:zyvor-databridge/src-creds:password}"
@@ -427,7 +393,7 @@ mod tests {
             "abc123",
             "h",
             1521,
-            "ORCLPDB",
+            "ORCLCDB/ORCLPDB",
             "ns",
             "creds",
         );
@@ -436,7 +402,12 @@ mod tests {
             "io.debezium.connector.oracle.OracleConnector"
         );
         assert_eq!(ora["config"]["snapshot.mode"], "initial");
+        assert_eq!(ora["config"]["database.dbname"], "ORCLCDB");
         assert_eq!(ora["config"]["database.pdb.name"], "ORCLPDB");
+        let non_cdb =
+            debezium_source_spec(SourceKind::Oracle, "abc123", "h", 1521, "ORCL", "ns", "c");
+        assert_eq!(non_cdb["config"]["database.dbname"], "ORCL");
+        assert!(non_cdb["config"].get("database.pdb.name").is_none());
         let mss = debezium_source_spec(
             SourceKind::Sqlserver,
             "abc123",
@@ -455,45 +426,8 @@ mod tests {
     }
 
     #[test]
-    fn sink_targets_topic_regex_and_upsert() {
+    fn sink_takes_the_debezium_envelope() {
         let s = jdbc_sink_spec(
-            "abc123",
-            "jdbc:postgresql://edge-rw:5432/appdb",
-            "zyvor-databridge",
-            "edge-app",
-            "app",
-            "password",
-            "id",
-            false,
-        );
-        assert_eq!(s["config"]["insert.mode"], "upsert");
-        assert_eq!(s["config"]["pk.fields"], "id");
-        assert_eq!(s["config"]["auto.create"], false);
-        assert_eq!(
-            s["config"]["transforms.unwrap.type"],
-            "io.debezium.transforms.ExtractNewRecordState"
-        );
-        assert_eq!(s["config"]["topics.regex"], "dbabc123[.][^.]+[.].*");
-    }
-
-    #[test]
-    fn sink_auto_creates_for_heterogeneous() {
-        let s = jdbc_sink_spec(
-            "abc123",
-            "jdbc:postgresql://edge-rw:5432/appdb",
-            "ns",
-            "edge-app",
-            "app",
-            "password",
-            "id",
-            true,
-        );
-        assert_eq!(s["config"]["auto.create"], true);
-    }
-
-    #[test]
-    fn mysql_edge_sink_takes_the_debezium_envelope() {
-        let s = debezium_jdbc_sink_spec(
             "abc123",
             "jdbc:mysql://edge-haproxy:3306/shop",
             "ns",
@@ -505,14 +439,50 @@ mod tests {
         assert_eq!(s["class"], "io.debezium.connector.jdbc.JdbcSinkConnector");
         assert_eq!(c["connection.username"], "root");
         assert_eq!(c["connection.password"], "${secrets:ns/edge-secrets:root}");
+        assert_eq!(c["insert.mode"], "upsert");
         assert_eq!(c["primary.key.mode"], "record_key");
         assert_eq!(c["delete.enabled"], true);
+        assert_eq!(c["schema.evolution"], "basic");
         assert_eq!(c["topics.regex"], "dbabc123[.][^.]+[.].*");
         assert_eq!(
             c["transforms"], "route",
             "no unwrap: the sink reads the envelope"
         );
         assert!(c.get("pk.fields").is_none());
+    }
+
+    #[test]
+    fn sink_routes_every_topic_shape_to_its_table() {
+        let s = jdbc_sink_spec(
+            "abc123",
+            "jdbc:postgresql://e/appdb",
+            "ns",
+            "s",
+            "app",
+            "pw",
+        );
+        let route = regex_lite(s["config"]["transforms.route.regex"].as_str().unwrap());
+        for (topic, table) in [
+            ("dbabc123.shop.dbo.customers", "customers"),
+            ("dbabc123.public.orders", "orders"),
+            ("dbabc123.APP.CUSTOMERS", "CUSTOMERS"),
+        ] {
+            assert_eq!(route(topic).as_deref(), Some(table), "{topic}");
+        }
+        assert_eq!(route("dbother.public.orders"), None);
+    }
+
+    /// Just enough of RegexRouter for `<prefix>[.].*[.]([^.]+)`: the last dot-separated segment
+    /// of a topic that starts with `<prefix>.`.
+    fn regex_lite(re: &str) -> impl Fn(&str) -> Option<String> + '_ {
+        let prefix = re
+            .strip_suffix("[.].*[.]([^.]+)")
+            .expect("route regex shape");
+        move |topic: &str| {
+            let rest = topic.strip_prefix(prefix)?.strip_prefix('.')?;
+            let (_, table) = rest.rsplit_once('.')?;
+            Some(table.to_string())
+        }
     }
 
     #[test]
@@ -564,13 +534,14 @@ mod tests {
             .contains("authSource=admin"));
         assert_eq!(
             s["config"]["change.data.capture.handler"],
-            "com.mongodb.kafka.connect.sink.cdc.debezium.mongodb.MongoDbHandler"
+            "com.mongodb.kafka.connect.sink.cdc.debezium.mongodb.ChangeStreamHandler"
         );
-        assert_eq!(s["config"]["transforms.route.replacement"], "$1");
+        assert_eq!(s["config"]["topics.regex"], "dbabc123[.][^.]+[.].*");
         assert_eq!(
-            s["config"]["topics.regex"], "(dbabc123[.][^.]+[.].*|[^.]+)",
-            "must match Debezium topic and post-RegexRouter collection name"
+            s["config"]["namespace.mapper.value.collection.field"],
+            "source.collection"
         );
+        assert!(s["config"].get("transforms").is_none());
     }
 
     #[test]
