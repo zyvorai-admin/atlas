@@ -191,3 +191,48 @@ fn tcp_leader_failover_and_rejoin() {
     c.restart(&old);
     c.wait_converged(&["a", "b"]);
 }
+
+#[test]
+fn tcp_metrics_expose_role_replication_and_transport_failures() {
+    let mut c = TcpCluster::new(3);
+    c.propose_on_leader(create("a"));
+    c.wait_converged(&["a"]);
+    let l = c.wait_leader();
+
+    let m = c.servers[&l].as_ref().unwrap().render_metrics().unwrap();
+    assert!(m.contains(&format!(
+        "atlas_native_raft_role{{node=\"{l}\",role=\"leader\"}} 1"
+    )));
+    assert!(m.contains("# TYPE atlas_native_raft_peer_match_index gauge"));
+    assert_eq!(m.matches("atlas_native_raft_peer_match_index{").count(), 2);
+    assert!(m.contains("atlas_native_raft_leader_terms_total{node="));
+
+    let (fid, f) = c.live().find(|(id, _)| **id != l).unwrap();
+    let fm = f.render_metrics().unwrap();
+    assert!(fm.contains(&format!(
+        "atlas_native_raft_role{{node=\"{fid}\",role=\"follower\"}} 1"
+    )));
+    let fid = fid.clone();
+
+    c.stop(&fid);
+    let deadline = Instant::now() + WAIT;
+    let leader = c.servers[&l].as_ref().unwrap();
+    let pattern =
+        format!("atlas_native_transport_connect_failures_total{{node=\"{l}\",peer=\"{fid}\"}} ");
+    loop {
+        let m = leader.render_metrics().unwrap();
+        let failures: u64 = m
+            .lines()
+            .find_map(|line| line.strip_prefix(&pattern))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        if failures > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no connect failures recorded for {fid}:\n{m}"
+        );
+        thread::sleep(TICK);
+    }
+}

@@ -24,6 +24,7 @@ use std::{
 
 use crate::{
     metadata::{Catalog, MetaCommand},
+    metrics::PromText,
     raft::{Envelope, NodeId, RaftConfig, RaftError, RaftNode, Role},
 };
 
@@ -43,12 +44,24 @@ pub struct RaftStatus {
     pub applied_index: u64,
 }
 
+#[derive(Debug, Default)]
+struct PeerStats {
+    connect_failures: AtomicU64,
+    write_failures: AtomicU64,
+    /// Messages dropped because the peer's send queue was full.
+    dropped: AtomicU64,
+    sent: AtomicU64,
+}
+
 struct Shared {
     node: Mutex<RaftNode>,
     changed: Condvar,
     stop: AtomicBool,
     fatal: Mutex<Option<String>>,
     outbound: BTreeMap<NodeId, SyncSender<Envelope>>,
+    peer_stats: BTreeMap<NodeId, Arc<PeerStats>>,
+    /// Inbound frames dropped for a wrong addressee or an unknown sender.
+    rejected_frames: AtomicU64,
     /// Accepted connections, kept so shutdown can unblock their readers; removed on reader exit.
     conns: Mutex<BTreeMap<u64, TcpStream>>,
     next_conn: AtomicU64,
@@ -65,9 +78,14 @@ impl Shared {
 
     fn flush(&self, node: &mut RaftNode) {
         for env in node.take_messages() {
-            if let Some(tx) = self.outbound.get(&env.to) {
+            let to = env.to.clone();
+            if let Some(tx) = self.outbound.get(&to) {
                 // A full queue means the peer is unreachable; Raft retransmits.
-                let _ = tx.try_send(env);
+                if tx.try_send(env).is_err() {
+                    if let Some(st) = self.peer_stats.get(&to) {
+                        st.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -108,12 +126,17 @@ impl RaftServer {
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
         let mut outbound = BTreeMap::new();
+        let mut peer_stats = BTreeMap::new();
         for p in &cfg.peers {
             let (tx, rx) = mpsc::sync_channel(PEER_QUEUE);
             outbound.insert(p.clone(), tx);
+            let stats = Arc::new(PeerStats::default());
+            peer_stats.insert(p.clone(), stats.clone());
             let peer_addr = peers[p];
             let stop = stop.clone();
-            threads.push(thread::spawn(move || peer_sender(peer_addr, rx, &stop)));
+            threads.push(thread::spawn(move || {
+                peer_sender(peer_addr, rx, &stop, &stats)
+            }));
         }
 
         let shared = Arc::new(Shared {
@@ -122,6 +145,8 @@ impl RaftServer {
             stop: AtomicBool::new(false),
             fatal: Mutex::new(None),
             outbound,
+            peer_stats,
+            rejected_frames: AtomicU64::new(0),
             conns: Mutex::new(BTreeMap::new()),
             next_conn: AtomicU64::new(0),
             readers: Mutex::new(Vec::new()),
@@ -169,6 +194,143 @@ impl RaftServer {
 
     pub fn catalog(&self) -> Result<Catalog, RaftError> {
         Ok(self.shared.lock()?.catalog().clone())
+    }
+
+    /// Prometheus text exposition for this node's Raft state and transport.
+    pub fn render_metrics(&self) -> Result<String, RaftError> {
+        let n = self.shared.lock()?;
+        let id = n.id().to_string();
+        let node = [("node", id.as_str())];
+        let mut p = PromText::new();
+        p.family("atlas_native_raft_term", "gauge", "Current Raft term.")
+            .sample("atlas_native_raft_term", &node, n.term());
+        p.family(
+            "atlas_native_raft_commit_index",
+            "gauge",
+            "Highest committed log index.",
+        )
+        .sample("atlas_native_raft_commit_index", &node, n.commit_index());
+        p.family(
+            "atlas_native_raft_applied_index",
+            "gauge",
+            "Highest log index applied to the catalog.",
+        )
+        .sample("atlas_native_raft_applied_index", &node, n.applied_index());
+        p.family(
+            "atlas_native_raft_last_index",
+            "gauge",
+            "Last log index (including uncommitted).",
+        )
+        .sample("atlas_native_raft_last_index", &node, n.last_index());
+        p.family(
+            "atlas_native_raft_snapshot_index",
+            "gauge",
+            "Log compaction point.",
+        )
+        .sample(
+            "atlas_native_raft_snapshot_index",
+            &node,
+            n.snapshot_index(),
+        );
+        p.family(
+            "atlas_native_raft_role",
+            "gauge",
+            "1 for the node's current role, 0 otherwise.",
+        );
+        for (role, name) in [
+            (Role::Follower, "follower"),
+            (Role::PreCandidate, "pre_candidate"),
+            (Role::Candidate, "candidate"),
+            (Role::Leader, "leader"),
+        ] {
+            p.sample(
+                "atlas_native_raft_role",
+                &[("node", id.as_str()), ("role", name)],
+                u8::from(n.role() == role),
+            );
+        }
+        let c = n.counters();
+        p.family(
+            "atlas_native_raft_elections_total",
+            "counter",
+            "Elections started after a successful pre-vote.",
+        )
+        .sample("atlas_native_raft_elections_total", &node, c.elections);
+        p.family(
+            "atlas_native_raft_leader_terms_total",
+            "counter",
+            "Times this node became leader.",
+        )
+        .sample(
+            "atlas_native_raft_leader_terms_total",
+            &node,
+            c.leader_terms,
+        );
+        p.family(
+            "atlas_native_raft_append_rejections_total",
+            "counter",
+            "AppendEntries rejections received while leader.",
+        )
+        .sample(
+            "atlas_native_raft_append_rejections_total",
+            &node,
+            c.append_rejections,
+        );
+        p.family(
+            "atlas_native_raft_peer_match_index",
+            "gauge",
+            "Highest index replicated on each peer (leader only).",
+        );
+        for (peer, m) in n.peer_match_index() {
+            p.sample(
+                "atlas_native_raft_peer_match_index",
+                &[("node", id.as_str()), ("peer", peer.as_str())],
+                m,
+            );
+        }
+        drop(n);
+        for (name, help, get) in [
+            (
+                "atlas_native_transport_sent_total",
+                "Raft frames written to each peer.",
+                (|s: &PeerStats| s.sent.load(Ordering::Relaxed)) as fn(&PeerStats) -> u64,
+            ),
+            (
+                "atlas_native_transport_connect_failures_total",
+                "Failed connection attempts to each peer.",
+                |s| s.connect_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "atlas_native_transport_write_failures_total",
+                "Frame writes that failed and dropped the connection.",
+                |s| s.write_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "atlas_native_transport_dropped_total",
+                "Messages dropped while the peer was unreachable or its queue was full.",
+                |s| s.dropped.load(Ordering::Relaxed),
+            ),
+        ] {
+            p.family(name, "counter", help);
+            for (peer, st) in &self.shared.peer_stats {
+                p.sample(
+                    name,
+                    &[("node", id.as_str()), ("peer", peer.as_str())],
+                    get(st),
+                );
+            }
+        }
+        p.family(
+            "atlas_native_transport_rejected_frames_total",
+            "counter",
+            "Inbound frames from unknown senders or for another node.",
+        )
+        .sample(
+            "atlas_native_transport_rejected_frames_total",
+            &node,
+            self.shared.rejected_frames.load(Ordering::Relaxed),
+        );
+        Ok(p.finish())
     }
 
     /// The first fatal error (e.g. a failed fsync) that stopped this server, if any.
@@ -296,7 +458,13 @@ fn accept_loop(
                 let peers = peers.to_vec();
                 let reader_shared = shared.clone();
                 let handle = thread::spawn(move || {
-                    read_loop(stream, &inbound, &id, &peers);
+                    read_loop(
+                        stream,
+                        &inbound,
+                        &id,
+                        &peers,
+                        &reader_shared.rejected_frames,
+                    );
                     if let Ok(mut conns) = reader_shared.conns.lock() {
                         conns.remove(&conn_id);
                     }
@@ -314,9 +482,16 @@ fn accept_loop(
     }
 }
 
-fn read_loop(mut stream: TcpStream, inbound: &Sender<Envelope>, id: &str, peers: &[NodeId]) {
+fn read_loop(
+    mut stream: TcpStream,
+    inbound: &Sender<Envelope>,
+    id: &str,
+    peers: &[NodeId],
+    rejected: &AtomicU64,
+) {
     while let Ok(env) = read_frame(&mut stream) {
         if env.to != id || !peers.contains(&env.from) {
+            rejected.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         if inbound.send(env).is_err() {
@@ -325,7 +500,7 @@ fn read_loop(mut stream: TcpStream, inbound: &Sender<Envelope>, id: &str, peers:
     }
 }
 
-fn peer_sender(addr: SocketAddr, rx: Receiver<Envelope>, stop: &AtomicBool) {
+fn peer_sender(addr: SocketAddr, rx: Receiver<Envelope>, stop: &AtomicBool, stats: &PeerStats) {
     let mut conn: Option<TcpStream> = None;
     let mut last_failure: Option<Instant> = None;
     loop {
@@ -351,13 +526,22 @@ fn peer_sender(addr: SocketAddr, rx: Receiver<Envelope>, stop: &AtomicBool) {
                 })
                 .ok();
             if conn.is_none() {
+                stats.connect_failures.fetch_add(1, Ordering::Relaxed);
                 last_failure = Some(Instant::now());
             }
         }
-        if let Some(s) = conn.as_mut() {
-            if write_frame(s, &env).is_err() {
-                conn = None;
-                last_failure = Some(Instant::now());
+        match conn.as_mut() {
+            Some(s) => {
+                if write_frame(s, &env).is_ok() {
+                    stats.sent.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats.write_failures.fetch_add(1, Ordering::Relaxed);
+                    conn = None;
+                    last_failure = Some(Instant::now());
+                }
+            }
+            None => {
+                stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

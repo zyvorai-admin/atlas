@@ -296,6 +296,22 @@ fn rejoining_node_does_not_disrupt_stable_leader() {
 }
 
 #[test]
+fn counters_track_elections_and_leadership() {
+    let mut c = Cluster::new(3, 0);
+    let l = c.elect();
+    let counters = c.node(&l).counters();
+    assert!(counters.elections >= 1);
+    assert_eq!(counters.leader_terms, 1);
+    assert_eq!(c.node(&l).membership().voters().len(), 3);
+    c.node_mut(&l).propose(create("a")).unwrap();
+    assert!(c.run_until(50, |c| c.converged(&["a"])));
+    let commit = c.node(&l).commit_index();
+    let matched = c.node(&l).peer_match_index();
+    assert_eq!(matched.len(), 2);
+    assert!(matched.values().all(|m| *m >= commit));
+}
+
+#[test]
 fn isolated_leader_steps_down() {
     let mut c = Cluster::new(3, 0);
     let l = c.elect();

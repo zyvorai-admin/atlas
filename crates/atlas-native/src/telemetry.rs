@@ -11,6 +11,7 @@ pub struct NativeIoCounters {
     write_bytes: AtomicU64,
     checksum_failures: AtomicU64,
     replica_fallbacks: AtomicU64,
+    gc_reclaimed: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub struct NativeIoSnapshot {
     pub write_bytes: u64,
     pub checksum_failures: u64,
     pub replica_fallbacks: u64,
+    pub gc_reclaimed: u64,
 }
 
 impl NativeIoCounters {
@@ -38,6 +40,9 @@ impl NativeIoCounters {
     pub fn replica_fallback(&self) {
         self.replica_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn gc_reclaimed(&self, extents: u64) {
+        self.gc_reclaimed.fetch_add(extents, Ordering::Relaxed);
+    }
     pub fn snapshot(&self) -> NativeIoSnapshot {
         NativeIoSnapshot {
             reads: self.reads.load(Ordering::Relaxed),
@@ -46,6 +51,7 @@ impl NativeIoCounters {
             write_bytes: self.write_bytes.load(Ordering::Relaxed),
             checksum_failures: self.checksum_failures.load(Ordering::Relaxed),
             replica_fallbacks: self.replica_fallbacks.load(Ordering::Relaxed),
+            gc_reclaimed: self.gc_reclaimed.load(Ordering::Relaxed),
         }
     }
 }
