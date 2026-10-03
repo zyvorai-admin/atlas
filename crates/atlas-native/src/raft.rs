@@ -56,6 +56,8 @@ pub enum RaftError {
     Timeout { index: u64 },
     #[error("raft server is shut down")]
     Shutdown,
+    #[error("term changed from {expected} to {current} before the proposal")]
+    TermChanged { expected: u64, current: u64 },
 }
 
 #[derive(Debug, Clone)]

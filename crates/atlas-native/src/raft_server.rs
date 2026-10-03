@@ -196,6 +196,61 @@ impl RaftServer {
         Ok(self.shared.lock()?.catalog().clone())
     }
 
+    /// Runs `f` against the applied catalog without cloning it. `f` holds the node lock, so it
+    /// must not block.
+    pub fn with_catalog<R>(&self, f: impl FnOnce(&Catalog) -> R) -> Result<R, RaftError> {
+        Ok(f(self.shared.lock()?.catalog()))
+    }
+
+    /// Log entries retained above the last compaction point.
+    pub fn log_records(&self) -> Result<u64, RaftError> {
+        let n = self.shared.lock()?;
+        Ok(n.last_index() - n.snapshot_index())
+    }
+
+    /// Blocks until this node is leader and has applied its whole log, including the no-op that
+    /// commits earlier terms' entries. Returns the term, which callers use as a data write fence
+    /// and pass to [`Self::propose_in_term`].
+    pub fn leader_ready(&self, timeout: Duration) -> Result<u64, RaftError> {
+        let deadline = Instant::now() + timeout;
+        let mut node = self.shared.lock()?;
+        loop {
+            if self.shared.stop.load(Ordering::SeqCst) {
+                return Err(RaftError::Shutdown);
+            }
+            if !node.is_leader() {
+                return Err(RaftError::NotLeader {
+                    leader: node.leader().map(str::to_string),
+                });
+            }
+            if node.applied_index() == node.last_index() {
+                return Ok(node.term());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RaftError::Timeout {
+                    index: node.last_index(),
+                });
+            }
+            node = self
+                .shared
+                .changed
+                .wait_timeout(node, deadline - now)
+                .map_err(|_| RaftError::Shutdown)?
+                .0;
+        }
+    }
+
+    /// Like [`Self::propose`], but refuses to propose unless the node is still leader in `term`.
+    pub fn propose_in_term(
+        &self,
+        command: MetaCommand,
+        term: u64,
+        timeout: Duration,
+    ) -> Result<u64, RaftError> {
+        self.propose_inner(command, Some(term), timeout)
+    }
+
     /// Prometheus text exposition for this node's Raft state and transport.
     pub fn render_metrics(&self) -> Result<String, RaftError> {
         let n = self.shared.lock()?;
@@ -341,9 +396,24 @@ impl RaftServer {
     /// Proposes `command` and blocks until it is applied locally. Returns `LeadershipLost` if
     /// this node stops being leader (or changes term) first: the entry may or may not commit.
     pub fn propose(&self, command: MetaCommand, timeout: Duration) -> Result<u64, RaftError> {
+        self.propose_inner(command, None, timeout)
+    }
+
+    fn propose_inner(
+        &self,
+        command: MetaCommand,
+        expected_term: Option<u64>,
+        timeout: Duration,
+    ) -> Result<u64, RaftError> {
         let deadline = Instant::now() + timeout;
         let mut node = self.shared.lock()?;
         let term = node.term();
+        if let Some(expected) = expected_term.filter(|t| *t != term) {
+            return Err(RaftError::TermChanged {
+                expected,
+                current: term,
+            });
+        }
         let index = node.propose(command)?;
         self.shared.flush(&mut node);
         loop {

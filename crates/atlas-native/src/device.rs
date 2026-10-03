@@ -16,6 +16,38 @@ use crate::engine::NativeError;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeviceId(pub String);
 
+/// Byte-addressed extent storage the engine writes replicas to: a local [`FileDevice`] or a
+/// [`crate::data_node::RemoteDevice`].
+///
+/// `fence` is the writer's Raft term. Remote data nodes reject writes whose fence is below the
+/// highest they have accepted; local files ignore it.
+pub trait BlockStore: std::fmt::Debug + Send + Sync {
+    /// Appends `data` at the end of the device and returns its offset.
+    fn append(&self, fence: u64, data: &[u8]) -> Result<u64, NativeError>;
+    /// Overwrites `data.len()` bytes at `offset`. Never extends the device.
+    fn write_at(&self, fence: u64, offset: u64, data: &[u8]) -> Result<(), NativeError>;
+    fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, NativeError>;
+    fn len(&self) -> Result<u64, NativeError>;
+    fn is_empty(&self) -> Result<bool, NativeError> {
+        Ok(self.len()? == 0)
+    }
+}
+
+impl BlockStore for FileDevice {
+    fn append(&self, _fence: u64, data: &[u8]) -> Result<u64, NativeError> {
+        FileDevice::append(self, data)
+    }
+    fn write_at(&self, _fence: u64, offset: u64, data: &[u8]) -> Result<(), NativeError> {
+        FileDevice::write_at(self, offset, data)
+    }
+    fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, NativeError> {
+        FileDevice::read_exact_at(self, offset, len)
+    }
+    fn len(&self) -> Result<u64, NativeError> {
+        FileDevice::len(self)
+    }
+}
+
 #[derive(Debug)]
 pub struct FileDevice {
     id: DeviceId,
