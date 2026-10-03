@@ -41,6 +41,10 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      # codeql-action init/autobuild/analyze must move in lockstep (see codeql.yml).
+      codeql-action:
+        patterns: ["github/codeql-action*"]
     labels: ["dependencies", "ci"]
     commit-message:
       prefix: "chore(deps)"
