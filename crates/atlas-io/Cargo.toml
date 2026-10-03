@@ -12,6 +12,11 @@ description = "Observe-first eBPF storage I/O sensor for Atlas (bio latency, att
 name = "atlas-io-agent"
 path = "src/bin/atlas-io-agent.rs"
 
+[features]
+# Live block-layer attach: build.rs compiles bpf/atlas_bio.bpf.c (needs clang + libbpf headers)
+# and src/bpf.rs loads it with aya. Off by default so CI and `make run` need no BPF toolchain.
+bpf = ["dep:aya"]
+
 [dependencies]
 atlas-api-types = { workspace = true }
 anyhow = { workspace = true }
@@ -23,6 +28,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

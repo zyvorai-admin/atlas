@@ -1,7 +1,8 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
-//! Event sources. Live eBPF is a stub that reports missing programs unless a
-//! loader is compiled in later; FakeSource is the CI and demo path.
+//! Event sources. `live()` attaches the block-layer BPF programs (`bpf` feature);
+//! LiveSource is the honest stand-in when that is unavailable; FakeSource is the CI
+//! and demo path.
 
 use atlas_api_types::{BioEvent, IoOp, IoSensorHealth};
 
@@ -60,8 +61,22 @@ impl IoSource for FakeSource {
     }
 }
 
-/// Live attach stub: never claims programs are loaded. The agent still serves
-/// health/coverage so `atlasctl io coverage` is honest on a host without BPF.
+/// The attached block-layer BPF source, or why it could not be attached (built without
+/// the `bpf` feature, not Linux, missing CAP_BPF/CAP_PERFMON, no tracefs, …).
+pub fn live() -> anyhow::Result<Box<dyn IoSource>> {
+    #[cfg(all(feature = "bpf", target_os = "linux"))]
+    {
+        Ok(Box::new(crate::bpf::BpfSource::attach()?))
+    }
+    #[cfg(not(all(feature = "bpf", target_os = "linux")))]
+    {
+        anyhow::bail!("atlas-io was built without the `bpf` feature (Linux only)")
+    }
+}
+
+/// Stand-in when the BPF programs could not be attached: never claims programs are
+/// loaded. The agent still serves health/coverage so `atlasctl io coverage` is honest
+/// on a host without BPF.
 pub struct LiveSource;
 
 impl IoSource for LiveSource {

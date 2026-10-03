@@ -83,9 +83,11 @@ agent (`atlas-io-agent`, own Dockerfile.io/DaemonSet, `deploy/k8s/atlas-io-agent
 `atlas-gateway` specifically so the main gateway never needs `CAP_BPF`/`CAP_PERFMON`. Fake bio source
 by default (zero external dependency, same fake-first pattern as the storage drivers); device-map
 attribution, log2-µs histograms, per-cgroup/pid workload accounting, RCA verdicts, and fail-open
-leased write-freezes are all live-verified over HTTP/`/metrics` and `atlasctl io`. Real CO-RE
-attach (`crates/atlas-io/bpf/*.bpf.c` C contracts) is not yet wired up — live mode reports the
-programs as missing rather than fabricating data.
+leased write-freezes are all live-verified over HTTP/`/metrics` and `atlasctl io`. **Real
+block-layer attach** (`bpf` feature: `crates/atlas-io/bpf/atlas_bio.bpf.c`, CO-RE, loaded with
+`aya`; built into `Dockerfile.io`) is verified live on kernel 7.0 — real per-device latency and
+pid/cgroup attribution; if attach fails, live mode reports the programs missing rather than
+fabricating data. NFS/ZFS/io_uring programs are still contracts only.
 
 **Licensed** under the [Apache License 2.0](LICENSE) (`Apache-2.0`; relicensed from the Zyvor
 Production License v1.0 at the maintainer's explicit request — history in

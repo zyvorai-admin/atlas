@@ -1,7 +1,15 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
 # SPDX-License-Identifier: Apache-2.0
-# Optional node sensor. Privileged + host /sys/fs/bpf only when ATLAS_IO_MODE=live.
-# Default is fake so a lab cluster can exercise the API without CAP_BPF.
+# Optional node sensor. Default is fake so a lab cluster can exercise the API without CAP_BPF.
+# Live mode (block-layer BPF, docs/IO_EBPF.md): set --mode/ATLAS_IO_MODE to live and give the
+# container, instead of privileged:
+#   securityContext:
+#     runAsUser: 0
+#     seccompProfile: { type: Unconfined }   # RuntimeDefault blocks perf_event_open without SYS_ADMIN
+#     capabilities: { drop: [ALL], add: [BPF, PERFMON] }
+#   volumeMounts: [{ name: tracefs, mountPath: /sys/kernel/tracing, readOnly: true }]
+#   volumes:      [{ name: tracefs, hostPath: { path: /sys/kernel/tracing } }]
+# Without them the agent still serves, reporting the programs missing.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

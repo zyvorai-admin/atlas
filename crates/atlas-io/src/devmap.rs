@@ -3,6 +3,7 @@
 //! Map kernel `major:minor` to an Atlas volume id and a human device name.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
 pub struct DeviceMap {
@@ -37,6 +38,31 @@ impl DeviceMap {
         })
     }
 
+    /// The host's block devices, named from `/sys/class/block` (no volume bindings). Devices
+    /// that appear later resolve to `major:minor`.
+    pub fn from_sysfs() -> Self {
+        Self::from_class_dir(Path::new("/sys/class/block"))
+    }
+
+    fn from_class_dir(dir: &Path) -> Self {
+        let mut m = Self::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return m;
+        };
+        for entry in entries.flatten() {
+            let Ok(dev) = std::fs::read_to_string(entry.path().join("dev")) else {
+                continue;
+            };
+            let Some((major, minor)) = dev.trim().split_once(':') else {
+                continue;
+            };
+            if let (Ok(major), Ok(minor)) = (major.parse(), minor.parse()) {
+                m.insert(major, minor, entry.file_name().to_string_lossy(), None);
+            }
+        }
+        m
+    }
+
     /// Seed a lab-shaped map used by the fake agent and unit tests.
     pub fn lab() -> Self {
         let mut m = Self::new();
@@ -68,6 +94,22 @@ mod tests {
         let b = m.resolve(8, 1);
         assert_eq!(b.name, "8:1");
         assert!(b.volume_id.is_none());
+    }
+
+    #[test]
+    fn names_devices_from_sysfs() {
+        let dir = std::env::temp_dir().join(format!("atlas-io-devmap-{}", std::process::id()));
+        for (name, dev) in [("nvme0n1", "259:0\n"), ("rbd0", "251:0\n")] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name).join("dev"), dev).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("broken")).unwrap();
+        let m = DeviceMap::from_class_dir(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.resolve(259, 0).name, "nvme0n1");
+        assert_eq!(m.resolve(251, 0).name, "rbd0");
+        assert!(m.resolve(251, 0).volume_id.is_none());
     }
 
     #[test]
