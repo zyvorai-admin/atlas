@@ -119,8 +119,10 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   and a Raft core for the metadata log (pre-vote, check-quorum) with a std-only TCP server
   (`raft_server`), plus networked data nodes (`data_node`, term-fenced writes) so the engine can
   commit through Raft (`MetaBackend::Raft`) with replicas on other hosts. Per-node circuit breaker,
-  write failover and scrub/repair (`repair_once`); both transports support optional mutual TLS. See
-  `docs/NATIVE_STORAGE.md`, `docs/NATIVE_METADATA.md`.
+  write failover and scrub/repair (`repair_once`); both transports support optional mutual TLS.
+  Bin `atlas-native-node` (`node` module) runs either role with an HTTP health/metrics/volume API
+  (`deploy/native/smoke.sh`). See `docs/NATIVE_STORAGE.md`, `docs/NATIVE_METADATA.md`,
+  `docs/NATIVE_NODE.md`.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
   DB-backed rate-limit counters (`rate_limit.rs`).

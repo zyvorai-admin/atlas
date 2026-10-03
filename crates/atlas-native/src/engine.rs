@@ -126,7 +126,7 @@ struct NodeRuntime {
 }
 
 /// A node's health as the engine currently sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NodeStatus {
     pub id: String,
     /// Configured healthy and not inside an I/O-failure back-off window.
@@ -134,7 +134,15 @@ pub struct NodeStatus {
     pub failures: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VolumeInfo {
+    pub id: VolumeId,
+    pub name: String,
+    pub size_bytes: u64,
+    pub extents: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct RepairStats {
     pub extents_checked: u64,
     pub replicas_repaired: u64,
@@ -494,6 +502,21 @@ impl NativeEngine {
             }
         }
         Ok(st)
+    }
+
+    /// Volumes in the applied catalog, ordered by id.
+    pub fn volumes(&self) -> Result<Vec<VolumeInfo>, NativeError> {
+        self.with_catalog(|c| {
+            c.volumes
+                .values()
+                .map(|v| VolumeInfo {
+                    id: v.id.clone(),
+                    name: v.name.clone(),
+                    size_bytes: v.size_bytes,
+                    extents: v.extents.len(),
+                })
+                .collect()
+        })
     }
 
     /// Current per-node health.

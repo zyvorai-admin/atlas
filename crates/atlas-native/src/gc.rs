@@ -3,7 +3,7 @@
 
 use crate::metadata::{Catalog, ExtentId};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct GcStats {
     pub candidates: u64,
     pub reclaimed: u64,

@@ -7,6 +7,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "atlas-native-node"
+path = "src/bin/atlas-native-node.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

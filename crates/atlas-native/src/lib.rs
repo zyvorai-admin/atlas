@@ -8,7 +8,8 @@
 //! replicates the same `MetaCommand` log across metadata replicas and applies it through the same
 //! `Catalog` state machine. Phase 4 puts replicas on other hosts through [`data_node`] and lets
 //! [`NativeEngine`] commit through Raft ([`MetaBackend::Raft`]); both transports support mutual TLS
-//! ([`tls`]).
+//! ([`tls`]). [`node::NativeNode`] (binary `atlas-native-node`) runs either or both roles with an
+//! HTTP ops/volume endpoint.
 
 pub mod alloc;
 pub mod checksum;
@@ -17,9 +18,11 @@ pub mod device;
 mod durable;
 pub mod engine;
 pub mod gc;
+pub mod http;
 pub mod membership;
 pub mod metadata;
 pub mod metrics;
+pub mod node;
 pub mod placement;
 pub mod raft;
 pub mod raft_server;
@@ -30,7 +33,9 @@ pub mod wal;
 pub use alloc::{FreeList, FreeRange};
 pub use data_node::{DataNodeServer, RemoteDevice};
 pub use device::{BlockStore, DeviceId, FileDevice};
-pub use engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, NodeStatus, RepairStats};
+pub use engine::{
+    EngineConfig, MetaBackend, NativeEngine, NativeError, NodeStatus, RepairStats, VolumeInfo,
+};
 pub use gc::GcStats;
 pub use membership::Membership;
 pub use metadata::{Catalog, MetaCommand, SnapshotId, VolumeId};

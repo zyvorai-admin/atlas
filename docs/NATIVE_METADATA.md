@@ -264,7 +264,8 @@ Not implemented yet:
 
 ## Next phase
 
-- a native node binary hosting `RaftServer` + `DataNodeServer` + `/metrics`;
+- a container image, Helm chart and gateway integration for `atlas-native-node`
+  (`docs/NATIVE_NODE.md`);
 - joint-consensus membership changes;
 - incremental, rate-limited background scrub (today `repair_once` scans everything);
 - hole punching for freed ranges at the device tail;
