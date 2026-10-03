@@ -7,7 +7,8 @@
 //! free lists so reclaimed extents are physically reused, and a sans-IO Raft core ([`raft`]) that
 //! replicates the same `MetaCommand` log across metadata replicas and applies it through the same
 //! `Catalog` state machine. Phase 4 puts replicas on other hosts through [`data_node`] and lets
-//! [`NativeEngine`] commit through Raft ([`MetaBackend::Raft`]).
+//! [`NativeEngine`] commit through Raft ([`MetaBackend::Raft`]); both transports support mutual TLS
+//! ([`tls`]).
 
 pub mod alloc;
 pub mod checksum;
@@ -23,6 +24,7 @@ pub mod placement;
 pub mod raft;
 pub mod raft_server;
 pub mod telemetry;
+pub mod tls;
 pub mod wal;
 
 pub use alloc::{FreeList, FreeRange};
@@ -35,3 +37,4 @@ pub use metadata::{Catalog, MetaCommand, SnapshotId, VolumeId};
 pub use placement::{FailureDomain, Node, PlacementPolicy};
 pub use raft::{Envelope, Message, RaftConfig, RaftCounters, RaftError, RaftNode, Role};
 pub use raft_server::{RaftServer, RaftStatus};
+pub use tls::TlsIdentity;

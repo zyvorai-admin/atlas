@@ -5,8 +5,10 @@
 //! [`RemoteDevice`] is the engine-side client, so replicas land on other hosts' disks.
 //!
 //! Wire format, both directions: a 4-byte big-endian header length, a JSON header, then the raw
-//! payload the header announces (write data in requests, read data in responses). There is no
-//! authentication or encryption; bind to a private storage network only.
+//! payload the header announces (write data in requests, read data in responses). Without TLS
+//! there is no authentication or encryption; bind to a private storage network only. With a
+//! [`TlsIdentity`] connections are mutual TLS against the cluster CA: clients must present a
+//! CA-signed certificate, and verify the node's certificate against its node id.
 //!
 //! Every write carries a fence (the writer's Raft term). The node durably records the highest
 //! fence it has accepted and rejects lower ones, so a deposed leader that has not noticed yet
@@ -26,6 +28,7 @@ use std::{
     time::Duration,
 };
 
+use rustls::{pki_types::ServerName, ClientConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -33,9 +36,11 @@ use crate::{
     durable,
     engine::NativeError,
     metrics::PromText,
+    tls::{self, Conn, TlsIdentity},
 };
 
 const MAX_HEADER: usize = 64 << 10;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest payload accepted in either direction.
 pub const MAX_PAYLOAD: u64 = 256 << 20;
 
@@ -68,12 +73,14 @@ struct Stats {
     errors: AtomicU64,
     bytes_written: AtomicU64,
     bytes_read: AtomicU64,
+    tls_handshake_failures: AtomicU64,
 }
 
 struct Shared {
     device: FileDevice,
     fence: Mutex<u64>,
     fence_path: PathBuf,
+    tls: Option<Arc<ServerConfig>>,
     stop: AtomicBool,
     stats: Stats,
     conns: Mutex<BTreeMap<u64, TcpStream>>,
@@ -124,13 +131,24 @@ pub struct DataNodeServer {
 }
 
 impl DataNodeServer {
-    /// Serves `root/nvme0.data` on an already-bound `listener`. The highest accepted fence is
-    /// kept in `root/fence`.
+    /// Serves `root/nvme0.data` on an already-bound `listener` without TLS. The highest
+    /// accepted fence is kept in `root/fence`.
     pub fn start(
         id: impl Into<String>,
         root: impl AsRef<Path>,
         listener: TcpListener,
     ) -> Result<Self, NativeError> {
+        Self::start_with(id, root, listener, None)
+    }
+
+    /// Like [`Self::start`], with mutual TLS when `tls` is set.
+    pub fn start_with(
+        id: impl Into<String>,
+        root: impl AsRef<Path>,
+        listener: TcpListener,
+        tls: Option<TlsIdentity>,
+    ) -> Result<Self, NativeError> {
+        let tls = tls.map(|t| t.server_config()).transpose()?;
         let root = root.as_ref();
         fs::create_dir_all(root)?;
         let device = FileDevice::open(root.join("nvme0.data"))?;
@@ -149,6 +167,7 @@ impl DataNodeServer {
             device,
             fence: Mutex::new(fence),
             fence_path,
+            tls,
             stop: AtomicBool::new(false),
             stats: Stats::default(),
             conns: Mutex::new(BTreeMap::new()),
@@ -217,6 +236,11 @@ impl DataNodeServer {
                 "atlas_native_data_read_bytes_total",
                 "Bytes read from the local device.",
                 &s.bytes_read,
+            ),
+            (
+                "atlas_native_data_tls_handshake_failures_total",
+                "Inbound TLS handshakes that failed.",
+                &s.tls_handshake_failures,
             ),
         ] {
             p.family(name, "counter", help)
@@ -287,7 +311,15 @@ fn accept_loop(listener: TcpListener, shared: &Arc<Shared>) {
                 }
                 let conn_shared = shared.clone();
                 let handle = thread::spawn(move || {
-                    serve(stream, &conn_shared);
+                    match Conn::accept(stream, conn_shared.tls.as_ref(), HANDSHAKE_TIMEOUT) {
+                        Ok(conn) => serve(conn, &conn_shared),
+                        Err(_) => {
+                            conn_shared
+                                .stats
+                                .tls_handshake_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if let Ok(mut conns) = conn_shared.conns.lock() {
                         conns.remove(&conn_id);
                     }
@@ -305,7 +337,7 @@ fn accept_loop(listener: TcpListener, shared: &Arc<Shared>) {
     }
 }
 
-fn serve(mut stream: TcpStream, sh: &Shared) {
+fn serve(mut stream: Conn, sh: &Shared) {
     while let Ok(req) = read_header::<Request>(&mut stream) {
         let result = match req {
             Request::Append { fence, len } => read_payload(&mut stream, len).and_then(|data| {
@@ -368,40 +400,62 @@ fn serve(mut stream: TcpStream, sh: &Shared) {
 }
 
 /// Client for a [`DataNodeServer`]. Keeps one connection open and reconnects on failure.
-#[derive(Debug)]
 pub struct RemoteDevice {
     addr: SocketAddr,
     timeout: Duration,
-    conn: Mutex<Option<TcpStream>>,
+    tls: Option<(Arc<ClientConfig>, ServerName<'static>)>,
+    conn: Mutex<Option<Conn>>,
+}
+
+impl std::fmt::Debug for RemoteDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteDevice")
+            .field("addr", &self.addr)
+            .field("tls", &self.tls.as_ref().map(|(_, n)| n))
+            .finish()
+    }
 }
 
 impl RemoteDevice {
-    /// `timeout` bounds connecting and each socket read or write.
+    /// Plaintext client. `timeout` bounds connecting, the handshake and each socket read or
+    /// write.
     pub fn new(addr: SocketAddr, timeout: Duration) -> Self {
         Self {
             addr,
             timeout,
+            tls: None,
             conn: Mutex::new(None),
         }
+    }
+
+    /// Mutual-TLS client that requires the data node's certificate to be valid for `node_id`.
+    pub fn with_tls(
+        addr: SocketAddr,
+        node_id: &str,
+        identity: &TlsIdentity,
+        timeout: Duration,
+    ) -> Result<Self, NativeError> {
+        Ok(Self {
+            addr,
+            timeout,
+            tls: Some((identity.client_config()?, tls::server_name(node_id)?)),
+            conn: Mutex::new(None),
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    fn connect(&self) -> io::Result<TcpStream> {
+    fn connect(&self) -> io::Result<Conn> {
         let s = TcpStream::connect_timeout(&self.addr, self.timeout)?;
         s.set_nodelay(true)?;
         s.set_read_timeout(Some(self.timeout))?;
         s.set_write_timeout(Some(self.timeout))?;
-        Ok(s)
+        Conn::connect(s, self.tls.as_ref().map(|(c, n)| (c, n.clone())))
     }
 
-    fn exchange(
-        s: &mut TcpStream,
-        req: &Request,
-        payload: &[u8],
-    ) -> io::Result<(Response, Vec<u8>)> {
+    fn exchange(s: &mut Conn, req: &Request, payload: &[u8]) -> io::Result<(Response, Vec<u8>)> {
         write_message(s, req, payload)?;
         let resp: Response = read_header(s)?;
         let data = match &resp {
@@ -498,7 +552,8 @@ fn write_message(w: &mut impl Write, header: &impl Serialize, payload: &[u8]) ->
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
     frame.extend_from_slice(&body);
     frame.extend_from_slice(payload);
-    w.write_all(&frame)
+    w.write_all(&frame)?;
+    w.flush()
 }
 
 fn read_header<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> io::Result<T> {

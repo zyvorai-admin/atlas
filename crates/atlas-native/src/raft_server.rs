@@ -5,9 +5,13 @@
 //! thread per peer keeps a connection open and drops messages while the peer is unreachable
 //! (Raft tolerates loss), and the listener accepts peer connections.
 //!
-//! Wire format: a 4-byte big-endian length followed by a JSON [`Envelope`]. There is no
-//! authentication or encryption; bind to a private metadata network only. Inbound envelopes are
+//! Wire format: a 4-byte big-endian length followed by a JSON [`Envelope`]. Inbound envelopes are
 //! dropped unless they come from a configured peer and are addressed to this node.
+//!
+//! Without TLS there is no authentication or encryption; bind to a private metadata network only.
+//! With a [`TlsIdentity`] every connection is mutual TLS against the cluster CA, a peer is dialled
+//! as its node id (which must be a DNS SAN on its certificate), and an inbound envelope's `from`
+//! must be a name the sending connection's client certificate is valid for.
 
 use std::{
     collections::BTreeMap,
@@ -22,10 +26,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rustls::{pki_types::ServerName, ClientConfig, ServerConfig};
+
 use crate::{
     metadata::{Catalog, MetaCommand},
     metrics::PromText,
     raft::{Envelope, NodeId, RaftConfig, RaftError, RaftNode, Role},
+    tls::{self, Conn, TlsIdentity},
 };
 
 const MAX_FRAME: usize = 256 << 20;
@@ -33,6 +40,7 @@ const PEER_QUEUE: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftStatus {
@@ -60,8 +68,11 @@ struct Shared {
     fatal: Mutex<Option<String>>,
     outbound: BTreeMap<NodeId, SyncSender<Envelope>>,
     peer_stats: BTreeMap<NodeId, Arc<PeerStats>>,
-    /// Inbound frames dropped for a wrong addressee or an unknown sender.
+    /// Inbound frames dropped for a wrong addressee, an unknown sender, or a sender the
+    /// connection's certificate does not vouch for.
     rejected_frames: AtomicU64,
+    tls_server: Option<Arc<ServerConfig>>,
+    tls_handshake_failures: Arc<AtomicU64>,
     /// Accepted connections, kept so shutdown can unblock their readers; removed on reader exit.
     conns: Mutex<BTreeMap<u64, TcpStream>>,
     next_conn: AtomicU64,
@@ -106,19 +117,42 @@ pub struct RaftServer {
 }
 
 impl RaftServer {
-    /// Starts serving `cfg` on an already-bound `listener`. `peers` maps every id in
-    /// `cfg.peers` to its address.
+    /// Starts serving `cfg` on an already-bound `listener` without TLS. `peers` maps every id
+    /// in `cfg.peers` to its address.
     pub fn start(
         cfg: RaftConfig,
         listener: TcpListener,
         peers: BTreeMap<NodeId, SocketAddr>,
         tick: Duration,
     ) -> Result<Self, RaftError> {
+        Self::start_with(cfg, listener, peers, tick, None)
+    }
+
+    /// Like [`Self::start`], with mutual TLS when `tls` is set. Node ids must then be DNS names.
+    pub fn start_with(
+        cfg: RaftConfig,
+        listener: TcpListener,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        tick: Duration,
+        tls: Option<TlsIdentity>,
+    ) -> Result<Self, RaftError> {
         for p in &cfg.peers {
             if !peers.contains_key(p) {
                 return Err(RaftError::Config(format!("no address for peer {p}")));
             }
         }
+        let (tls_server, tls_client) = match &tls {
+            Some(id) => (Some(id.server_config()?), Some(id.client_config()?)),
+            None => (None, None),
+        };
+        let mut peer_names = BTreeMap::new();
+        if tls.is_some() {
+            for p in cfg.peers.iter().chain([&cfg.id]) {
+                let name = tls::server_name(p).map_err(|e| RaftError::Config(e.to_string()))?;
+                peer_names.insert(p.clone(), name);
+            }
+        }
+        let tls_handshake_failures = Arc::new(AtomicU64::new(0));
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let node = RaftNode::open(cfg.clone())?;
@@ -132,10 +166,14 @@ impl RaftServer {
             outbound.insert(p.clone(), tx);
             let stats = Arc::new(PeerStats::default());
             peer_stats.insert(p.clone(), stats.clone());
-            let peer_addr = peers[p];
+            let target = PeerTarget {
+                addr: peers[p],
+                tls: tls_client.clone().zip(peer_names.get(p).cloned()),
+                handshake_failures: tls_handshake_failures.clone(),
+            };
             let stop = stop.clone();
             threads.push(thread::spawn(move || {
-                peer_sender(peer_addr, rx, &stop, &stats)
+                peer_sender(&target, rx, &stop, &stats)
             }));
         }
 
@@ -147,6 +185,8 @@ impl RaftServer {
             outbound,
             peer_stats,
             rejected_frames: AtomicU64::new(0),
+            tls_server,
+            tls_handshake_failures,
             conns: Mutex::new(BTreeMap::new()),
             next_conn: AtomicU64::new(0),
             readers: Mutex::new(Vec::new()),
@@ -385,6 +425,16 @@ impl RaftServer {
             &node,
             self.shared.rejected_frames.load(Ordering::Relaxed),
         );
+        p.family(
+            "atlas_native_transport_tls_handshake_failures_total",
+            "counter",
+            "Inbound and outbound TLS handshakes that failed.",
+        )
+        .sample(
+            "atlas_native_transport_tls_handshake_failures_total",
+            &node,
+            self.shared.tls_handshake_failures.load(Ordering::Relaxed),
+        );
         Ok(p.finish())
     }
 
@@ -528,13 +578,29 @@ fn accept_loop(
                 let peers = peers.to_vec();
                 let reader_shared = shared.clone();
                 let handle = thread::spawn(move || {
-                    read_loop(
-                        stream,
-                        &inbound,
-                        &id,
-                        &peers,
-                        &reader_shared.rejected_frames,
-                    );
+                    match Conn::accept(stream, reader_shared.tls_server.as_ref(), HANDSHAKE_TIMEOUT)
+                    {
+                        Ok(conn) => {
+                            // A TLS sender may only speak for the peers its certificate names.
+                            let allowed: Vec<NodeId> = if conn.is_tls() {
+                                conn.peer_names(&peers).into_iter().cloned().collect()
+                            } else {
+                                peers
+                            };
+                            read_loop(
+                                conn,
+                                &inbound,
+                                &id,
+                                &allowed,
+                                &reader_shared.rejected_frames,
+                            );
+                        }
+                        Err(_) => {
+                            reader_shared
+                                .tls_handshake_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if let Ok(mut conns) = reader_shared.conns.lock() {
                         conns.remove(&conn_id);
                     }
@@ -553,7 +619,7 @@ fn accept_loop(
 }
 
 fn read_loop(
-    mut stream: TcpStream,
+    mut stream: Conn,
     inbound: &Sender<Envelope>,
     id: &str,
     peers: &[NodeId],
@@ -570,8 +636,28 @@ fn read_loop(
     }
 }
 
-fn peer_sender(addr: SocketAddr, rx: Receiver<Envelope>, stop: &AtomicBool, stats: &PeerStats) {
-    let mut conn: Option<TcpStream> = None;
+struct PeerTarget {
+    addr: SocketAddr,
+    tls: Option<(Arc<ClientConfig>, ServerName<'static>)>,
+    handshake_failures: Arc<AtomicU64>,
+}
+
+impl PeerTarget {
+    fn connect(&self) -> io::Result<Conn> {
+        let s = TcpStream::connect_timeout(&self.addr, CONNECT_TIMEOUT)?;
+        s.set_nodelay(true)?;
+        s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let conn = Conn::connect(s, self.tls.as_ref().map(|(c, n)| (c, n.clone())));
+        if conn.is_err() && self.tls.is_some() {
+            self.handshake_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        conn
+    }
+}
+
+fn peer_sender(target: &PeerTarget, rx: Receiver<Envelope>, stop: &AtomicBool, stats: &PeerStats) {
+    let mut conn: Option<Conn> = None;
     let mut last_failure: Option<Instant> = None;
     loop {
         let env = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -588,13 +674,7 @@ fn peer_sender(addr: SocketAddr, rx: Receiver<Envelope>, stop: &AtomicBool, stat
             return;
         }
         if conn.is_none() && last_failure.is_none_or(|t| t.elapsed() >= RECONNECT_BACKOFF) {
-            conn = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-                .and_then(|s| {
-                    s.set_nodelay(true)?;
-                    s.set_write_timeout(Some(WRITE_TIMEOUT))?;
-                    Ok(s)
-                })
-                .ok();
+            conn = target.connect().ok();
             if conn.is_none() {
                 stats.connect_failures.fetch_add(1, Ordering::Relaxed);
                 last_failure = Some(Instant::now());
@@ -628,7 +708,8 @@ fn write_frame(w: &mut impl Write, env: &Envelope) -> io::Result<()> {
     let mut frame = Vec::with_capacity(4 + body.len());
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
     frame.extend_from_slice(&body);
-    w.write_all(&frame)
+    w.write_all(&frame)?;
+    w.flush()
 }
 
 fn read_frame(r: &mut impl Read) -> io::Result<Envelope> {

@@ -308,8 +308,17 @@ fn raft_engines_share_data_nodes_across_leader_failover() {
 
     // Overwrite and GC on the new leader reuse space freed by the old one.
     g.on_leader(|e| e.write(&v, 0, &[9u8; 4096]));
-    let (_, st) = g.on_leader(|e| e.gc_once());
-    assert_eq!(st.reclaimed, 1);
+    // A retry after `LeadershipLost` can commit a write twice or split a GC pass across leaders,
+    // so count reclaims until nothing is left rather than expecting exactly one pass.
+    let mut reclaimed = 0;
+    loop {
+        let (_, st) = g.on_leader(|e| e.gc_once());
+        reclaimed += st.reclaimed;
+        if st.candidates == 0 {
+            break;
+        }
+    }
+    assert!(reclaimed >= 1, "the overwritten extent was never reclaimed");
     for id in g.live().map(|(id, _)| id.clone()).collect::<Vec<_>>() {
         g.wait_readable(&id, &v, 0, &[9u8; 4096]);
         g.wait_readable(&id, &v, 4096, &[8u8; 4096]);

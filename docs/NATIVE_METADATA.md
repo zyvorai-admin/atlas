@@ -98,7 +98,8 @@ standard library:
 - a storage error inside the node (e.g. a failed fsync) stops the server and is reported by
   `fatal_error()`; it never keeps serving on a state it could not persist.
 
-The transport has **no authentication or encryption**. Bind it to a private metadata network only.
+Started without a `TlsIdentity` the transport has **no authentication or encryption**; bind it to a
+private metadata network only, or enable mutual TLS (below).
 
 `tests/raft_tcp.rs` runs a real 3-server cluster over localhost: election and replication, follower
 redirect, and leader shutdown, failover and rejoin from disk.
@@ -140,7 +141,7 @@ The engine writes replicas through the `BlockStore` trait: `FileDevice` for loca
 - one thread per connection; `RemoteDevice` keeps one connection open, bounds every connect, read
   and write with a timeout, and retries once on a fresh connection if a reused one fails (a retried
   append can leave an unreferenced copy, the same leak as a crash between data write and commit);
-- the transport has **no authentication or encryption**, same as Raft.
+- without a `TlsIdentity` the transport has **no authentication or encryption**, same as Raft.
 
 **Write fencing.** Every `append`/`write_at` carries a fence: the writer's Raft term. The node
 durably records (`root/fence`, atomic rewrite) the highest fence it has accepted and rejects lower
@@ -177,9 +178,33 @@ engine on remote data nodes losing one, and three Raft-backed engines sharing th
 through a leader failover, followed by an overwrite and GC on the new leader that reuse space freed
 under the old one. A write with the old leader's term is then fenced.
 
+### Mutual TLS (`tls` module)
+
+Both transports take an optional `TlsIdentity` (`RaftServer::start_with`,
+`DataNodeServer::start_with`, `RemoteDevice::with_tls`), built from PEM: the cluster CA bundle,
+the node's certificate chain and its private key. With it every connection is mutual TLS (rustls,
+explicit `ring` provider, TLS 1.2/1.3) and both sides verify the other against the cluster CA:
+
+- each node's certificate carries its node id as a DNS SAN, so node ids must be valid DNS names;
+- a Raft peer is dialled as its node id, and an inbound envelope is accepted only if its `from` is a
+  configured peer **and** a name the connection's client certificate is valid for, so a node can
+  only speak for the identity its certificate names;
+- a `RemoteDevice` verifies the data node's certificate against the expected node id; a data node
+  accepts any client certificate signed by the cluster CA (it does not yet restrict which clients);
+- handshakes are bounded by a 5 s timeout and counted in
+  `atlas_native_transport_tls_handshake_failures_total` / `atlas_native_data_tls_handshake_failures_total`.
+
+Without an identity both transports stay plaintext, as before. There is no certificate rotation
+without restarting the server, and no revocation (CRL/OCSP) checking.
+
+`tests/tls.rs` runs an mTLS Raft cluster, isolates a peer holding a CA-signed certificate for another
+node's name (frames rejected, never dialled successfully) and a peer from a different CA (handshake
+failures), checks the data node refuses plaintext, wrong-name and rogue-CA clients, and runs
+Raft-backed engines writing to TLS data nodes.
+
 Not implemented yet:
 
-- transport TLS / mutual auth (Raft and data nodes);
+- per-client authorization on data nodes, certificate hot reload and revocation;
 - data-node health tracking (marking nodes down and re-placing writes);
 - membership changes: the voter set is fixed at open (quorum math already supports joint
   configurations);
@@ -201,7 +226,6 @@ Not implemented yet:
 
 ## Next phase
 
-- transport TLS / mutual auth;
 - data-node health tracking and re-placement;
 - a native node binary hosting `RaftServer` + `DataNodeServer` + `/metrics`;
 - joint-consensus membership changes;
