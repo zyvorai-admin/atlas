@@ -19,14 +19,18 @@ not the database engine.
 | MongoDB | `mongodb`, `mongo` | Percona Server for MongoDB (**document**) | homogeneous | `mongodb` driver (feature `mongodb`) |
 
 *Homogeneous* migrations (Postgres/MySQL/MariaDB/MongoDB) copy the data with a `dump→restore` full-load
-Job, then Debezium streams changes (`snapshot.mode=never`). *Heterogeneous* migrations (Oracle / SQL
+Job, then Debezium streams changes (`snapshot.mode=no_data`: schema only, no data snapshot). *Heterogeneous* migrations (Oracle / SQL
 Server → Postgres) have **no dump full-load**: Debezium's `initial` snapshot seeds the edge and the JDBC
-sink `auto.create`s the tables, then it streams (the standard cross-engine pattern). **MongoDB** is the
+sink creates the tables, then it streams (the standard cross-engine pattern). **MongoDB** is the
 one document engine — it lands on a Percona Server for MongoDB replica set (`rs0`, required for change
 streams), full-loads with `mongodump | mongorestore`, and uses the **MongoDB Kafka sink** (with the
 Debezium Mongo CDC handler) instead of the JDBC sink. Every engine runs the whole pipeline
 **fake-first** with no cloud creds; the real Oracle / SQL Server / MongoDB connectors are behind cargo
 features because they link a native client (OCI) / TLS stack / driver.
+
+An **Oracle** source's `database` is `CDB/PDB` for a multitenant database (e.g. `FREE/FREEPDB1`,
+`ORCLCDB/ORCLPDB1`): discovery connects to the PDB service, while Debezium's LogMiner connects to
+the CDB and captures the PDB. A bare name means a non-CDB database.
 
 > Positioning: *"Migrate managed cloud databases (RDS/Aurora, Cloud SQL, Azure SQL, on-prem Oracle)
 > to open engines running on Zyvor Edge, backed by Ceph — with continuous replication, validation,
@@ -45,8 +49,8 @@ Each stage is an async job (`202 + job id`, progress via `/jobs/{id}/watch`). Lo
 - **Edge runtime**: CloudNativePG (Postgres) / Percona XtraDB (MySQL) / Percona Server for MongoDB,
   data + WAL on the `zyvor-rbd-prod` Ceph RBD StorageClass.
 - **CDC**: Debezium on Strimzi/Kafka (cloud-neutral, reads WAL/binlog/redo/oplog — Postgres, MySQL,
-  MariaDB, Oracle LogMiner, SQL Server, MongoDB change streams) → Aiven JDBC sink (relational) or the
-  MongoDB Kafka sink (document) → edge DB.
+  MariaDB, Oracle LogMiner, SQL Server, MongoDB change streams) → Debezium JDBC sink (relational) or
+  the MongoDB Kafka sink (document) → edge DB.
 - **Cutover** is admin-guarded: plan `validated` + last validation `passed` + CDC `lag_seconds` under
   threshold; **rollback** only within the plan's rollback window. In real mode the cutover job leaves
   the record `draining`; the reconciler completes the switch once the CDC stream reports **zero** lag
@@ -167,7 +171,6 @@ State machine: `created → planning → copying → verifying → completed | f
 |---|---|---|
 | `ATLAS_DATABRIDGE_RECONCILE_SECS` | `15` | reconciler tick (edge CR readiness, full-load/validation Jobs, CDC health). `0` disables. |
 | `ATLAS_DATABRIDGE_CONNECT_IMAGE` | *(unset)* | Kafka Connect image bundling Debezium + a JDBC-sink plugin (see `deploy/databridge/connect/Dockerfile`). Required for real CDC. |
-| `ATLAS_DATABRIDGE_SINK_PK_FIELDS` | `id` | record-key PK column(s) the JDBC sink upserts on. |
 
 Source `driver_mode` (`fake`/`real`) is per-source, set at registration. Edge namespace is
 `zyvor-databridge`; edge storage class is `zyvor-rbd-prod`. Real CDC also expects a Strimzi Kafka named
@@ -265,8 +268,8 @@ connectors RUNNING and replicated a row to the edge with **zero manual patching*
 
 Real CDC is **health-tracked** by the reconciler: a streaming stream backed by a real Debezium
 `KafkaConnector` follows the connector's state (RUNNING → live, else → `error`); fake
-streams keep the synthesized lag drain. The sink `pk.fields` is configurable via
-`ATLAS_DATABRIDGE_SINK_PK_FIELDS` (default `id`). With the **`kafka-lag`** feature, a healthy real
+streams keep the synthesized lag drain. The JDBC sink upserts on every record-key column of each
+table, so no per-deployment primary-key setting is needed. With the **`kafka-lag`** feature, a healthy real
 stream also reports its **precise offset-lag** (∑ per-partition `high_watermark − committed_offset` of
 the sink consumer group `connect-<sink-connector>`) via an embedded Kafka client; without it, a healthy
 stream reports caught-up (0).
@@ -278,7 +281,7 @@ stream reports caught-up (0).
   full-load (`pg_dump|psql` / `mysqldump|mysql` batch Jobs, reconciler-watched) → **CDC** (Strimzi
   `KafkaConnect` + Debezium source + JDBC-sink connectors, live source→edge replication) → validate
   (row-count-compare Job) → cutover (guarded) → rollback.
-- Real CDC is **health-tracked** by the reconciler; the JDBC sink `pk.fields` is configurable.
+- Real CDC is **health-tracked** by the reconciler; the JDBC sink keys on each table's own primary key.
 - **Engine coverage**: all six source engines (Postgres, MySQL, MariaDB, Oracle, SQL Server, MongoDB)
   run the full pipeline; the fake path for every engine is exercised end-to-end (discover→…→cutover).
   Real Postgres/MySQL/MariaDB connectors are default; real SQL Server (`tiberius`), Oracle (`oracle`/OCI)
@@ -330,8 +333,8 @@ stream reports caught-up (0).
   (`edge-…-haproxy.zyvor-databridge.svc:3306`).
 - **MongoDB real CDC + cutover — verified live** (2026-09-01, `212.8.248.187`): gateway rebuilt with
   `atlas-databridge/mongodb` (+ kafka-lag), PSMDB edge, `mongodump|mongorestore` full-load, Debezium
-  Mongo source (`snapshot.mode=no_data` — 3.x rejects `never`) + Mongo Kafka sink (topics.regex must
-  match both Debezium topic and post-RegexRouter collection name), validate → cutover_complete.
+  Mongo source (`snapshot.mode=no_data` — 3.x rejects `never`) + Mongo Kafka sink, validate →
+  cutover_complete. (Its sink routing and CDC handler were replaced on 2026-10-03, see below.)
   Also corrected PSMDB users Secret name to `internal-<cluster>-users` (operator 1.16+).
 - **MySQL real CDC — verified live end-to-end for DATETIME columns** (2026-08-25/26,
   `<ephemeral-ip>`): full-load re-verified end-to-end against a real Percona edge (3 customer
@@ -385,8 +388,43 @@ stream reports caught-up (0).
     source + Debezium JDBC sink in the `deploy/databridge/connect` image, KRaft Kafka, MySQL 8.4
     edge, all in podman): for both a **MySQL 8.4** and a **MariaDB 11.4** source, `TIMESTAMP`
     columns (`DEFAULT CURRENT_TIMESTAMP` and explicit values), `DATETIME`, an update, a delete
-    and a composite-key table all landed on the edge identical to the source. Postgres edges keep
-    the Aiven sink.
+    and a composite-key table all landed on the edge identical to the source. Postgres edges
+    moved to the same sink afterwards (next item).
+- **Every engine on Debezium 3.7 + the Debezium JDBC sink — verified (2026-10-03,
+  `212.8.248.187`)**, with the exact connector configs DataBridge generates, in standalone podman
+  (KRaft Kafka + the `deploy/databridge/connect` image + real source and edge databases; the shared
+  k3s cluster was left alone). Each run seeded rows, then applied an insert, an update and a delete
+  on the source and compared source and edge:
+  - **SQL Server 2022 → Postgres 16** and **Oracle 26ai Free → Postgres 16** (heterogeneous): the
+    Debezium `initial` snapshot created and seeded the edge table, then the changes streamed.
+  - **Postgres 16 → Postgres 16**, **MySQL 8.4 / MariaDB 11.4 → MySQL 8.4** (homogeneous, edge
+    pre-seeded like the full-load leaves it, `snapshot.mode=no_data`), including composite keys
+    and MySQL `TIMESTAMP` columns.
+  - **MongoDB 7 → MongoDB 7** (replica sets, `no_data`).
+
+  What it took:
+  1. **Debezium 3.3 → 3.7** in the Connect image. 3.3's Oracle connector looks the version up with
+     `BANNER_FULL LIKE 'Oracle Database%'`; the 26ai banner reads "Oracle AI Database 26ai", so
+     validation failed with `Failed to resolve Oracle database version`. 3.7 reads it from JDBC
+     metadata. 3.7 also **removed `snapshot.mode=never`**, so homogeneous relational sources now
+     use `no_data` (schema only), as MongoDB already did.
+  2. **Postgres edges use the Debezium JDBC sink** too. The Aiven sink needs one `pk.fields` for
+     every table of a connector (it rejects an empty value) and, as configured, left deleted rows on
+     the edge; the Debezium sink
+     keys each table on its own record key, applies deletes, and creates the heterogeneous edge
+     tables (`schema.evolution=basic`). `ATLAS_DATABRIDGE_SINK_PK_FIELDS` is gone.
+  3. **Topics route to their last segment**: SQL Server topics are `<prefix>.<db>.<schema>.<table>`,
+     and keeping everything after the prefix's first segment made rows target a `dbo.customers`
+     table (`schema "dbo" does not exist`).
+  4. **Oracle sources name the container database**: Debezium connects to the CDB
+     (`database.dbname`) and captures the PDB (`database.pdb.name`); the source's `database` is
+     now `CDB/PDB` (e.g. `FREE/FREEPDB1`), a bare name meaning a non-CDB. It used to send the PDB
+     as both.
+  5. **Mongo sink**: the `ChangeStreamHandler` (DataBridge captures change streams; the
+     `MongoDbHandler` it used is for the removed oplog mode and failed every update with "Update
+     document missing `patch` field"), and the target collection now comes from each event's
+     `source.collection` instead of a RegexRouter, whose bare-name `topics.regex` alternative also
+     subscribed Connect's own config/offset/status topics and killed the task.
 
   With the column altered to `DATETIME` and the poisoned offset advanced, a fresh row
   (`'Jack CDC Datetime Fixed'`) was confirmed **physically present on the edge PXC**, proving
@@ -403,8 +441,8 @@ stream reports caught-up (0).
 | MySQL | **live** | **live** | **live** | **live** (incl. TIMESTAMP columns via the Debezium JDBC sink, see note) | pending |
 | MariaDB | **live** | **live** | **live** | **live** | **live** |
 | MongoDB | **live** | **live** | **live** | **live** | **live** |
-| SQL Server | **live** | via Debezium `initial` | advisory | pending | pending |
-| Oracle | **live** | via Debezium `initial` | advisory | pending | pending |
+| SQL Server | **live** | via Debezium `initial` | advisory | **live** (podman, see note) | pending |
+| Oracle | **live** | via Debezium `initial` | advisory | **live** (26ai, podman, see note) | pending |
 
 Fake path covers **all six** engines discover→cutover in CI (`tests/databridge_engines.rs`).
 
@@ -416,11 +454,17 @@ Fake path covers **all six** engines discover→cutover in CI (`tests/databridge
 - **Follow-ups (verify on live infra)**: **MySQL cutover** through the in-cluster pipeline (CDC,
   including TIMESTAMP columns, is verified; the lab host currently has no Ceph/Percona/Strimzi
   stack to run the full gateway pipeline). Postgres, MariaDB, and MongoDB are verified
-  through live cutover.
+  through live cutover. SQL Server / Oracle CDC is verified with the generated connectors in podman,
+  not yet through the in-cluster gateway pipeline.
+- **Known limitation — writes during the full-load**: homogeneous relational CDC starts after the
+  dump→restore, from the source's current WAL/binlog position (`no_data`), so a write made between
+  the dump and `cdc/start` reaches the edge only if the row changes again. `validate`'s row-count
+  compare reports the drift; quiesce writes during the full-load until CDC starts first.
 - **CDC Connect image — multi-engine** (`deploy/databridge/connect/Dockerfile`): one Strimzi-based
   image bundles Debezium PostgreSQL + MySQL + **MariaDB** + MongoDB + Oracle + SQL Server source
-  connectors, the Aiven JDBC sink (Postgres/MySQL/SQL Server/Oracle drivers; used for Postgres
-  edges), the Debezium JDBC sink (MySQL/MariaDB edges), and the MongoDB Kafka sink. `start_cdc` in real mode **refuses** without `ATLAS_DATABRIDGE_CONNECT_IMAGE` set. Lab Kafka
+  connectors (Debezium 3.7), the Debezium JDBC sink (every relational edge; ships its own drivers),
+  the MongoDB Kafka sink, and the Aiven JDBC sink for sink connectors created by earlier releases
+  (a re-apply moves them to the Debezium sink). `start_cdc` in real mode **refuses** without `ATLAS_DATABRIDGE_CONNECT_IMAGE` set. Lab Kafka
   CR: `deploy/databridge/10-kafka.yaml` (applied by `up.sh`). `up.sh` also installs the Percona
   Server for MongoDB operator for document-edge targets.
 

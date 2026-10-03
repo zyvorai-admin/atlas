@@ -17,7 +17,7 @@ pub struct OracleSourceConnector {
     source_id: String,
     host: String,
     port: i64,
-    /// Oracle service name (mapped from the source's `database`).
+    /// Oracle service name: the PDB of a `CDB/PDB` source `database`, else the whole value.
     service: String,
     user: String,
     password: String,

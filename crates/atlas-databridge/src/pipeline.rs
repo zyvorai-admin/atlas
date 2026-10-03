@@ -1013,10 +1013,9 @@ pub async fn rollback(pool: &AnyPool, plan_id: &str) -> Result<serde_json::Value
     Ok(serde_json::json!({ "plan_id": plan.id, "state": "rolled_back" }))
 }
 
-/// The sink connector applying the CDC topics to the edge. Postgres edges use the Aiven JDBC sink
-/// (with auto.create for heterogeneous sources); MySQL-family edges use the Debezium JDBC sink
-/// (TIMESTAMP columns arrive as Debezium ZonedTimestamp, which only it binds); MongoDB uses the
-/// MongoDB Kafka sink into the edge PSMDB replica set.
+/// The sink connector applying the CDC topics to the edge: the Debezium JDBC sink for the
+/// relational edges (CNPG Postgres, Percona XtraDB), the MongoDB Kafka sink into the edge PSMDB
+/// replica set for MongoDB.
 fn sink_spec_for(
     kind: crate::SourceKind,
     short: &str,
@@ -1027,21 +1026,15 @@ fn sink_spec_for(
 ) -> serde_json::Value {
     let edge_db = if kind.homogeneous() { db } else { "appdb" };
     match kind.edge_operator() {
-        crate::connector::EdgeOperator::Cnpg => {
-            let pk_fields =
-                std::env::var("ATLAS_DATABRIDGE_SINK_PK_FIELDS").unwrap_or_else(|_| "id".into());
-            crate::cr::streaming::jdbc_sink_spec(
-                short,
-                &format!("jdbc:postgresql://{cr_name}-rw.{ns}.svc:5432/{edge_db}"),
-                ns,
-                edge_secret,
-                "app",
-                "password",
-                &pk_fields,
-                !kind.homogeneous(),
-            )
-        }
-        crate::connector::EdgeOperator::Percona => crate::cr::streaming::debezium_jdbc_sink_spec(
+        crate::connector::EdgeOperator::Cnpg => crate::cr::streaming::jdbc_sink_spec(
+            short,
+            &format!("jdbc:postgresql://{cr_name}-rw.{ns}.svc:5432/{edge_db}"),
+            ns,
+            edge_secret,
+            "app",
+            "password",
+        ),
+        crate::connector::EdgeOperator::Percona => crate::cr::streaming::jdbc_sink_spec(
             short,
             &format!("jdbc:mysql://{cr_name}-haproxy.{ns}.svc:3306/{edge_db}"),
             ns,
