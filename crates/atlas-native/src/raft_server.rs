@@ -31,7 +31,7 @@ use rustls::{pki_types::ServerName, ClientConfig, ServerConfig};
 use crate::{
     metadata::{Catalog, MetaCommand},
     metrics::PromText,
-    raft::{Envelope, NodeId, RaftConfig, RaftError, RaftNode, Role},
+    raft::{Envelope, Message, NodeId, RaftConfig, RaftError, RaftNode, Role},
     tls::{self, Conn, TlsIdentity},
 };
 
@@ -59,6 +59,59 @@ struct PeerStats {
     /// Messages dropped because the peer's send queue was full.
     dropped: AtomicU64,
     sent: AtomicU64,
+    /// Connections dropped as leading nowhere (see [`PeerLiveness`]).
+    stale_reconnects: AtomicU64,
+}
+
+/// Detects outbound connections that lead nowhere. A peer that vanishes without closing its
+/// sockets (a deleted pod, a host that lost power) leaves a connection whose writes keep
+/// succeeding into the kernel buffer for many minutes, while its replacement at the same name
+/// may already be talking to us over its own connection. A sender drops its connection when
+///
+/// - it is sending a request and the peer has not answered anything for `stale_after` (every
+///   Raft request gets a response, even a rejection), or
+/// - the peer reconnected to us (any inbound connection after its first) at least `stale_after`
+///   after ours was established, i.e. it restarted (this also covers a node that only ever sends
+///   responses to that peer). Its first connection is ignored: peers starting a few seconds
+///   apart is not a restart.
+///
+/// The `stale_after` gap keeps two senders from endlessly resetting each other.
+struct PeerLiveness {
+    epoch: Instant,
+    last_response_ms: AtomicU64,
+    inbound_conns: AtomicU64,
+    last_reconnect_ms: AtomicU64,
+    stale_after: Duration,
+}
+
+impl PeerLiveness {
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    fn responded(&self) {
+        self.last_response_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    fn inbound_connected(&self) {
+        if self.inbound_conns.fetch_add(1, Ordering::Relaxed) > 0 {
+            self.last_reconnect_ms
+                .store(self.now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a connection established at `connected_ms` should be dropped before sending `msg`.
+    fn is_stale(&self, connected_ms: u64, msg: &Message) -> bool {
+        let stale = self.stale_after.as_millis() as u64;
+        let now = self.now_ms();
+        let unanswered = !msg.is_response()
+            && now.saturating_sub(connected_ms) >= stale
+            && now.saturating_sub(self.last_response_ms.load(Ordering::Relaxed)) >= stale;
+        let peer_reconnected =
+            self.last_reconnect_ms.load(Ordering::Relaxed) >= connected_ms + stale;
+        unanswered || peer_reconnected
+    }
 }
 
 struct Shared {
@@ -68,6 +121,7 @@ struct Shared {
     fatal: Mutex<Option<String>>,
     outbound: BTreeMap<NodeId, SyncSender<Envelope>>,
     peer_stats: BTreeMap<NodeId, Arc<PeerStats>>,
+    liveness: BTreeMap<NodeId, Arc<PeerLiveness>>,
     /// Inbound frames dropped for a wrong addressee, an unknown sender, or a sender the
     /// connection's certificate does not vouch for.
     rejected_frames: AtomicU64,
@@ -162,11 +216,22 @@ impl RaftServer {
         let mut threads = Vec::new();
         let mut outbound = BTreeMap::new();
         let mut peer_stats = BTreeMap::new();
+        let mut liveness = BTreeMap::new();
+        let epoch = Instant::now();
+        let stale_after = (tick * 40).max(Duration::from_secs(1));
         for p in &cfg.peers {
             let (tx, rx) = mpsc::sync_channel(PEER_QUEUE);
             outbound.insert(p.clone(), tx);
             let stats = Arc::new(PeerStats::default());
             peer_stats.insert(p.clone(), stats.clone());
+            let live = Arc::new(PeerLiveness {
+                epoch,
+                last_response_ms: AtomicU64::new(0),
+                inbound_conns: AtomicU64::new(0),
+                last_reconnect_ms: AtomicU64::new(0),
+                stale_after,
+            });
+            liveness.insert(p.clone(), live.clone());
             let target = PeerTarget {
                 target: peers[p].to_string(),
                 tls: tls_client.clone().zip(peer_names.get(p).cloned()),
@@ -174,7 +239,7 @@ impl RaftServer {
             };
             let stop = stop.clone();
             threads.push(thread::spawn(move || {
-                peer_sender(&target, rx, &stop, &stats)
+                peer_sender(&target, rx, &stop, &stats, &live)
             }));
         }
 
@@ -185,6 +250,7 @@ impl RaftServer {
             fatal: Mutex::new(None),
             outbound,
             peer_stats,
+            liveness,
             rejected_frames: AtomicU64::new(0),
             tls_server,
             tls_handshake_failures,
@@ -402,6 +468,11 @@ impl RaftServer {
                 |s| s.write_failures.load(Ordering::Relaxed),
             ),
             (
+                "atlas_native_transport_stale_reconnects_total",
+                "Connections re-established because the peer had stopped answering.",
+                |s| s.stale_reconnects.load(Ordering::Relaxed),
+            ),
+            (
                 "atlas_native_transport_dropped_total",
                 "Messages dropped while the peer was unreachable or its queue was full.",
                 |s| s.dropped.load(Ordering::Relaxed),
@@ -534,6 +605,11 @@ fn drive(shared: &Shared, inbound: Receiver<Envelope>, tick: Duration) {
         };
         let mut result = Ok(());
         for env in first.into_iter().chain(inbound.try_iter()) {
+            if env.msg.is_response() {
+                if let Some(l) = shared.liveness.get(&env.from) {
+                    l.responded();
+                }
+            }
             result = result.and_then(|_| node.step(env));
         }
         if Instant::now() >= next_tick {
@@ -588,13 +664,7 @@ fn accept_loop(
                             } else {
                                 peers
                             };
-                            read_loop(
-                                conn,
-                                &inbound,
-                                &id,
-                                &allowed,
-                                &reader_shared.rejected_frames,
-                            );
+                            read_loop(conn, &inbound, &id, &allowed, &reader_shared);
                         }
                         Err(_) => {
                             reader_shared
@@ -624,12 +694,18 @@ fn read_loop(
     inbound: &Sender<Envelope>,
     id: &str,
     peers: &[NodeId],
-    rejected: &AtomicU64,
+    shared: &Shared,
 ) {
+    let mut seen = std::collections::BTreeSet::new();
     while let Ok(env) = read_frame(&mut stream) {
         if env.to != id || !peers.contains(&env.from) {
-            rejected.fetch_add(1, Ordering::Relaxed);
+            shared.rejected_frames.fetch_add(1, Ordering::Relaxed);
             continue;
+        }
+        if seen.insert(env.from.clone()) {
+            if let Some(l) = shared.liveness.get(&env.from) {
+                l.inbound_connected();
+            }
         }
         if inbound.send(env).is_err() {
             return;
@@ -657,8 +733,15 @@ impl PeerTarget {
     }
 }
 
-fn peer_sender(target: &PeerTarget, rx: Receiver<Envelope>, stop: &AtomicBool, stats: &PeerStats) {
+fn peer_sender(
+    target: &PeerTarget,
+    rx: Receiver<Envelope>,
+    stop: &AtomicBool,
+    stats: &PeerStats,
+    live: &PeerLiveness,
+) {
     let mut conn: Option<Conn> = None;
+    let mut connected_ms = 0;
     let mut last_failure: Option<Instant> = None;
     loop {
         let env = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -674,11 +757,17 @@ fn peer_sender(target: &PeerTarget, rx: Receiver<Envelope>, stop: &AtomicBool, s
         if stop.load(Ordering::SeqCst) {
             return;
         }
+        if conn.is_some() && live.is_stale(connected_ms, &env.msg) {
+            stats.stale_reconnects.fetch_add(1, Ordering::Relaxed);
+            conn = None;
+        }
         if conn.is_none() && last_failure.is_none_or(|t| t.elapsed() >= RECONNECT_BACKOFF) {
             conn = target.connect().ok();
             if conn.is_none() {
                 stats.connect_failures.fetch_add(1, Ordering::Relaxed);
                 last_failure = Some(Instant::now());
+            } else {
+                connected_ms = live.now_ms();
             }
         }
         match conn.as_mut() {
