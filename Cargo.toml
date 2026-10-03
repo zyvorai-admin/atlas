@@ -91,6 +91,7 @@ ring = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 dotenvy = "0.15"
 # Same version reqwest's rustls backend already resolves to (Cargo.lock); used to eagerly validate a

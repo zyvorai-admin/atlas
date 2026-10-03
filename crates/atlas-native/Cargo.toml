@@ -13,3 +13,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 ring.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
