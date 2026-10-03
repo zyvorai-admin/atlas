@@ -838,6 +838,33 @@ mod tests {
         assert_eq!(back.from, "a");
         assert_eq!(back.msg.term(), 3);
 
+        let mut catalog = crate::metadata::Catalog::default();
+        catalog.volumes.insert(
+            "v".into(),
+            crate::metadata::VolumeMeta {
+                id: "v".into(),
+                name: "v".into(),
+                size_bytes: 8192,
+                extents: [(4096, "e1".to_string())].into(),
+            },
+        );
+        let snap = Envelope {
+            from: "a".into(),
+            to: "b".into(),
+            msg: Message::InstallSnapshot {
+                term: 2,
+                snapshot: Box::new(catalog),
+            },
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &snap).unwrap();
+        let Message::InstallSnapshot { snapshot, .. } =
+            read_frame(&mut buf.as_slice()).unwrap().msg
+        else {
+            panic!("not a snapshot");
+        };
+        assert_eq!(snapshot.volumes["v"].extents[&4096], "e1");
+
         let mut huge = ((MAX_FRAME + 1) as u32).to_be_bytes().to_vec();
         huge.extend_from_slice(b"{}");
         assert!(read_frame(&mut huge.as_slice()).is_err());
