@@ -2,31 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
-
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     checksum,
     device::FileDevice,
+    gc,
+    metadata::{Catalog, ExtentRef, MetaCommand, MetaError, ReplicaRef, SnapshotId, VolumeId},
     placement::{select_replicas, Node, PlacementPolicy},
     telemetry::NativeIoCounters,
+    wal::{Wal, WalError, WalRecord},
 };
-
-pub type VolumeId = String;
-pub type SnapshotId = String;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("metadata error: {0}")]
-    Metadata(#[from] serde_json::Error),
+    #[error("metadata json error: {0}")]
+    MetadataJson(#[from] serde_json::Error),
+    #[error("metadata state error: {0}")]
+    Metadata(#[from] MetaError),
+    #[error("wal error: {0}")]
+    Wal(#[from] WalError),
     #[error("resource not found: {0}")]
     NotFound(String),
     #[error("insufficient healthy replicas: need {needed}, found {found}")]
@@ -56,44 +57,6 @@ impl EngineConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReplicaRef {
-    node_id: String,
-    device_index: usize,
-    offset: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExtentRef {
-    id: String,
-    logical_offset: u64,
-    len: usize,
-    checksum: [u8; 32],
-    replicas: Vec<ReplicaRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct VolumeMeta {
-    id: VolumeId,
-    name: String,
-    size_bytes: u64,
-    extents: BTreeMap<u64, ExtentRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotMeta {
-    id: SnapshotId,
-    volume_id: VolumeId,
-    name: String,
-    extents: BTreeMap<u64, ExtentRef>,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct Catalog {
-    volumes: BTreeMap<VolumeId, VolumeMeta>,
-    snapshots: BTreeMap<SnapshotId, SnapshotMeta>,
-}
-
 #[derive(Debug)]
 struct NodeRuntime {
     spec: Node,
@@ -105,6 +68,7 @@ pub struct NativeEngine {
     cfg: EngineConfig,
     nodes: Vec<NodeRuntime>,
     catalog: RwLock<Catalog>,
+    wal: Mutex<Wal>,
     pub telemetry: NativeIoCounters,
 }
 
@@ -122,18 +86,28 @@ impl NativeEngine {
                 devices: vec![Arc::new(d)],
             });
         }
-        let catalog_path = cfg.root.join("catalog.json");
-        let catalog = if catalog_path.exists() {
-            serde_json::from_slice(&fs::read(&catalog_path)?)?
+
+        let snapshot_path = cfg.root.join("catalog.json");
+        let mut catalog: Catalog = if snapshot_path.exists() {
+            serde_json::from_slice(&fs::read(&snapshot_path)?)?
         } else {
             Catalog::default()
         };
-        Ok(Self {
+        let wal = Wal::open(cfg.root.join("wal"))?;
+        for rec in wal.replay::<MetaCommand>()? {
+            if rec.index > catalog.applied_index {
+                catalog.apply(rec.term, rec.index, &rec.command)?;
+            }
+        }
+        let engine = Self {
             cfg,
             nodes: runtimes,
             catalog: RwLock::new(catalog),
+            wal: Mutex::new(wal),
             telemetry: NativeIoCounters::default(),
-        })
+        };
+        engine.persist_catalog()?;
+        Ok(engine)
     }
 
     pub fn create_volume(
@@ -145,36 +119,36 @@ impl NativeEngine {
             return Err(NativeError::Invalid("volume size must be > 0".into()));
         }
         let id = Uuid::new_v4().to_string();
-        let mut c = self
-            .catalog
-            .write()
-            .map_err(|_| NativeError::Poisoned("catalog"))?;
-        c.volumes.insert(
-            id.clone(),
-            VolumeMeta {
-                id: id.clone(),
-                name: name.into(),
-                size_bytes,
-                extents: BTreeMap::new(),
-            },
-        );
-        self.persist(&c)?;
+        self.commit(MetaCommand::CreateVolume {
+            id: id.clone(),
+            name: name.into(),
+            size_bytes,
+        })?;
         Ok(id)
+    }
+
+    pub fn delete_volume(&self, volume_id: &str) -> Result<(), NativeError> {
+        self.commit(MetaCommand::DeleteVolume {
+            volume_id: volume_id.to_string(),
+        })?;
+        Ok(())
     }
 
     pub fn write(&self, volume_id: &str, offset: u64, data: &[u8]) -> Result<(), NativeError> {
         if data.is_empty() {
             return Ok(());
         }
-        let mut c = self
-            .catalog
-            .write()
-            .map_err(|_| NativeError::Poisoned("catalog"))?;
-        let vol = c
-            .volumes
-            .get_mut(volume_id)
-            .ok_or_else(|| NativeError::NotFound(volume_id.into()))?;
-        if offset.saturating_add(data.len() as u64) > vol.size_bytes {
+        let size = {
+            let c = self
+                .catalog
+                .read()
+                .map_err(|_| NativeError::Poisoned("catalog"))?;
+            c.volumes
+                .get(volume_id)
+                .ok_or_else(|| NativeError::NotFound(volume_id.into()))?
+                .size_bytes
+        };
+        if offset.saturating_add(data.len() as u64) > size {
             return Err(NativeError::Invalid("write exceeds volume size".into()));
         }
 
@@ -209,19 +183,20 @@ impl NativeEngine {
                     offset: off,
                 });
             }
-            vol.extents.insert(
-                logical,
-                ExtentRef {
-                    id: Uuid::new_v4().to_string(),
-                    logical_offset: logical,
-                    len: chunk.len(),
-                    checksum: checksum::sha256(chunk),
-                    replicas,
-                },
-            );
+            let extent = ExtentRef {
+                id: Uuid::new_v4().to_string(),
+                logical_offset: logical,
+                len: chunk.len(),
+                checksum: checksum::sha256(chunk),
+                replicas,
+            };
+            self.commit(MetaCommand::InstallExtent {
+                volume_id: volume_id.to_string(),
+                logical_offset: logical,
+                extent,
+            })?;
             self.telemetry.record_write(chunk.len());
         }
-        self.persist(&c)?;
         Ok(())
     }
 
@@ -234,7 +209,16 @@ impl NativeEngine {
             .volumes
             .get(volume_id)
             .ok_or_else(|| NativeError::NotFound(volume_id.into()))?;
-        self.read_map(&vol.extents, offset, len)
+        let eid = vol
+            .extents
+            .get(&offset)
+            .ok_or_else(|| NativeError::NotFound(format!("extent at {offset}")))?;
+        let ext = &c
+            .extents
+            .get(eid)
+            .ok_or_else(|| NativeError::NotFound(eid.clone()))?
+            .extent;
+        self.read_extent(ext, len)
     }
 
     pub fn create_snapshot(
@@ -242,27 +226,20 @@ impl NativeEngine {
         volume_id: &str,
         name: impl Into<String>,
     ) -> Result<SnapshotId, NativeError> {
-        let mut c = self
-            .catalog
-            .write()
-            .map_err(|_| NativeError::Poisoned("catalog"))?;
-        let vol = c
-            .volumes
-            .get(volume_id)
-            .ok_or_else(|| NativeError::NotFound(volume_id.into()))?
-            .clone();
         let id = Uuid::new_v4().to_string();
-        c.snapshots.insert(
-            id.clone(),
-            SnapshotMeta {
-                id: id.clone(),
-                volume_id: volume_id.into(),
-                name: name.into(),
-                extents: vol.extents,
-            },
-        );
-        self.persist(&c)?;
+        self.commit(MetaCommand::CreateSnapshot {
+            id: id.clone(),
+            volume_id: volume_id.to_string(),
+            name: name.into(),
+        })?;
         Ok(id)
+    }
+
+    pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), NativeError> {
+        self.commit(MetaCommand::DeleteSnapshot {
+            snapshot_id: snapshot_id.to_string(),
+        })?;
+        Ok(())
     }
 
     pub fn read_snapshot(
@@ -279,21 +256,74 @@ impl NativeEngine {
             .snapshots
             .get(snapshot_id)
             .ok_or_else(|| NativeError::NotFound(snapshot_id.into()))?;
-        self.read_map(&s.extents, offset, len)
-    }
-
-    fn read_map(
-        &self,
-        extents: &BTreeMap<u64, ExtentRef>,
-        offset: u64,
-        len: usize,
-    ) -> Result<Vec<u8>, NativeError> {
-        let ext = extents
+        let eid = s
+            .extents
             .get(&offset)
             .ok_or_else(|| NativeError::NotFound(format!("extent at {offset}")))?;
+        let ext = &c
+            .extents
+            .get(eid)
+            .ok_or_else(|| NativeError::NotFound(eid.clone()))?
+            .extent;
+        self.read_extent(ext, len)
+    }
+
+    pub fn gc_once(&self) -> Result<gc::GcStats, NativeError> {
+        let candidates = {
+            let c = self
+                .catalog
+                .read()
+                .map_err(|_| NativeError::Poisoned("catalog"))?;
+            gc::collect_candidates(&c)
+        };
+        let mut stats = gc::GcStats {
+            candidates: candidates.len() as u64,
+            reclaimed: 0,
+        };
+        // Phase 2 only reclaims metadata references. Device-space hole-punch/reuse comes in the
+        // allocator PR; append-only device files remain crash-simple for now.
+        for eid in candidates {
+            self.commit(MetaCommand::MarkExtentReclaimed { extent_id: eid })?;
+            stats.reclaimed += 1;
+        }
+        Ok(stats)
+    }
+
+    pub fn applied_index(&self) -> Result<u64, NativeError> {
+        Ok(self
+            .catalog
+            .read()
+            .map_err(|_| NativeError::Poisoned("catalog"))?
+            .applied_index)
+    }
+
+    fn commit(&self, command: MetaCommand) -> Result<Vec<String>, NativeError> {
+        let mut wal = self.wal.lock().map_err(|_| NativeError::Poisoned("wal"))?;
+        let mut c = self
+            .catalog
+            .write()
+            .map_err(|_| NativeError::Poisoned("catalog"))?;
+        let index = wal.last_index() + 1;
+        let term = c.current_term.max(1);
+        let rec = WalRecord {
+            term,
+            index,
+            command,
+        };
+        // A record that fails to apply must never reach the WAL, or every later replay fails on it.
+        // The WAL still reaches stable storage before the new state becomes visible.
+        let mut next = c.clone();
+        let gc = next.apply(term, index, &rec.command)?;
+        wal.append(&rec)?;
+        *c = next;
+        self.persist_locked(&c)?;
+        Ok(gc)
+    }
+
+    fn read_extent(&self, ext: &ExtentRef, len: usize) -> Result<Vec<u8>, NativeError> {
         if len > ext.len {
             return Err(NativeError::Invalid(
-                "cross-extent reads are not implemented in phase 1".into(),
+                "cross-extent reads are not implemented in phase 2".into(),
             ));
         }
         for (i, r) in ext.replicas.iter().enumerate() {
@@ -319,12 +349,26 @@ impl NativeEngine {
         Err(NativeError::Checksum(ext.id.clone()))
     }
 
-    fn persist(&self, catalog: &Catalog) -> Result<(), NativeError> {
+    fn persist_catalog(&self) -> Result<(), NativeError> {
+        let c = self
+            .catalog
+            .read()
+            .map_err(|_| NativeError::Poisoned("catalog"))?;
+        self.persist_locked(&c)
+    }
+
+    fn persist_locked(&self, catalog: &Catalog) -> Result<(), NativeError> {
         let tmp = self.cfg.root.join("catalog.json.tmp");
         let dst = self.cfg.root.join("catalog.json");
         let bytes = serde_json::to_vec_pretty(catalog)?;
         fs::write(&tmp, bytes)?;
-        fs::rename(tmp, dst)?;
+        let f = fs::OpenOptions::new().read(true).open(&tmp)?;
+        f.sync_all()?;
+        fs::rename(&tmp, &dst)?;
+        if let Some(parent) = dst.parent() {
+            let d = fs::File::open(parent)?;
+            d.sync_all()?;
+        }
         Ok(())
     }
 }
