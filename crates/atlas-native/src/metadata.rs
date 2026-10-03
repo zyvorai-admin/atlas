@@ -39,6 +39,10 @@ pub struct SnapshotMeta {
     pub id: SnapshotId,
     pub volume_id: VolumeId,
     pub name: String,
+    /// The volume's size when the snapshot was taken (0 in catalogs written before it was
+    /// recorded).
+    #[serde(default)]
+    pub size_bytes: u64,
     pub extents: BTreeMap<u64, ExtentId>,
 }
 
@@ -186,6 +190,7 @@ impl Catalog {
                         id: id.clone(),
                         volume_id: volume_id.clone(),
                         name: name.clone(),
+                        size_bytes: vol.size_bytes,
                         extents: vol.extents,
                     },
                 );

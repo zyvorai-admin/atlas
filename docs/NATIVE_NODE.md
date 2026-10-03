@@ -64,7 +64,7 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | --- | --- | --- |
 | `api_token_file` | none | Bearer token required on every `/v1/*` request. Without it `/v1/*` is open: keep `http_listen` on localhost or a private network. |
 | `tls` | none | Mutual TLS for the Raft and data-node transports (not the HTTP endpoint). Node ids must then be DNS names present as SANs on each node's certificate. |
-| `max_request_bytes` | 64 MiB | Larger HTTP bodies get 413. |
+| `max_request_bytes` | 64 MiB | Larger HTTP bodies and read lengths get 413. |
 | `metadata.replicas` | 3 | Between 1 and the number of `data_nodes`. |
 | `metadata.extent_bytes` | 4 MiB | Writes are split into extents of this size. |
 | `metadata.tick_ms` | 50 | Raft tick; elections take 10–20 ticks. |
@@ -85,11 +85,11 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `GET /v1/volumes` | yes | Volumes in the applied catalog. |
 | `POST /v1/volumes` | yes | `{"name": "...", "size_bytes": N}` → 201 `{"id": "..."}`. |
 | `DELETE /v1/volumes/{id}` | yes | 204. |
-| `PUT /v1/volumes/{id}/data?offset=N` | yes | Raw body written at `offset` (split into extents) → 204. |
-| `GET /v1/volumes/{id}/data?offset=N&len=M` | yes | Raw bytes. `offset` must be an extent start and `len` at most one extent. |
+| `PUT /v1/volumes/{id}/data?offset=N` | yes | Raw body written at any `offset` → 204. Extents sit on a fixed `extent_bytes` grid; a write covering part of an extent rewrites that extent with the old bytes merged in. |
+| `GET /v1/volumes/{id}/data?offset=N&len=M` | yes | Raw bytes from any range within the volume, across extents; never-written bytes read as zeros. `len` above `max_request_bytes` gets 413. |
 | `POST /v1/volumes/{id}/snapshots` | yes | `{"name": "..."}` → 201 `{"id": "..."}`. |
 | `DELETE /v1/snapshots/{id}` | yes | 204. |
-| `GET /v1/snapshots/{id}/data?offset=N&len=M` | yes | Raw bytes from the snapshot. |
+| `GET /v1/snapshots/{id}/data?offset=N&len=M` | yes | Same as the volume read, against the snapshot. |
 | `POST /v1/repair`, `POST /v1/gc` | yes | Run one pass now (leader only) and return its stats. |
 
 Errors are JSON `{"error": "...", "leader": ...}`. A mutation sent to a follower returns **421** with
@@ -152,6 +152,5 @@ repair after losing a data node, and config validation.
 
 - TLS or client-certificate auth on the HTTP endpoint (use a token plus a private network, or a
   TLS-terminating proxy);
-- cross-extent reads and unaligned I/O in the volume API;
 - Raft membership changes (the voter set is fixed by config);
 - a Helm chart and gateway integration (the raw manifest above is the only deployment).

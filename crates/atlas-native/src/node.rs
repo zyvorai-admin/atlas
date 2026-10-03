@@ -220,6 +220,8 @@ struct TaskStats {
 struct NodeShared {
     id: String,
     token: Option<String>,
+    /// Caps request bodies and read lengths alike.
+    max_io_bytes: usize,
     raft: Option<Arc<RaftServer>>,
     engine: Option<NativeEngine>,
     data: Mutex<Option<DataNodeServer>>,
@@ -347,6 +349,7 @@ impl NativeNode {
         let shared = Arc::new(NodeShared {
             id: cfg.node_id.clone(),
             token,
+            max_io_bytes: cfg.max_request_bytes,
             raft,
             engine,
             data: Mutex::new(data),
@@ -535,6 +538,18 @@ fn query_u64(req: &Request, key: &str) -> Result<u64, Response> {
         .ok_or_else(|| Response::text(400, format!("query parameter {key} (integer) is required")))
 }
 
+fn read_range(sh: &NodeShared, req: &Request) -> Result<(u64, usize), Response> {
+    let offset = query_u64(req, "offset")?;
+    let len = query_u64(req, "len")?;
+    if len > sh.max_io_bytes as u64 {
+        return Err(Response::text(
+            413,
+            format!("len exceeds {} bytes", sh.max_io_bytes),
+        ));
+    }
+    Ok((offset, len as usize))
+}
+
 fn body_json(req: &Request) -> Result<serde_json::Value, Response> {
     serde_json::from_slice(&req.body)
         .map_err(|e| Response::text(400, format!("invalid JSON body: {e}")))
@@ -588,9 +603,9 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
                 .map(|()| Response::text(204, ""))
         }
         ("GET", ["v1", "volumes", id, "data"]) => {
-            let (offset, len) = match (query_u64(&req, "offset"), query_u64(&req, "len")) {
-                (Ok(o), Ok(l)) => (o, l as usize),
-                (Err(r), _) | (_, Err(r)) => return r,
+            let (offset, len) = match read_range(sh, &req) {
+                Ok(r) => r,
+                Err(r) => return r,
             };
             e.read(id, offset, len).map(|b| Response::bytes(200, b))
         }
@@ -609,9 +624,9 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
             e.delete_snapshot(id).map(|()| Response::text(204, ""))
         }
         ("GET", ["v1", "snapshots", id, "data"]) => {
-            let (offset, len) = match (query_u64(&req, "offset"), query_u64(&req, "len")) {
-                (Ok(o), Ok(l)) => (o, l as usize),
-                (Err(r), _) | (_, Err(r)) => return r,
+            let (offset, len) = match read_range(sh, &req) {
+                Ok(r) => r,
+                Err(r) => return r,
             };
             e.read_snapshot(id, offset, len)
                 .map(|b| Response::bytes(200, b))

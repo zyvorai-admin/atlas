@@ -48,3 +48,80 @@ fn snapshot_is_copy_on_write_metadata() {
     assert_eq!(e.read_snapshot(&s, 0, 6).unwrap(), b"before");
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn small_extents(root: &std::path::Path) -> EngineConfig {
+    let mut c = EngineConfig::new(root);
+    c.extent_bytes = 16;
+    c
+}
+
+/// Byte-for-byte model of the volume: every write is checked against a plain buffer.
+#[test]
+fn unaligned_and_cross_extent_io_matches_a_flat_buffer() {
+    let root = test_root("unaligned");
+    let e = NativeEngine::open(small_extents(&root), nodes()).unwrap();
+    let size = 100u64;
+    let v = e.create_volume("v", size).unwrap();
+    let mut model = vec![0u8; size as usize];
+
+    assert_eq!(
+        e.read(&v, 0, size as usize).unwrap(),
+        model,
+        "unwritten reads zero"
+    );
+    let writes: &[(u64, usize, u8)] = &[
+        (5, 3, 1),   // inside one extent, nothing there yet
+        (0, 16, 2),  // whole extent over the partial one
+        (10, 30, 3), // spans three extents, partial at both ends
+        (47, 2, 4),  // straddles an extent boundary
+        (90, 10, 5), // last, short extent of the volume
+        (33, 1, 6),  // single byte inside an existing extent
+        (0, 100, 7), // everything
+        (31, 40, 8),
+    ];
+    for &(off, len, b) in writes {
+        e.write(&v, off, &vec![b; len]).unwrap();
+        model[off as usize..off as usize + len].fill(b);
+        assert_eq!(
+            e.read(&v, 0, size as usize).unwrap(),
+            model,
+            "after write at {off}"
+        );
+    }
+    for (off, len) in [(0, 1), (15, 2), (17, 50), (99, 1), (3, 97), (100, 0)] {
+        assert_eq!(
+            e.read(&v, off, len).unwrap(),
+            &model[off as usize..off as usize + len],
+            "read {off}+{len}"
+        );
+    }
+    assert!(e.read(&v, 90, 11).is_err(), "read past the end");
+    assert!(e.write(&v, 99, b"xy").is_err(), "write past the end");
+
+    let s = e.create_snapshot(&v, "s").unwrap();
+    e.write(&v, 20, &[9u8; 20]).unwrap();
+    assert_eq!(e.read_snapshot(&s, 0, size as usize).unwrap(), model);
+    assert!(e.read_snapshot(&s, 0, size as usize + 1).is_err());
+
+    // Every extent stays on the grid: one per 16-byte cell, none overlapping.
+    let extents = e.volumes().unwrap()[0].extents;
+    assert_eq!(extents, 7);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn partial_overwrite_survives_reopen() {
+    let root = test_root("partial-reopen");
+    let v = {
+        let e = NativeEngine::open(small_extents(&root), nodes()).unwrap();
+        let v = e.create_volume("v", 64).unwrap();
+        e.write(&v, 0, &[1u8; 64]).unwrap();
+        e.write(&v, 12, b"hello world").unwrap();
+        v
+    };
+    let e = NativeEngine::open(small_extents(&root), nodes()).unwrap();
+    let mut want = vec![1u8; 64];
+    want[12..23].copy_from_slice(b"hello world");
+    assert_eq!(e.read(&v, 0, 64).unwrap(), want);
+    let _ = std::fs::remove_dir_all(root);
+}

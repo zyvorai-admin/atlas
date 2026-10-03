@@ -297,6 +297,39 @@ fn http_api_round_trip_with_auth_and_leader_redirect() {
         .0,
         413
     );
+    assert_eq!(
+        api(
+            laddr,
+            "GET",
+            &format!("/v1/volumes/{v}/data?offset=0&len={}", 2 << 20),
+            b""
+        )
+        .0,
+        413
+    );
+    assert_eq!(
+        api(
+            laddr,
+            "GET",
+            &format!("/v1/volumes/{v}/data?offset=8000&len=193"),
+            b""
+        )
+        .0,
+        400,
+        "read past the end of the volume"
+    );
+
+    // Unaligned writes and reads that cross extent boundaries.
+    c.on_leader(
+        "PUT",
+        &format!("/v1/volumes/{v}/data?offset=4000"),
+        &[7u8; 200],
+        204,
+    );
+    let mut want = vec![1u8; 96];
+    want.extend_from_slice(&[7u8; 200]);
+    want.extend_from_slice(&[0u8; 4]);
+    c.wait_read(&format!("/v1/volumes/{v}/data?offset=3904&len=300"), &want);
 
     let (st, m) = http(laddr, "GET", "/metrics", None, b"");
     let m = String::from_utf8(m).unwrap();

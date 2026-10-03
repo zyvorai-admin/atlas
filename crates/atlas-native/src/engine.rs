@@ -282,61 +282,112 @@ impl NativeEngine {
             return Err(NativeError::Invalid("write exceeds volume size".into()));
         }
 
-        let needed = self.cfg.placement.replicas;
-        for (idx, chunk) in data.chunks(self.cfg.extent_bytes).enumerate() {
-            let logical = offset + (idx * self.cfg.extent_bytes) as u64;
-            let order = self.placement_order(chunk.len() as u64, |_| false);
-            if order.len() < needed {
-                return Err(NativeError::InsufficientReplicas {
-                    needed,
-                    found: order.len(),
-                });
-            }
-            // Walk the preference order so a node that fails is replaced by the next eligible one.
-            let mut replicas = Vec::new();
-            for node_id in order {
-                if replicas.len() == needed {
-                    break;
+        // Extents sit on a fixed grid (extent i covers [i*E, (i+1)*E)), so a write never leaves
+        // two extents covering the same bytes. A write that covers only part of an existing
+        // extent's bytes rewrites the whole extent with the old bytes merged in.
+        let grid = self.cfg.extent_bytes as u64;
+        let mut pos = offset;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let cell = pos - pos % grid;
+            let within = (pos - cell) as usize;
+            let n = rest.len().min(self.cfg.extent_bytes - within);
+            let (part, tail) = rest.split_at(n);
+            let existing = self.with_catalog(|c| {
+                c.volumes
+                    .get(volume_id)
+                    .and_then(|v| v.extents.get(&cell))
+                    .and_then(|id| c.extents.get(id))
+                    .map(|m| m.extent.clone())
+            })?;
+            let merged;
+            let content: &[u8] = match existing {
+                Some(ext) if within > 0 || n < ext.len => {
+                    let mut buf = self.read_extent(&ext)?;
+                    if buf.len() < within + n {
+                        buf.resize(within + n, 0);
+                    }
+                    buf[within..within + n].copy_from_slice(part);
+                    merged = buf;
+                    &merged
                 }
-                if let Some(r) = self.place_replica(&node_id, fence, chunk)? {
-                    replicas.push(r);
+                None if within > 0 => {
+                    let mut buf = vec![0u8; within + n];
+                    buf[within..].copy_from_slice(part);
+                    merged = buf;
+                    &merged
                 }
-            }
-            if replicas.len() < needed {
-                return Err(NativeError::InsufficientReplicas {
-                    needed,
-                    found: replicas.len(),
-                });
-            }
-            let extent = ExtentRef {
-                id: Uuid::new_v4().to_string(),
-                logical_offset: logical,
-                len: chunk.len(),
-                checksum: checksum::sha256(chunk),
-                replicas,
+                _ => part,
             };
-            self.commit(
-                MetaCommand::InstallExtent {
-                    volume_id: volume_id.to_string(),
-                    logical_offset: logical,
-                    extent,
-                },
-                Some(fence),
-            )?;
-            self.telemetry.record_write(chunk.len());
+            self.install_extent(volume_id, cell, content, fence)?;
+            pos += n as u64;
+            rest = tail;
         }
         Ok(())
     }
 
+    /// Writes `chunk` to fresh replicas and commits it as the extent at `logical`.
+    fn install_extent(
+        &self,
+        volume_id: &str,
+        logical: u64,
+        chunk: &[u8],
+        fence: u64,
+    ) -> Result<(), NativeError> {
+        let needed = self.cfg.placement.replicas;
+        let order = self.placement_order(chunk.len() as u64, |_| false);
+        if order.len() < needed {
+            return Err(NativeError::InsufficientReplicas {
+                needed,
+                found: order.len(),
+            });
+        }
+        // Walk the preference order so a node that fails is replaced by the next eligible one.
+        let mut replicas = Vec::new();
+        for node_id in order {
+            if replicas.len() == needed {
+                break;
+            }
+            if let Some(r) = self.place_replica(&node_id, fence, chunk)? {
+                replicas.push(r);
+            }
+        }
+        if replicas.len() < needed {
+            return Err(NativeError::InsufficientReplicas {
+                needed,
+                found: replicas.len(),
+            });
+        }
+        let extent = ExtentRef {
+            id: Uuid::new_v4().to_string(),
+            logical_offset: logical,
+            len: chunk.len(),
+            checksum: checksum::sha256(chunk),
+            replicas,
+        };
+        self.commit(
+            MetaCommand::InstallExtent {
+                volume_id: volume_id.to_string(),
+                logical_offset: logical,
+                extent,
+            },
+            Some(fence),
+        )?;
+        self.telemetry.record_write(chunk.len());
+        Ok(())
+    }
+
+    /// Reads `len` bytes at any `offset` within the volume, across extents. Never-written ranges
+    /// read as zeros.
     pub fn read(&self, volume_id: &str, offset: u64, len: usize) -> Result<Vec<u8>, NativeError> {
-        let ext = self.with_catalog(|c| {
+        let extents = self.with_catalog(|c| {
             let vol = c
                 .volumes
                 .get(volume_id)
                 .ok_or_else(|| NativeError::NotFound(volume_id.into()))?;
-            Self::extent_at(c, &vol.extents, offset)
+            self.extents_in(c, &vol.extents, vol.size_bytes, offset, len)
         })??;
-        self.read_extent(&ext, len)
+        self.read_range(extents, offset, len)
     }
 
     pub fn create_snapshot(
@@ -371,14 +422,19 @@ impl NativeEngine {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, NativeError> {
-        let ext = self.with_catalog(|c| {
+        let extents = self.with_catalog(|c| {
             let s = c
                 .snapshots
                 .get(snapshot_id)
                 .ok_or_else(|| NativeError::NotFound(snapshot_id.into()))?;
-            Self::extent_at(c, &s.extents, offset)
+            let size = if s.size_bytes > 0 {
+                s.size_bytes
+            } else {
+                Self::written_end(c, &s.extents)
+            };
+            self.extents_in(c, &s.extents, size, offset, len)
         })??;
-        self.read_extent(&ext, len)
+        self.read_range(extents, offset, len)
     }
 
     pub fn gc_once(&self) -> Result<gc::GcStats, NativeError> {
@@ -804,19 +860,64 @@ impl NativeEngine {
         }
     }
 
-    fn extent_at(
+    /// The extents of a map overlapping `[offset, offset + len)`, which must lie within `size`.
+    fn extents_in(
+        &self,
         c: &Catalog,
         extents: &std::collections::BTreeMap<u64, String>,
+        size: u64,
         offset: u64,
-    ) -> Result<ExtentRef, NativeError> {
-        let eid = extents
-            .get(&offset)
-            .ok_or_else(|| NativeError::NotFound(format!("extent at {offset}")))?;
-        Ok(c.extents
-            .get(eid)
-            .ok_or_else(|| NativeError::NotFound(eid.clone()))?
-            .extent
-            .clone())
+        len: usize,
+    ) -> Result<Vec<ExtentRef>, NativeError> {
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|e| *e <= size)
+            .ok_or_else(|| NativeError::Invalid("read exceeds volume size".into()))?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let first = offset - offset % self.cfg.extent_bytes as u64;
+        extents
+            .range(first..end)
+            .map(|(_, eid)| {
+                c.extents
+                    .get(eid)
+                    .map(|m| m.extent.clone())
+                    .ok_or_else(|| NativeError::NotFound(eid.clone()))
+            })
+            .collect()
+    }
+
+    /// One past the last byte any extent of the map covers.
+    fn written_end(c: &Catalog, extents: &std::collections::BTreeMap<u64, String>) -> u64 {
+        extents
+            .values()
+            .filter_map(|eid| c.extents.get(eid))
+            .map(|m| m.extent.logical_offset + m.extent.len as u64)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn read_range(
+        &self,
+        extents: Vec<ExtentRef>,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, NativeError> {
+        let mut out = vec![0u8; len];
+        let end = offset + len as u64;
+        for ext in extents {
+            let start = ext.logical_offset.max(offset);
+            let stop = (ext.logical_offset + ext.len as u64).min(end);
+            if start >= stop {
+                continue;
+            }
+            let buf = self.read_extent(&ext)?;
+            out[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(
+                &buf[(start - ext.logical_offset) as usize..(stop - ext.logical_offset) as usize],
+            );
+        }
+        Ok(out)
     }
 
     /// `fence` is the term data was written under; a Raft proposal is refused if leadership
@@ -857,12 +958,8 @@ impl NativeEngine {
         Ok(())
     }
 
-    fn read_extent(&self, ext: &ExtentRef, len: usize) -> Result<Vec<u8>, NativeError> {
-        if len > ext.len {
-            return Err(NativeError::Invalid(
-                "cross-extent reads are not implemented in phase 2".into(),
-            ));
-        }
+    /// The whole extent from the first replica whose checksum verifies.
+    fn read_extent(&self, ext: &ExtentRef) -> Result<Vec<u8>, NativeError> {
         let mut order: Vec<(usize, &ReplicaRef, &NodeRuntime)> = ext
             .replicas
             .iter()
@@ -886,8 +983,8 @@ impl NativeEngine {
                     if i > 0 {
                         self.telemetry.replica_fallback();
                     }
-                    self.telemetry.record_read(len);
-                    return Ok(buf[..len].to_vec());
+                    self.telemetry.record_read(buf.len());
+                    return Ok(buf);
                 }
                 Ok(_) => self.telemetry.checksum_failure(),
                 Err(_) => self.mark_down(node),
