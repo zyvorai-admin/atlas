@@ -273,6 +273,41 @@ fn full_cluster_restart_recovers_from_disk() {
 }
 
 #[test]
+fn rejoining_node_does_not_disrupt_stable_leader() {
+    let mut c = Cluster::new(3, 0);
+    let l = c.elect();
+    c.run(10);
+    let term = c.node(&l).term();
+    let f = c.live_ids().into_iter().find(|id| *id != l).unwrap();
+
+    c.isolated.insert(f.clone());
+    c.run(300);
+    assert_eq!(
+        c.node(&f).term(),
+        term,
+        "pre-vote must stop an isolated node from inflating its term"
+    );
+    assert_eq!(c.node(&l).role(), Role::Leader);
+
+    c.isolated.clear();
+    c.run(50);
+    assert_eq!(c.leader().as_deref(), Some(l.as_str()));
+    assert_eq!(c.node(&l).term(), term);
+}
+
+#[test]
+fn isolated_leader_steps_down() {
+    let mut c = Cluster::new(3, 0);
+    let l = c.elect();
+    c.isolated.insert(l.clone());
+    c.run(50);
+    assert!(
+        !c.node(&l).is_leader(),
+        "check-quorum must demote a leader cut off from the majority"
+    );
+}
+
+#[test]
 fn randomized_faults_never_lose_acknowledged_commits() {
     for seed in [7u64, 42, 1337] {
         run_fault_schedule(seed);

@@ -62,7 +62,13 @@ messages with `step()` and sends whatever `take_messages()` returns. Implemented
 - leader commit only for entries of its own term (a new leader appends a `Noop` to commit earlier
   ones), quorum = majority of voters including itself;
 - log compaction after `compact_after` applied entries and `InstallSnapshot` (the leader's applied
-  catalog) for followers behind the compaction point.
+  catalog) for followers behind the compaction point;
+- pre-vote: a node whose election timer fires first asks for pre-votes for `term + 1` without
+  changing anyone's term, and only campaigns once a majority would vote for it, so a partitioned
+  node cannot inflate its term and depose a healthy leader when it rejoins;
+- check-quorum: a leader that has not heard from a majority within the minimum election timeout
+  steps down, and a node that has heard from a live leader within that window ignores
+  higher-term vote requests.
 
 Each replica keeps its own `raft_state.json` (term + vote), WAL and `catalog.json`. Durability order:
 the vote is fsynced before any reply; entries are fsynced before they are acknowledged or counted
@@ -77,11 +83,32 @@ follower redirect, leader crash, a partitioned minority leader whose uncommitted
 full-cluster restart from disk, snapshot catch-up, and a randomized partition/crash/restart schedule
 that checks no acknowledged commit is lost and all replicas converge.
 
+### TCP transport (`raft_server` module)
+
+`RaftServer::start(cfg, listener, peers, tick)` runs a `RaftNode` across processes using only the
+standard library:
+
+- frames are a 4-byte big-endian length plus a JSON `Envelope`, capped at 256 MiB;
+- a driver thread owns the node, ticks it every `tick` and steps inbound messages in batches;
+- one sender thread per peer keeps a connection open, reconnects with a short backoff and drops
+  messages while the peer is down (Raft retransmits);
+- inbound envelopes are dropped unless `from` is a configured peer and `to` is this node;
+- `propose(cmd, timeout)` blocks until the entry is applied locally, or returns `NotLeader` (with a
+  leader hint), `LeadershipLost` (outcome unknown), `Timeout` or `Shutdown`;
+- a storage error inside the node (e.g. a failed fsync) stops the server and is reported by
+  `fatal_error()`; it never keeps serving on a state it could not persist.
+
+The transport has **no authentication or encryption**. Bind it to a private metadata network only.
+
+`tests/raft_tcp.rs` runs a real 3-server cluster over localhost: election and replication, follower
+redirect, and leader shutdown, failover and rejoin from disk.
+
 Not implemented yet:
 
-- a network transport, and wiring `NativeEngine` to commit through a `RaftNode` instead of its local
-  WAL (the engine is still single-node);
-- pre-vote / check-quorum: a partitioned node that rejoins with a higher term forces one extra election;
+- wiring `NativeEngine` to commit through Raft instead of its local WAL. The engine's data plane
+  addresses devices as local files, so this needs a networked data-node layer first; replicating
+  metadata that points at another process's local files would be incoherent;
+- transport TLS / mutual auth;
 - membership changes: the voter set is fixed at open;
 - linearizable reads (read index / leases).
 
@@ -94,12 +121,14 @@ Not implemented yet:
 - snapshot copy-on-write isolation and space protection;
 - refcount underflow and free-list double-free protection;
 - monotonic WAL indexes across compaction;
-- metadata leader crash, minority partition and full restart (Raft).
+- metadata leader crash, minority partition, rejoin without disruption, isolated-leader step-down
+  and full restart (Raft).
 
 ## Next phase
 
-- network transport for `RaftNode` and engine integration (commit through Raft);
-- pre-vote, check-quorum and joint-consensus membership changes;
+- networked data-node layer, then engine integration (commit through Raft);
+- transport TLS / mutual auth;
+- joint-consensus membership changes;
 - background scrub and replica repair;
 - hole punching for freed ranges at the device tail;
 - io_uring/raw-NVMe data path.

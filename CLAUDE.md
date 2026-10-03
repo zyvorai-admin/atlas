@@ -116,7 +116,8 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   not embedded in `atlas-gateway` (see `docs/IO_EBPF.md`).
 - `crates/atlas-native` — native data plane (library only, not yet wired into the gateway): replicated
   extent engine, metadata WAL + checkpoint/compaction, refcounted extents with free-list space reuse,
-  and a sans-IO Raft core for the metadata log (no network transport yet). See
+  and a Raft core for the metadata log (pre-vote, check-quorum) with a std-only TCP server
+  (`raft_server`, no TLS/auth yet; the engine itself still commits locally). See
   `docs/NATIVE_STORAGE.md`, `docs/NATIVE_METADATA.md`.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
