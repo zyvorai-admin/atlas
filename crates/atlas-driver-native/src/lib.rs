@@ -101,6 +101,8 @@ pub trait NativeApi: Send + Sync {
         size_bytes: Option<u64>,
     ) -> Result<String, DriverError>;
     async fn delete_snapshot(&self, id: &str) -> Result<(), DriverError>;
+    async fn read(&self, volume_id: &str, offset: u64, len: u64) -> Result<Vec<u8>, DriverError>;
+    async fn write(&self, volume_id: &str, offset: u64, data: Vec<u8>) -> Result<(), DriverError>;
 }
 
 pub struct NativeDriver<A> {
@@ -414,6 +416,31 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
     async fn delete_snapshot(&self, req: DeleteSnapshotRequest) -> Result<(), DriverError> {
         self.api
             .delete_snapshot(native_snapshot_id(&req.snapshot_id))
+            .await
+    }
+
+    async fn read_volume(
+        &self,
+        volume_id: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, DriverError> {
+        self.api
+            .read(native_volume_id(volume_id), offset, len)
+            .await
+    }
+
+    async fn write_volume(
+        &self,
+        volume_id: &str,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), DriverError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.api
+            .write(native_volume_id(volume_id), offset, data)
             .await
     }
 }

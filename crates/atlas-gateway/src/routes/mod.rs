@@ -24,8 +24,9 @@ mod volumes;
 mod zfs;
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 
@@ -133,6 +134,12 @@ pub fn router(state: AppState) -> Router {
         .route("/volumes.csv", get(volumes_csv))
         .route("/volumes/{id}", get(get_volume).delete(delete_volume))
         .route("/volumes/{id}/expand", post(expand_volume))
+        .route(
+            "/volumes/{id}/data",
+            get(read_volume_data).merge(
+                put(write_volume_data).layer(DefaultBodyLimit::max(volumes::MAX_VOLUME_IO_BYTES)),
+            ),
+        )
         .route("/volumes/{id}/protection", get(get_volume_protection))
         .route("/rbd-images", get(list_rbd_images).post(create_rbd_image))
         .route(

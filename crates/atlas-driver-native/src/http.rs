@@ -41,6 +41,11 @@ pub struct HttpApi {
     preferred: AtomicUsize,
 }
 
+enum Body {
+    Json(Value),
+    Raw(Vec<u8>),
+}
+
 enum Round {
     Done(Vec<u8>),
     /// Some node answered "not the leader".
@@ -106,7 +111,7 @@ impl HttpApi {
         &self,
         method: Method,
         path: &str,
-        body: Option<Value>,
+        body: Option<Body>,
     ) -> Result<Vec<u8>, DriverError> {
         let deadline = Instant::now() + ELECTION_WAIT;
         let mut ambiguous = false;
@@ -132,7 +137,7 @@ impl HttpApi {
         &self,
         method: &Method,
         path: &str,
-        body: Option<&Value>,
+        body: Option<&Body>,
         ambiguous: &mut bool,
     ) -> Result<Round, DriverError> {
         let n = self.endpoints.len();
@@ -146,9 +151,13 @@ impl HttpApi {
             if let Some(t) = &self.token {
                 req = req.bearer_auth(t);
             }
-            if let Some(b) = body {
-                req = req.json(b);
-            }
+            req = match body {
+                Some(Body::Json(v)) => req.json(v),
+                Some(Body::Raw(b)) => req
+                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(b.clone()),
+                None => req,
+            };
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -190,6 +199,9 @@ impl HttpApi {
                 StatusCode::NOT_FOUND => {
                     return Err(DriverError::Backend(format!("not found: {msg}")));
                 }
+                StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => {
+                    return Err(DriverError::Backend(format!("invalid: {msg}")));
+                }
                 _ => return Err(DriverError::Backend(format!("{status}: {msg}"))),
             }
         }
@@ -206,7 +218,9 @@ impl HttpApi {
     }
 
     async fn post_created(&self, path: &str, body: Value) -> Result<String, DriverError> {
-        let b = self.call(Method::POST, path, Some(body)).await?;
+        let b = self
+            .call(Method::POST, path, Some(Body::Json(body)))
+            .await?;
         serde_json::from_slice::<Created>(&b)
             .map(|c| c.id)
             .map_err(|e| DriverError::Parse(format!("{path}: {e}")))
@@ -268,7 +282,7 @@ impl NativeApi for HttpApi {
         self.call(
             Method::POST,
             &path,
-            Some(json!({ "size_bytes": size_bytes })),
+            Some(Body::Json(json!({ "size_bytes": size_bytes }))),
         )
         .await
         .map(drop)
@@ -292,5 +306,21 @@ impl NativeApi for HttpApi {
     async fn delete_snapshot(&self, id: &str) -> Result<(), DriverError> {
         let path = format!("/v1/snapshots/{}", path_id(id)?);
         self.call(Method::DELETE, &path, None).await.map(drop)
+    }
+
+    async fn read(&self, volume_id: &str, offset: u64, len: u64) -> Result<Vec<u8>, DriverError> {
+        let path = format!(
+            "/v1/volumes/{}/data?offset={offset}&len={len}",
+            path_id(volume_id)?
+        );
+        self.call(Method::GET, &path, None).await
+    }
+
+    async fn write(&self, volume_id: &str, offset: u64, data: Vec<u8>) -> Result<(), DriverError> {
+        // Rewriting the same bytes is harmless, so the usual failover/retry applies.
+        let path = format!("/v1/volumes/{}/data?offset={offset}", path_id(volume_id)?);
+        self.call(Method::PUT, &path, Some(Body::Raw(data)))
+            .await
+            .map(drop)
     }
 }

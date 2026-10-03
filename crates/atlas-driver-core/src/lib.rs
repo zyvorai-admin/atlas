@@ -14,8 +14,8 @@ use atlas_api_types::{
 
 pub mod registry;
 mod tls;
-pub use tls::trusted_http_client;
 pub use registry::DriverRegistry;
+pub use tls::trusted_http_client;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
@@ -84,6 +84,25 @@ pub trait StorageDriver: Send + Sync {
     }
     async fn delete_snapshot(&self, _req: DeleteSnapshotRequest) -> Result<(), DriverError> {
         Err(DriverError::NotImplemented("delete_snapshot"))
+    }
+
+    // ---- block data path (backends whose volumes the gateway can read/write directly) ----
+    /// `len` bytes at `offset` of a block volume; never-written bytes read as zeros.
+    async fn read_volume(
+        &self,
+        _volume_id: &str,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<Vec<u8>, DriverError> {
+        Err(DriverError::NotImplemented("read_volume"))
+    }
+    async fn write_volume(
+        &self,
+        _volume_id: &str,
+        _offset: u64,
+        _data: Vec<u8>,
+    ) -> Result<(), DriverError> {
+        Err(DriverError::NotImplemented("write_volume"))
     }
 
     // ---- Ceph-native introspection (read-only; other backends return NotImplemented) ----

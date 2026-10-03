@@ -129,7 +129,8 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   `docs/NATIVE_NODE.md`.
 - `crates/atlas-driver-native` — `StorageDriver` over the `atlas-native-node` HTTP API (backend
   `bkd_native`, `ATLAS_NATIVE_*`); the one driver whose write methods the gateway calls
-  (synchronous volume create/expand/delete, snapshot create/delete, clone/restore). Tested against in-process native nodes.
+  (synchronous volume create/expand/delete, snapshot create/delete, clone/restore) and the
+  only one with a gateway block data path (`GET`/`PUT /volumes/{id}/data`). Tested against in-process native nodes.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
   DB-backed rate-limit counters (`rate_limit.rs`).
