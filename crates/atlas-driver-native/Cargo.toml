@@ -14,9 +14,10 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 atlas-native = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }

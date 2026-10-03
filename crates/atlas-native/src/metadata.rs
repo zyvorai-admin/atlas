@@ -95,6 +95,20 @@ pub enum MetaCommand {
     DeleteVolume {
         volume_id: VolumeId,
     },
+    /// Grows a volume; shrinking is refused (it would drop written data).
+    ResizeVolume {
+        volume_id: VolumeId,
+        size_bytes: u64,
+    },
+    /// A new volume sharing the snapshot's extents (copy-on-write: writes to either side
+    /// install new extents). `size_bytes` defaults to the snapshot's size and may only grow it.
+    CloneSnapshot {
+        id: VolumeId,
+        name: String,
+        snapshot_id: SnapshotId,
+        #[serde(default)]
+        size_bytes: Option<u64>,
+    },
     MarkExtentReclaimed {
         extent_id: ExtentId,
     },
@@ -142,6 +156,13 @@ impl Catalog {
                 name,
                 size_bytes,
             } => {
+                // Client-chosen ids make a retried create a no-op instead of a second volume.
+                if let Some(v) = self.volumes.get(id) {
+                    if v.name == *name && v.size_bytes == *size_bytes {
+                        return self.applied(term, index, gc_candidates);
+                    }
+                    return Err(MetaError::Invalid(format!("volume {id} already exists")));
+                }
                 self.volumes.insert(
                     id.clone(),
                     VolumeMeta {
@@ -187,6 +208,12 @@ impl Catalog {
                 volume_id,
                 name,
             } => {
+                if let Some(s) = self.snapshots.get(id) {
+                    if s.volume_id == *volume_id && s.name == *name {
+                        return self.applied(term, index, gc_candidates);
+                    }
+                    return Err(MetaError::Invalid(format!("snapshot {id} already exists")));
+                }
                 let vol = self
                     .volumes
                     .get(volume_id)
@@ -227,6 +254,67 @@ impl Catalog {
                 for eid in v.extents.values() {
                     self.dec_ref(eid, &mut gc_candidates)?;
                 }
+            }
+            MetaCommand::ResizeVolume {
+                volume_id,
+                size_bytes,
+            } => {
+                let vol = self
+                    .volumes
+                    .get_mut(volume_id)
+                    .ok_or_else(|| MetaError::NotFound(volume_id.clone()))?;
+                if *size_bytes < vol.size_bytes {
+                    return Err(MetaError::Invalid(format!(
+                        "volume {volume_id} cannot shrink from {} to {size_bytes} bytes",
+                        vol.size_bytes
+                    )));
+                }
+                vol.size_bytes = *size_bytes;
+            }
+            MetaCommand::CloneSnapshot {
+                id,
+                name,
+                snapshot_id,
+                size_bytes,
+            } => {
+                if let Some(v) = self.volumes.get(id) {
+                    if v.name == *name {
+                        return self.applied(term, index, gc_candidates);
+                    }
+                    return Err(MetaError::Invalid(format!("volume {id} already exists")));
+                }
+                let s = self
+                    .snapshots
+                    .get(snapshot_id)
+                    .ok_or_else(|| MetaError::NotFound(snapshot_id.clone()))?
+                    .clone();
+                let floor = if s.size_bytes > 0 {
+                    s.size_bytes
+                } else {
+                    self.written_end(&s.extents)
+                };
+                let size = size_bytes.unwrap_or(floor);
+                if size == 0 || size < floor {
+                    return Err(MetaError::Invalid(format!(
+                        "clone of {snapshot_id} needs at least {} bytes",
+                        floor.max(1)
+                    )));
+                }
+                for eid in s.extents.values() {
+                    self.extents
+                        .get_mut(eid)
+                        .ok_or_else(|| MetaError::NotFound(eid.clone()))?
+                        .refs += 1;
+                }
+                self.volumes.insert(
+                    id.clone(),
+                    VolumeMeta {
+                        id: id.clone(),
+                        name: name.clone(),
+                        size_bytes: size,
+                        extents: s.extents,
+                    },
+                );
             }
             MetaCommand::MarkExtentReclaimed { extent_id } => {
                 let e = self
@@ -307,9 +395,18 @@ impl Catalog {
             }
             MetaCommand::Noop => {}
         }
+        self.applied(term, index, gc_candidates)
+    }
+
+    fn applied(
+        &mut self,
+        term: u64,
+        index: u64,
+        gc: Vec<ExtentId>,
+    ) -> Result<Vec<ExtentId>, MetaError> {
         self.current_term = term;
         self.applied_index = index;
-        Ok(gc_candidates)
+        Ok(gc)
     }
 
     /// Applies an already-committed entry. A command that fails validation still consumes its
@@ -335,6 +432,16 @@ impl Catalog {
                 Err(e)
             }
         }
+    }
+
+    /// End of the last written byte among `extents`.
+    pub fn written_end(&self, extents: &BTreeMap<u64, ExtentId>) -> u64 {
+        extents
+            .values()
+            .filter_map(|eid| self.extents.get(eid))
+            .map(|m| m.extent.logical_offset + m.extent.len as u64)
+            .max()
+            .unwrap_or(0)
     }
 
     fn dec_ref(&mut self, extent_id: &str, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {

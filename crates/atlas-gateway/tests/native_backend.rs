@@ -140,14 +140,39 @@ async fn native_backend_volume_and_snapshot_lifecycle() {
             .json(&json!({ "new_size_bytes": 16_777_216 })),
     )
     .await;
-    assert_eq!(st, 400, "{body}");
-    let (st, body) = send(
+    assert_eq!(st, 200, "{body}");
+    let (_, vol) = send(c.get(format!("{base}/volumes/{vid}"))).await;
+    assert_eq!(vol["size_bytes"], 16_777_216);
+
+    let (st, clone) = send(
         c.post(format!("{base}/snapshots/{sid}/clone"))
             .json(&json!({ "name": "copy" })),
     )
     .await;
-    assert_eq!(st, 400, "{body}");
+    assert_eq!(st, 201, "{clone}");
+    let cid = clone["volume_id"].as_str().unwrap().to_string();
+    assert!(cid.starts_with("vol_native_"), "{cid}");
+    let (st, cvol) = send(c.get(format!("{base}/volumes/{cid}"))).await;
+    assert_eq!(st, 200, "{cvol}");
+    assert_eq!(cvol["name"], "copy");
+    assert_eq!(cvol["size_bytes"], 16_777_216);
+    let (_, acme) = send(c.get(format!("{base}/volumes?tenant=acme"))).await;
+    assert!(acme.to_string().contains(&cid), "{acme}");
 
+    let (st, restored) = send(
+        c.post(format!("{base}/snapshots/{sid}/restore"))
+            .json(&json!({})),
+    )
+    .await;
+    assert_eq!(st, 201, "{restored}");
+    let rid = restored["volume_id"].as_str().unwrap().to_string();
+
+    let (st, body) = send(c.delete(format!("{base}/snapshots/{sid}"))).await;
+    assert_eq!(st, 409, "clones depend on the snapshot: {body}");
+    for id in [&cid, &rid] {
+        let (st, body) = send(c.delete(format!("{base}/volumes/{id}"))).await;
+        assert_eq!(st, 200, "{body}");
+    }
     let (st, body) = send(c.delete(format!("{base}/snapshots/{sid}"))).await;
     assert_eq!(st, 200, "{body}");
     let (st, body) = send(c.delete(format!("{base}/volumes/{vid}"))).await;

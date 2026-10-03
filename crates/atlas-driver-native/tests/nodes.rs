@@ -8,8 +8,8 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use atlas_api_types::{
-    CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest, DeleteVolumeRequest, Health,
-    VolumeKind,
+    CloneSnapshotRequest, CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest,
+    DeleteVolumeRequest, ExpandVolumeRequest, Health, VolumeKind,
 };
 use atlas_driver_core::{DriverError, StorageDriver};
 use atlas_driver_native::{HttpApi, HttpApiConfig, RealNativeDriver, POOL_NAME};
@@ -194,6 +194,53 @@ async fn real_driver_manages_volumes_on_a_live_cluster() {
         })
         .await
         .unwrap();
+    d.expand_volume(ExpandVolumeRequest {
+        volume_id: ids[0].volume_id.clone(),
+        new_size_bytes: 2 << 20,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        d.expand_volume(ExpandVolumeRequest {
+            volume_id: ids[0].volume_id.clone(),
+            new_size_bytes: 4096,
+        })
+        .await,
+        Err(DriverError::Backend(_))
+    ));
+    let clone = d
+        .clone_snapshot(CloneSnapshotRequest {
+            snapshot_id: snap.snapshot_id.clone(),
+            new_volume_name: "copy".into(),
+            size_bytes: Some(3 << 20),
+        })
+        .await
+        .unwrap();
+    let sizes: BTreeMap<String, i64> = d
+        .list_volumes(POOL_NAME)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.id, v.size_bytes))
+        .collect();
+    assert_eq!(sizes[&ids[0].volume_id], 2 << 20);
+    assert_eq!(sizes[&clone.volume_id], 3 << 20);
+    match d
+        .clone_snapshot(CloneSnapshotRequest {
+            snapshot_id: "snap_native_missing".into(),
+            new_volume_name: "x".into(),
+            size_bytes: None,
+        })
+        .await
+    {
+        Err(DriverError::Backend(m)) => assert!(m.starts_with("not found"), "{m}"),
+        other => panic!("clone of a missing snapshot: {other:?}"),
+    }
+    d.delete_volume(DeleteVolumeRequest {
+        volume_id: clone.volume_id,
+    })
+    .await
+    .unwrap();
     d.delete_snapshot(DeleteSnapshotRequest {
         snapshot_id: snap.snapshot_id,
     })

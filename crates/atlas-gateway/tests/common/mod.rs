@@ -39,7 +39,9 @@ fn unique_suffix() -> String {
 /// so passing the same label from multiple call sites in one file is fine.
 pub async fn fresh_database_url(label: &str) -> String {
     match std::env::var("ATLAS_TEST_DATABASE_URL") {
-        Ok(admin_url) if !admin_url.trim().is_empty() => postgres_database_url(&admin_url, label).await,
+        Ok(admin_url) if !admin_url.trim().is_empty() => {
+            postgres_database_url(&admin_url, label).await
+        }
         _ => sqlite_database_url(label),
     }
 }
@@ -69,10 +71,12 @@ async fn postgres_database_url(admin_url: &str, label: &str) -> String {
         .await
         .expect("connect to ATLAS_TEST_DATABASE_URL (admin Postgres connection)");
     // `db_name` is built from a sanitized test label plus a unique suffix — test-only, never user input.
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\"")))
-        .execute(&admin_pool)
-        .await
-        .unwrap_or_else(|e| panic!("CREATE DATABASE \"{db_name}\" failed: {e}"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin_pool)
+    .await
+    .unwrap_or_else(|e| panic!("CREATE DATABASE \"{db_name}\" failed: {e}"));
     admin_pool.close().await;
 
     // Swap the admin URL's path (its own target database, e.g. "postgres") for the freshly

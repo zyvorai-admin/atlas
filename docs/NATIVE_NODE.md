@@ -85,11 +85,13 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `GET /metrics` | no | Prometheus text: Raft/transport, engine, data node, and `atlas_native_{repair,gc}_{runs,errors}_total`. |
 | `GET /v1/status` | yes | Raft role/term/leader/indexes and voter flag, `layout` (`extent_bytes`, `replicas`), per-data-node health, last repair result, data-node fence. |
 | `GET /v1/volumes` | yes | Volumes in the applied catalog. |
-| `POST /v1/volumes` | yes | `{"name": "...", "size_bytes": N}` → 201 `{"id": "..."}`. |
+| `POST /v1/volumes` | yes | `{"name": "...", "size_bytes": N, "id"?: "..."}` → 201 `{"id": "..."}`. An optional client-chosen `id` (1–64 of `[A-Za-z0-9-]`) makes the create idempotent: repeating it with the same parameters is a no-op, different parameters get 409. |
 | `DELETE /v1/volumes/{id}` | yes | 204. |
+| `POST /v1/volumes/{id}/resize` | yes | `{"size_bytes": N}` → 200. Grow only; a smaller size gets 409 (it would drop written data). |
 | `PUT /v1/volumes/{id}/data?offset=N` | yes | Raw body written at any `offset` → 204. Extents sit on a fixed `extent_bytes` grid; a write covering part of an extent rewrites that extent with the old bytes merged in. |
 | `GET /v1/volumes/{id}/data?offset=N&len=M` | yes | Raw bytes from any range within the volume, across extents; never-written bytes read as zeros. `len` above `max_request_bytes` gets 413. |
-| `POST /v1/volumes/{id}/snapshots` | yes | `{"name": "..."}` → 201 `{"id": "..."}`. |
+| `POST /v1/volumes/{id}/snapshots` | yes | `{"name": "...", "id"?: "..."}` → 201 `{"id": "..."}` (`id` as for volumes). |
+| `POST /v1/snapshots/{id}/clone` | yes | `{"name": "...", "size_bytes"?: N, "id"?: "..."}` → 201 `{"id": "..."}`: a new volume sharing the snapshot's extents (copy-on-write; it survives deleting the snapshot and its source). `size_bytes` defaults to the snapshot's size and may only be larger. |
 | `DELETE /v1/snapshots/{id}` | yes | 204. |
 | `GET /v1/snapshots/{id}/data?offset=N&len=M` | yes | Same as the volume read, against the snapshot. |
 | `GET /v1/members` | yes | `{"membership": {"type": "stable", "voters": [...]}, "addrs": {id: "host:port"}}` (`type` is `joint` with `old`/`new` mid-change); `addrs` are the Raft addresses learned from membership changes. |
@@ -197,23 +199,27 @@ backend `bkd_native`, discovers it at startup and every `ATLAS_MONITOR_INTERVAL_
   know their disks' size), so it stays empty instead of being invented;
 - `POST /volumes` with `"kubernetes": {"backend_id": "bkd_native"}`: created synchronously through
   the leader (201, no job), recorded under the request's tenant (quota admission and product
-  bindings as for any volume); `DELETE /volumes/{id}`, `POST /volumes/{id}/snapshots` and
-  `DELETE /snapshots/{id}` likewise go straight to the cluster. Resize and clone/restore are
-  refused with 400 until the node API has them.
+  bindings as for any volume); `DELETE /volumes/{id}`, `POST /volumes/{id}/expand`,
+  `POST /volumes/{id}/snapshots`, `DELETE /snapshots/{id}` and `POST /snapshots/{id}/clone` /
+  `restore` (a new volume from the snapshot, recorded as its dependent so the snapshot can't be
+  deleted without `force` while it exists) likewise go straight to the cluster.
 
 Real mode (`ATLAS_NATIVE_DRIVER_MODE=real`) needs `ATLAS_NATIVE_ENDPOINTS` (comma-separated
 `https://pod:7480` URLs of metadata nodes). Mutations are retried across the endpoints until the
-leader accepts them; reads use any node. `ATLAS_NATIVE_TOKEN_FILE` is the API token,
+leader accepts them (for up to 5 s while every node answers "not the leader"); reads use any
+node. The driver picks the ids of new volumes and snapshots, so a create retried after an
+ambiguous failure (a 503 or timeout after the proposal) cannot create a second object, and a
+retried delete that finds the object gone counts as done. `ATLAS_NATIVE_TOKEN_FILE` is the API token,
 `ATLAS_NATIVE_CA_CERT` a private CA for `http_tls`, and `ATLAS_NATIVE_CLIENT_CERT`/`_KEY` a client
 certificate for clusters with `client_ca`. Fake mode keeps volumes in memory for demos and tests.
 
 Verified live (2026-10-03) on the k3s lab: a gateway in real mode against a 3-pod Helm release
 discovered `bkd_native` (pool `native`, 3 replicas, ok), created a 16 MiB volume (201, visible on
-the nodes), showed its used extent after a write, took and deleted a snapshot, refused resize with
-400 and deleted the volume on the cluster.
+the nodes), showed its used extent after a write, took a snapshot, expanded the volume to 32 MiB,
+cloned and restored the snapshot (the clone's bytes matched the snapshot; snapshot delete got 409
+while they existed), then deleted everything on the cluster.
 
 ## Not implemented yet
 
-- volume resize and clones (node API and driver);
 - the data path through the gateway (volumes are created and listed via Atlas; block I/O goes to
   the node API directly).

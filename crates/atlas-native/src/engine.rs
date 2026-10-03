@@ -237,10 +237,20 @@ impl NativeEngine {
         name: impl Into<String>,
         size_bytes: u64,
     ) -> Result<VolumeId, NativeError> {
+        self.create_volume_as(Uuid::new_v4().to_string(), name, size_bytes)
+    }
+
+    /// [`Self::create_volume`] with a caller-chosen id: repeating the same call is a no-op, so a
+    /// client can safely retry after an ambiguous failure.
+    pub fn create_volume_as(
+        &self,
+        id: String,
+        name: impl Into<String>,
+        size_bytes: u64,
+    ) -> Result<VolumeId, NativeError> {
         if size_bytes == 0 {
             return Err(NativeError::Invalid("volume size must be > 0".into()));
         }
-        let id = Uuid::new_v4().to_string();
         self.commit(
             MetaCommand::CreateVolume {
                 id: id.clone(),
@@ -259,6 +269,48 @@ impl NativeEngine {
             },
             None,
         )
+    }
+
+    /// Grows `volume_id` to `size_bytes` (never shrinks).
+    pub fn resize_volume(&self, volume_id: &str, size_bytes: u64) -> Result<(), NativeError> {
+        self.commit(
+            MetaCommand::ResizeVolume {
+                volume_id: volume_id.to_string(),
+                size_bytes,
+            },
+            None,
+        )
+    }
+
+    /// A new volume with the snapshot's contents, sharing its extents until either side is
+    /// written. `size_bytes` defaults to the snapshot's size.
+    pub fn clone_snapshot(
+        &self,
+        snapshot_id: &str,
+        name: impl Into<String>,
+        size_bytes: Option<u64>,
+    ) -> Result<VolumeId, NativeError> {
+        self.clone_snapshot_as(Uuid::new_v4().to_string(), snapshot_id, name, size_bytes)
+    }
+
+    /// [`Self::clone_snapshot`] with a caller-chosen id for the new volume (idempotent).
+    pub fn clone_snapshot_as(
+        &self,
+        id: String,
+        snapshot_id: &str,
+        name: impl Into<String>,
+        size_bytes: Option<u64>,
+    ) -> Result<VolumeId, NativeError> {
+        self.commit(
+            MetaCommand::CloneSnapshot {
+                id: id.clone(),
+                name: name.into(),
+                snapshot_id: snapshot_id.to_string(),
+                size_bytes,
+            },
+            None,
+        )?;
+        Ok(id)
     }
 
     pub fn write(&self, volume_id: &str, offset: u64, data: &[u8]) -> Result<(), NativeError> {
@@ -395,7 +447,16 @@ impl NativeEngine {
         volume_id: &str,
         name: impl Into<String>,
     ) -> Result<SnapshotId, NativeError> {
-        let id = Uuid::new_v4().to_string();
+        self.create_snapshot_as(Uuid::new_v4().to_string(), volume_id, name)
+    }
+
+    /// [`Self::create_snapshot`] with a caller-chosen id (idempotent).
+    pub fn create_snapshot_as(
+        &self,
+        id: String,
+        volume_id: &str,
+        name: impl Into<String>,
+    ) -> Result<SnapshotId, NativeError> {
         self.commit(
             MetaCommand::CreateSnapshot {
                 id: id.clone(),
@@ -430,7 +491,7 @@ impl NativeEngine {
             let size = if s.size_bytes > 0 {
                 s.size_bytes
             } else {
-                Self::written_end(c, &s.extents)
+                c.written_end(&s.extents)
             };
             self.extents_in(c, &s.extents, size, offset, len)
         })??;
@@ -889,15 +950,6 @@ impl NativeEngine {
     }
 
     /// One past the last byte any extent of the map covers.
-    fn written_end(c: &Catalog, extents: &std::collections::BTreeMap<u64, String>) -> u64 {
-        extents
-            .values()
-            .filter_map(|eid| c.extents.get(eid))
-            .map(|m| m.extent.logical_offset + m.extent.len as u64)
-            .max()
-            .unwrap_or(0)
-    }
-
     fn read_range(
         &self,
         extents: Vec<ExtentRef>,
