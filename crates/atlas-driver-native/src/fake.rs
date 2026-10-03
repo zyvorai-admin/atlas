@@ -21,6 +21,8 @@ struct State {
     volumes: BTreeMap<String, NativeVolume>,
     /// Snapshot id → the volume as it was (size, extents).
     snapshots: BTreeMap<String, (u64, u64)>,
+    /// Written bytes per volume, up to the last written byte.
+    data: BTreeMap<String, Vec<u8>>,
 }
 
 fn lock(m: &Mutex<State>) -> Result<std::sync::MutexGuard<'_, State>, DriverError> {
@@ -88,8 +90,9 @@ impl NativeApi for FakeApi {
     }
 
     async fn delete_volume(&self, id: &str) -> Result<(), DriverError> {
-        lock(&self.state)?
-            .volumes
+        let mut s = lock(&self.state)?;
+        s.data.remove(id);
+        s.volumes
             .remove(id)
             .map(|_| ())
             .ok_or_else(|| DriverError::Backend(format!("not found: volume {id}")))
@@ -147,6 +150,48 @@ impl NativeApi for FakeApi {
             v.extents = extents;
         }
         Ok(id)
+    }
+
+    async fn read(&self, volume_id: &str, offset: u64, len: u64) -> Result<Vec<u8>, DriverError> {
+        let s = lock(&self.state)?;
+        let size = s
+            .volumes
+            .get(volume_id)
+            .ok_or_else(|| DriverError::Backend(format!("not found: volume {volume_id}")))?
+            .size_bytes;
+        if offset.saturating_add(len) > size {
+            return Err(DriverError::Backend(
+                "invalid: read exceeds volume size".into(),
+            ));
+        }
+        let mut out = vec![0u8; len as usize];
+        if let Some(d) = s.data.get(volume_id) {
+            let start = (offset as usize).min(d.len());
+            let end = ((offset + len) as usize).min(d.len());
+            out[..end - start].copy_from_slice(&d[start..end]);
+        }
+        Ok(out)
+    }
+
+    async fn write(&self, volume_id: &str, offset: u64, data: Vec<u8>) -> Result<(), DriverError> {
+        let mut s = lock(&self.state)?;
+        let size = s
+            .volumes
+            .get(volume_id)
+            .ok_or_else(|| DriverError::Backend(format!("not found: volume {volume_id}")))?
+            .size_bytes;
+        let end = offset.saturating_add(data.len() as u64);
+        if end > size {
+            return Err(DriverError::Backend(
+                "invalid: write exceeds volume size".into(),
+            ));
+        }
+        let d = s.data.entry(volume_id.to_string()).or_default();
+        if d.len() < end as usize {
+            d.resize(end as usize, 0);
+        }
+        d[offset as usize..end as usize].copy_from_slice(&data);
+        Ok(())
     }
 
     async fn delete_snapshot(&self, id: &str) -> Result<(), DriverError> {

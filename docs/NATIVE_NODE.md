@@ -202,7 +202,11 @@ backend `bkd_native`, discovers it at startup and every `ATLAS_MONITOR_INTERVAL_
   bindings as for any volume); `DELETE /volumes/{id}`, `POST /volumes/{id}/expand`,
   `POST /volumes/{id}/snapshots`, `DELETE /snapshots/{id}` and `POST /snapshots/{id}/clone` /
   `restore` (a new volume from the snapshot, recorded as its dependent so the snapshot can't be
-  deleted without `force` while it exists) likewise go straight to the cluster.
+  deleted without `force` while it exists) likewise go straight to the cluster;
+- block data: `PUT /volumes/{id}/data?offset=N` (raw body) and
+  `GET /volumes/{id}/data?offset=N&len=M` proxy to the node data API for atlas-native volumes
+  (operator role and the volume's tenant; at most 4 MiB per request, larger bodies get 413;
+  ranges outside the volume get 400; volumes on other backends get 400).
 
 Real mode (`ATLAS_NATIVE_DRIVER_MODE=real`) needs `ATLAS_NATIVE_ENDPOINTS` (comma-separated
 `https://pod:7480` URLs of metadata nodes). Mutations are retried across the endpoints until the
@@ -218,8 +222,5 @@ discovered `bkd_native` (pool `native`, 3 replicas, ok), created a 16 MiB volume
 the nodes), showed its used extent after a write, took a snapshot, expanded the volume to 32 MiB,
 cloned and restored the snapshot (the clone's bytes matched the snapshot; snapshot delete got 409
 while they existed), then deleted everything on the cluster.
-
-## Not implemented yet
-
-- the data path through the gateway (volumes are created and listed via Atlas; block I/O goes to
-  the node API directly).
+A 1 MiB write through the gateway's data route read back identically through the gateway and
+straight from the nodes, and a clone of the snapshot served the same bytes through the gateway.

@@ -187,6 +187,24 @@ async fn real_driver_manages_volumes_on_a_live_cluster() {
     assert_eq!(v.size_bytes, 1 << 20);
     assert_eq!(v.used_bytes, Some(0));
 
+    let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+    d.write_volume(&ids[1].volume_id, 1000, data.clone())
+        .await
+        .unwrap();
+    let back = d
+        .read_volume(&ids[1].volume_id, 1000, data.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(back, data);
+    assert_eq!(
+        d.read_volume(&ids[1].volume_id, 0, 8).await.unwrap(),
+        vec![0u8; 8]
+    );
+    match d.read_volume(&ids[1].volume_id, 1 << 20, 1).await {
+        Err(DriverError::Backend(m)) => assert!(m.starts_with("invalid"), "{m}"),
+        other => panic!("read past the end: {other:?}"),
+    }
+
     let snap = d
         .create_snapshot(CreateSnapshotRequest {
             volume_id: ids[0].volume_id.clone(),

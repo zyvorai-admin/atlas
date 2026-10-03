@@ -1,8 +1,10 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde::Deserialize;
@@ -254,6 +256,7 @@ fn driver_error(e: DriverError) -> AppError {
     match e {
         DriverError::Unreachable(m) => AppError::Unavailable(m),
         DriverError::Backend(m) if m.starts_with("not found") => AppError::NotFound(m),
+        DriverError::Backend(m) if m.starts_with("invalid") => AppError::Validation(m),
         DriverError::Backend(m) => AppError::Conflict(m),
         e => AppError::Driver(e.to_string()),
     }
@@ -929,4 +932,78 @@ async fn clone_native_snapshot(
                      "size_bytes": size_bytes, "state": "available" }),
         ),
     ))
+}
+
+/// Largest block read or write the gateway proxies in one request.
+pub(crate) const MAX_VOLUME_IO_BYTES: usize = 4 << 20;
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct VolumeIoParams {
+    offset: u64,
+    len: Option<u64>,
+}
+
+/// The native driver and native id for block I/O on `id`, after the role and tenant checks.
+async fn volume_for_io(
+    s: &AppState,
+    actor: &Actor,
+    id: &str,
+) -> AppResult<(std::sync::Arc<dyn StorageDriver>, String)> {
+    crate::auth::require_role(s.config.auth_required, actor, crate::auth::ROLE_OPERATOR)?;
+    let vol = atlas_inventory::get_volume(&s.pool, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("volume {id}")))?;
+    let tenant = atlas_inventory::volume_tenant(&s.pool, id).await?;
+    crate::auth::require_tenant(
+        s.config.auth_required,
+        actor,
+        &tenant,
+        format!("volume {id}"),
+    )?;
+    let driver = native_driver_for_volume(s, id).await?.ok_or_else(|| {
+        AppError::Validation("block data access is only available for atlas-native volumes".into())
+    })?;
+    Ok((
+        driver,
+        vol.backend_native_id.unwrap_or_else(|| id.to_string()),
+    ))
+}
+
+/// `GET /volumes/{id}/data?offset=N&len=M` — raw bytes of an atlas-native volume.
+pub(crate) async fn read_volume_data(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Query(q): Query<VolumeIoParams>,
+) -> AppResult<Response> {
+    let len = q
+        .len
+        .ok_or_else(|| AppError::Validation("query parameter len is required".into()))?;
+    if len > MAX_VOLUME_IO_BYTES as u64 {
+        return Err(AppError::Validation(format!(
+            "len exceeds {MAX_VOLUME_IO_BYTES} bytes"
+        )));
+    }
+    let (driver, native) = volume_for_io(&s, &actor, &id).await?;
+    let data = driver
+        .read_volume(&native, q.offset, len)
+        .await
+        .map_err(driver_error)?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response())
+}
+
+/// `PUT /volumes/{id}/data?offset=N` — writes the raw body into an atlas-native volume.
+pub(crate) async fn write_volume_data(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Query(q): Query<VolumeIoParams>,
+    body: Bytes,
+) -> AppResult<StatusCode> {
+    let (driver, native) = volume_for_io(&s, &actor, &id).await?;
+    driver
+        .write_volume(&native, q.offset, body.to_vec())
+        .await
+        .map_err(driver_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
