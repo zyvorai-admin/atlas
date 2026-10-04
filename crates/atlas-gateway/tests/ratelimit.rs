@@ -78,6 +78,16 @@ async fn rate_limit_trips_429() {
         axum::serve(listener, app).await.unwrap();
     });
 
+    // Counters reset on each wall-clock minute; 12 requests straddling one would be allowed twice.
+    let into_minute = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        % 60.0;
+    if into_minute > 55.0 {
+        tokio::time::sleep(std::time::Duration::from_secs_f64(60.5 - into_minute)).await;
+    }
+
     let c = reqwest::Client::new();
     let mut ok = 0;
     let mut limited = 0;
