@@ -202,3 +202,60 @@ fn snapshot_reads_and_clones_are_isolated() {
     assert_eq!(e.read_file("f", a, 0, 64).unwrap(), b"VERSION TWO, long");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn filesystem_grid_is_its_own_and_survives_snapshot_and_clone() {
+    let (e, root) = engine("grid");
+    // The cluster grid in these tests is 16 bytes.
+    assert!(e.create_fs_with("big".into(), "big", Some(32)).is_err());
+    assert!(e.create_fs_with("zero".into(), "zero", Some(0)).is_err());
+    e.create_fs_with("f".into(), "fs", Some(4)).unwrap();
+    e.create_fs_as("d".into(), "default").unwrap();
+    let grid = |id: &str| {
+        e.filesystems()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .extent_bytes
+    };
+    assert_eq!(grid("f"), 4);
+    assert_eq!(grid("d"), 16, "the default never exceeds the cluster grid");
+
+    let ino = e
+        .fs_mknode("f", ROOT_INO, node("a", NodeType::File))
+        .unwrap()
+        .ino;
+    let mut model = vec![0u8; 0];
+    for (off, len, b) in [
+        (0u64, 23usize, 1u8),
+        (5, 1, 2),
+        (3, 6, 3),
+        (30, 2, 4),
+        (17, 9, 5),
+    ] {
+        e.write_file("f", ino, off, &vec![b; len]).unwrap();
+        let end = off as usize + len;
+        if model.len() < end {
+            model.resize(end, 0);
+        }
+        model[off as usize..end].fill(b);
+    }
+    assert_eq!(e.read_file("f", ino, 0, 64).unwrap(), model);
+    assert_eq!(e.read_file("f", ino, 6, 7).unwrap(), model[6..13]);
+    e.fs_setattr("f", ino, truncate(10)).unwrap();
+    e.fs_setattr("f", ino, truncate(14)).unwrap();
+    model.truncate(10);
+    model.resize(14, 0);
+    assert_eq!(e.read_file("f", ino, 0, 64).unwrap(), model);
+
+    e.snapshot_fs_as("s".into(), "f", "s").unwrap();
+    e.clone_fs_as("c".into(), "s", "c").unwrap();
+    assert_eq!(grid("c"), 4);
+    e.write_file("c", ino, 1, b"zz").unwrap();
+    assert_eq!(e.read_file("f@s", ino, 0, 64).unwrap(), model);
+    assert_eq!(e.read_file("f", ino, 0, 64).unwrap(), model);
+    model[1..3].copy_from_slice(b"zz");
+    assert_eq!(e.read_file("c", ino, 0, 64).unwrap(), model);
+    let _ = std::fs::remove_dir_all(root);
+}

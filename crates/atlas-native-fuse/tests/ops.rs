@@ -487,3 +487,58 @@ fn concurrent_creates_do_not_starve_each_other() {
     }
     assert_eq!(ops.readdir(ROOT_INO).unwrap().len(), 16 * 25);
 }
+
+#[test]
+fn extended_attributes_round_trip_and_follow_snapshots() {
+    let c = Cluster::start();
+    create_fs(&c, "x");
+    let ops = mount(&c, "x", OpsConfig::default());
+    let f = ops
+        .mknode(ROOT_INO, "f", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    assert_eq!(ops.listxattr(f.ino).unwrap(), Vec::<String>::new());
+    assert_eq!(ops.getxattr(f.ino, "user.a"), Err(libc::ENODATA));
+    ops.setxattr(f.ino, "user.a", b"one", false, false).unwrap();
+    ops.setxattr(f.ino, "user.b c", &[0, 255, 7], true, false)
+        .unwrap();
+    assert_eq!(ops.getxattr(f.ino, "user.a").unwrap(), b"one");
+    assert_eq!(ops.getxattr(f.ino, "user.b c").unwrap(), [0, 255, 7]);
+    assert_eq!(
+        ops.setxattr(f.ino, "user.a", b"x", true, false),
+        Err(libc::EEXIST)
+    );
+    assert_eq!(
+        ops.setxattr(f.ino, "user.zz", b"x", false, true),
+        Err(libc::ENODATA)
+    );
+    ops.setxattr(f.ino, "user.a", b"two", false, true).unwrap();
+    assert_eq!(ops.getxattr(f.ino, "user.a").unwrap(), b"two");
+    assert_eq!(
+        ops.setxattr(f.ino, "system.posix_acl_access", b"x", false, false),
+        Err(libc::EOPNOTSUPP)
+    );
+    assert_eq!(
+        ops.setxattr(f.ino, "user.big", &vec![1; 65 << 10], false, false),
+        Err(libc::E2BIG)
+    );
+    assert_eq!(ops.listxattr(f.ino).unwrap(), ["user.a", "user.b c"]);
+
+    c.client()
+        .json(
+            Method::POST,
+            "/v1/fs/x/snapshots",
+            Body::Json(json!({ "id": "xs", "name": "s" })),
+            Retry::Idempotent,
+        )
+        .unwrap();
+    ops.removexattr(f.ino, "user.a").unwrap();
+    assert_eq!(ops.removexattr(f.ino, "user.a"), Err(libc::ENODATA));
+    assert_eq!(ops.listxattr(f.ino).unwrap(), ["user.b c"]);
+
+    let snap = mount(&c, "x@xs", OpsConfig::default());
+    assert_eq!(snap.getxattr(f.ino, "user.a").unwrap(), b"two");
+    assert_eq!(
+        snap.setxattr(f.ino, "user.n", b"x", false, false),
+        Err(libc::EROFS)
+    );
+}

@@ -37,6 +37,14 @@ enum Target<'a> {
 }
 
 impl Target<'_> {
+    /// The extent grid: the cluster's for volumes, the filesystem's own for files.
+    fn grid(&self, c: &Catalog, cluster: usize) -> Result<u64, NativeError> {
+        Ok(match self {
+            Target::Volume(_) => cluster as u64,
+            Target::File { fs, .. } => c.filesystem(fs)?.extent_bytes.unwrap_or(cluster as u64),
+        })
+    }
+
     /// The extent currently at grid cell `cell`, if any.
     fn extent_at(&self, c: &Catalog, cell: u64) -> Result<Option<ExtentRef>, NativeError> {
         let id = match self {
@@ -391,13 +399,13 @@ impl NativeEngine {
         // Extents sit on a fixed grid (extent i covers [i*E, (i+1)*E)), so a write never leaves
         // two extents covering the same bytes. A write that covers only part of an existing
         // extent's bytes rewrites the whole extent with the old bytes merged in.
-        let grid = self.cfg.extent_bytes as u64;
+        let grid = self.with_catalog(|c| target.grid(c, self.cfg.extent_bytes))??;
         let mut pos = offset;
         let mut rest = data;
         while !rest.is_empty() {
             let cell = pos - pos % grid;
             let within = (pos - cell) as usize;
-            let n = rest.len().min(self.cfg.extent_bytes - within);
+            let n = rest.len().min(grid as usize - within);
             let (part, tail) = rest.split_at(n);
             let existing = self.with_catalog(|c| target.extent_at(c, cell))??;
             let merged;
@@ -513,7 +521,8 @@ impl NativeEngine {
                 .volumes
                 .get(volume_id)
                 .ok_or_else(|| NativeError::NotFound(volume_id.into()))?;
-            self.extents_in(c, &vol.extents, vol.size_bytes, offset, len)
+            let grid = self.cfg.extent_bytes as u64;
+            self.extents_in(c, &vol.extents, grid, vol.size_bytes, offset, len)
         })??;
         self.read_range(extents, offset, len)
     }
@@ -569,7 +578,14 @@ impl NativeEngine {
             } else {
                 c.written_end(&s.extents)
             };
-            self.extents_in(c, &s.extents, size, offset, len)
+            self.extents_in(
+                c,
+                &s.extents,
+                self.cfg.extent_bytes as u64,
+                size,
+                offset,
+                len,
+            )
         })??;
         self.read_range(extents, offset, len)
     }
@@ -1012,6 +1028,7 @@ impl NativeEngine {
         &self,
         c: &Catalog,
         extents: &std::collections::BTreeMap<u64, String>,
+        grid: u64,
         size: u64,
         offset: u64,
         len: usize,
@@ -1023,7 +1040,7 @@ impl NativeEngine {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let first = offset - offset % self.cfg.extent_bytes as u64;
+        let first = offset - offset % grid;
         extents
             .range(first..end)
             .map(|(_, eid)| {

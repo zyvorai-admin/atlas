@@ -92,7 +92,7 @@ pid/cgroup attribution; if attach fails, live mode reports the programs missing 
 fabricating data. NFS/ZFS/io_uring programs are still contracts only.
 
 **atlas-native filesystems** (`docs/NATIVE_FS.md`): POSIX files and directories in the native
-cluster's replicated catalog (inodes, hard links, rename, setattr/truncate, symlinks, special files),
+cluster's replicated catalog (inodes, hard links, rename, setattr/truncate, symlinks, special files, extended attributes; per-filesystem extent grid),
 file data on the same copy-on-write extents as block volumes, metadata-only snapshots (read-only,
 `<fs>@<snap>`) and clones. `atlas-native-mount` (`crates/atlas-native-fuse`, `fuse` feature, Linux)
 mounts them through FUSE with leader failover, TTL attribute/name caching, write-back and

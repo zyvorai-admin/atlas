@@ -8,9 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{now_ns, NativeEngine, NativeError, Target};
 use crate::{
-    metadata::{Catalog, MetaCommand, SnapshotId},
-    namespace::{file_extents, FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr},
+    metadata::{Catalog, MetaCommand, MetaError, SnapshotId},
+    namespace::{file_extents, FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode},
 };
+
+/// File extent grid for new filesystems: a 4 KiB write rewrites at most this much.
+pub const DEFAULT_FS_EXTENT_BYTES: u64 = 1 << 20;
 
 /// What `stat(2)` needs about an inode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +50,8 @@ pub struct FsInfo {
     /// Sum of file sizes.
     pub bytes: u64,
     pub source_snapshot: Option<SnapshotId>,
+    /// File extent grid: the most a small write rewrites.
+    pub extent_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,13 +148,33 @@ impl NativeEngine {
         self.with_catalog(|c| f(c, c.fs_view(fs)?))?
     }
 
-    /// Creates an empty filesystem with a caller-chosen id (idempotent).
+    /// Creates an empty filesystem with a caller-chosen id (idempotent) and the default grid.
     pub fn create_fs_as(&self, id: String, name: impl Into<String>) -> Result<FsId, NativeError> {
+        self.create_fs_with(id, name, None)
+    }
+
+    /// As [`Self::create_fs_as`] with an explicit file extent grid, at most the cluster's
+    /// `extent_bytes`. `None` picks [`DEFAULT_FS_EXTENT_BYTES`] (or the cluster grid if that is
+    /// smaller).
+    pub fn create_fs_with(
+        &self,
+        id: String,
+        name: impl Into<String>,
+        extent_bytes: Option<u64>,
+    ) -> Result<FsId, NativeError> {
         writable(&id)?;
+        let cluster = self.cfg.extent_bytes as u64;
+        let grid = extent_bytes.unwrap_or(DEFAULT_FS_EXTENT_BYTES.min(cluster));
+        if grid == 0 || grid > cluster {
+            return Err(NativeError::Invalid(format!(
+                "extent_bytes must be 1..={cluster}, got {grid}"
+            )));
+        }
         self.fs_commit(FsOp::CreateFs {
             fs: id.clone(),
             name: name.into(),
             now_ns: now_ns(),
+            extent_bytes: Some(grid),
         })?;
         Ok(id)
     }
@@ -174,6 +199,7 @@ impl NativeEngine {
                         .map(Inode::size)
                         .sum(),
                     source_snapshot: f.source_snapshot.clone(),
+                    extent_bytes: f.extent_bytes.unwrap_or(self.cfg.extent_bytes as u64),
                 })
                 .collect()
         })
@@ -221,6 +247,52 @@ impl NativeEngine {
             _ => Err(NativeError::Invalid(format!(
                 "inode {ino} is not a symlink"
             ))),
+        })
+    }
+
+    /// Names of the inode's extended attributes.
+    pub fn fs_listxattr(&self, fs: &str, ino: u64) -> Result<Vec<String>, NativeError> {
+        self.with_fs(fs, |_, f| {
+            Ok(f.inode(ino)?.xattrs.keys().cloned().collect())
+        })
+    }
+
+    pub fn fs_getxattr(&self, fs: &str, ino: u64, name: &str) -> Result<Vec<u8>, NativeError> {
+        self.with_fs(fs, |_, f| {
+            f.inode(ino)?
+                .xattrs
+                .get(name)
+                .cloned()
+                .ok_or_else(|| MetaError::NoAttr(name.into()).into())
+        })
+    }
+
+    pub fn fs_setxattr(
+        &self,
+        fs: &str,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        mode: XattrMode,
+    ) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::SetXattr {
+            fs: fs.into(),
+            ino,
+            name: name.into(),
+            value: value.to_vec(),
+            mode,
+            now_ns: now_ns(),
+        })
+    }
+
+    pub fn fs_removexattr(&self, fs: &str, ino: u64, name: &str) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::RemoveXattr {
+            fs: fs.into(),
+            ino,
+            name: name.into(),
+            now_ns: now_ns(),
         })
     }
 
@@ -309,9 +381,9 @@ impl NativeEngine {
             .lock()
             .map_err(|_| NativeError::Poisoned("write"))?;
         if let Some(size) = attr.size {
-            let grid = self.cfg.extent_bytes as u64;
-            let cell = size - size % grid;
             let target = Target::File { fs, ino };
+            let grid = self.with_catalog(|c| target.grid(c, self.cfg.extent_bytes))??;
+            let cell = size - size % grid;
             if size > cell {
                 if let Some(ext) = self.with_catalog(|c| target.extent_at(c, cell))?? {
                     if cell + ext.len as u64 > size {
@@ -376,7 +448,8 @@ impl NativeEngine {
             if len == 0 {
                 return Ok((Vec::new(), 0));
             }
-            Ok((self.extents_in(c, extents, *size, offset, len)?, len))
+            let grid = f.extent_bytes.unwrap_or(self.cfg.extent_bytes as u64);
+            Ok((self.extents_in(c, extents, grid, *size, offset, len)?, len))
         })?;
         self.read_range(extents, offset, len)
     }
