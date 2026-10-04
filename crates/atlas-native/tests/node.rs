@@ -177,6 +177,24 @@ impl Cluster {
         }
     }
 
+    /// Sends `method path` to whichever metadata node is the leader and returns its answer.
+    fn on_leader_any(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            for (_, addr) in self.meta_addrs() {
+                let (st, b) = api(addr, method, path, body);
+                if st != 421 && st != 503 {
+                    return (st, b);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no leader answered {method} {path}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn wait_read(&self, path: &str, want: &[u8]) {
         for (id, addr) in self.meta_addrs() {
             let deadline = Instant::now() + WAIT;
@@ -542,4 +560,200 @@ fn http_members_list_and_remove_a_voter() {
         br#"{"name":"after","size_bytes":4096}"#,
         201,
     );
+}
+
+#[test]
+fn http_file_api_on_a_three_node_cluster() {
+    let c = Cluster::start(3, 3, 0);
+    let _ = c.on_leader("POST", "/v1/fs", br#"{"id":"f1","name":"home"}"#, 201);
+    let call = |method: &str, path: &str, body: &[u8]| {
+        // Leadership may move under load; follow it like a client would.
+        c.on_leader_any(method, path, body)
+    };
+    let code = |method: &str, path: &str, body: &[u8]| {
+        let (st, b) = c.on_leader_any(method, path, body);
+        (
+            st,
+            json(&b)["code"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    // A retried create is a no-op.
+    assert_eq!(
+        call("POST", "/v1/fs", br#"{"id":"f1","name":"home"}"#).0,
+        201
+    );
+
+    let mk = |parent: u64, body: &str| {
+        let (st, b) = call(
+            "POST",
+            &format!("/v1/fs/f1/inodes/{parent}/entries"),
+            body.as_bytes(),
+        );
+        assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+        json(&b)["ino"].as_u64().unwrap()
+    };
+    let d = mk(1, r#"{"name":"d","op_id":"o1","kind":"dir","mode":493}"#);
+    let a = mk(
+        d,
+        r#"{"name":"my file é","op_id":"o2","kind":"file","mode":420}"#,
+    );
+    assert_eq!(
+        mk(
+            d,
+            r#"{"name":"my file é","op_id":"o2","kind":"file","mode":420}"#
+        ),
+        a
+    );
+    let l = mk(
+        1,
+        r#"{"name":"ln","op_id":"o3","kind":"symlink","target":"d/my file é"}"#,
+    );
+
+    // Unaligned write across extent boundaries, then read it back from every replica.
+    let payload: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+    let (st, b) = call(
+        "PUT",
+        &format!("/v1/fs/f1/inodes/{a}/data?offset=100"),
+        &payload,
+    );
+    assert_eq!(st, 200);
+    assert_eq!(json(&b)["size"], 6100);
+    let mut want = vec![0u8; 100];
+    want.extend_from_slice(&payload);
+    c.wait_read(
+        &format!("/v1/fs/f1/inodes/{a}/data?offset=0&len=9000"),
+        &want,
+    );
+
+    let (st, b) = call(
+        "GET",
+        &format!("/v1/fs/f1/inodes/{d}/lookup?name=my%20file+%C3%A9"),
+        b"",
+    );
+    assert_eq!((st, json(&b)["ino"].as_u64()), (200, Some(a)));
+    let (_, b) = call("GET", "/v1/fs/f1/inodes/1/entries", b"");
+    let names = json(&b)["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["d", "ln"]);
+    let (_, b) = call("GET", &format!("/v1/fs/f1/inodes/{l}/target"), b"");
+    assert_eq!(json(&b)["target"], "d/my file é");
+
+    // Errors carry a stable code for errno mapping.
+    let entries = format!("/v1/fs/f1/inodes/{d}/entries");
+    assert_eq!(
+        code(
+            "POST",
+            &entries,
+            br#"{"name":"my file \u00e9","op_id":"x","kind":"file"}"#
+        ),
+        (409, "exists".into())
+    );
+    assert_eq!(
+        code("POST", "/v1/fs/f1/inodes/1/rmdir", br#"{"name":"d"}"#),
+        (409, "not_empty".into())
+    );
+    assert_eq!(
+        code("POST", "/v1/fs/f1/inodes/1/unlink", br#"{"name":"d"}"#),
+        (409, "is_dir".into())
+    );
+    assert_eq!(
+        code("GET", "/v1/fs/f1/inodes/1/lookup?name=nope", b""),
+        (404, "not_found".into())
+    );
+    assert_eq!(
+        code(
+            "POST",
+            &format!("/v1/fs/f1/inodes/{a}/entries"),
+            br#"{"name":"x","op_id":"y","kind":"file"}"#
+        ),
+        (409, "not_dir".into())
+    );
+    assert_eq!(
+        code(
+            "POST",
+            "/v1/fs/f1/inodes/1/entries",
+            br#"{"name":"a/b","op_id":"z","kind":"file"}"#
+        ),
+        (409, "invalid".into())
+    );
+
+    // Hard link, rename, truncate.
+    let (st, b) = call(
+        "POST",
+        &format!("/v1/fs/f1/inodes/{a}/links"),
+        br#"{"parent":1,"name":"hard"}"#,
+    );
+    assert_eq!((st, json(&b)["nlink"].as_u64()), (200, Some(2)));
+    let rename =
+        format!(r#"{{"parent":{d},"name":"my file é","new_parent":1,"new_name":"moved"}}"#);
+    assert_eq!(call("POST", "/v1/fs/f1/rename", rename.as_bytes()).0, 204);
+    let (st, b) = call(
+        "POST",
+        &format!("/v1/fs/f1/inodes/{a}/attr"),
+        br#"{"size":50,"mode":384}"#,
+    );
+    assert_eq!(st, 200);
+    assert_eq!(
+        (json(&b)["size"].as_u64(), json(&b)["mode"].as_u64()),
+        (Some(50), Some(0o600))
+    );
+
+    // Snapshots are frozen, readable as fs@snap, and refuse writes.
+    let (st, b) = call(
+        "POST",
+        "/v1/fs/f1/snapshots",
+        br#"{"id":"s1","name":"before"}"#,
+    );
+    assert_eq!((st, json(&b)["id"].as_str()), (201, Some("s1")));
+    assert_eq!(
+        call(
+            "PUT",
+            &format!("/v1/fs/f1/inodes/{a}/data?offset=0"),
+            b"CHANGED"
+        )
+        .0,
+        200
+    );
+    c.wait_read(
+        &format!("/v1/fs/f1@s1/inodes/{a}/data?offset=0&len=50"),
+        &want[..50],
+    );
+    assert_eq!(
+        code(
+            "PUT",
+            &format!("/v1/fs/f1@s1/inodes/{a}/data?offset=0"),
+            b"x"
+        ),
+        (409, "read_only".into())
+    );
+    let (st, _) = call(
+        "POST",
+        "/v1/fs-snapshots/s1/clone",
+        br#"{"id":"c1","name":"copy"}"#,
+    );
+    assert_eq!(st, 201);
+    c.wait_read(
+        &format!("/v1/fs/c1/inodes/{a}/data?offset=0&len=50"),
+        &want[..50],
+    );
+    let (_, b) = call("GET", "/v1/fs", b"");
+    assert_eq!(json(&b)["filesystems"].as_array().unwrap().len(), 2);
+
+    assert_eq!(call("DELETE", "/v1/fs/c1", b"").0, 204);
+    assert_eq!(call("DELETE", "/v1/fs-snapshots/s1", b"").0, 204);
+    assert_eq!(
+        call("POST", "/v1/fs/f1/inodes/1/unlink", br#"{"name":"moved"}"#).0,
+        204
+    );
+    assert_eq!(
+        call("POST", "/v1/fs/f1/inodes/1/unlink", br#"{"name":"hard"}"#).0,
+        204
+    );
+    let (st, b) = call("POST", "/v1/gc", b"");
+    assert_eq!(st, 200);
+    assert!(json(&b)["reclaimed"].as_u64().unwrap() > 0);
 }

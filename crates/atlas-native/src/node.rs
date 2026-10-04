@@ -33,6 +33,8 @@ use crate::{
     tls::TlsIdentity,
 };
 
+mod fs_api;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
@@ -574,25 +576,50 @@ fn token_ok(expected: &str, header: Option<&String>) -> bool {
 }
 
 fn error_response(e: NativeError) -> Response {
-    let (status, leader) = match &e {
-        NativeError::NotFound(_)
-        | NativeError::Metadata(MetaError::NotFound(_))
-        | NativeError::Raft(RaftError::Rejected(MetaError::NotFound(_))) => (404, None),
-        NativeError::Invalid(_) => (400, None),
-        NativeError::Raft(RaftError::NotLeader { leader }) => (421, leader.clone()),
-        NativeError::Raft(RaftError::Rejected(_) | RaftError::MembershipBusy)
-        | NativeError::Metadata(_) => (409, None),
-        NativeError::Raft(RaftError::Config(_)) => (400, None),
-        NativeError::InsufficientReplicas { .. }
-        | NativeError::Fenced { .. }
-        | NativeError::Raft(
-            RaftError::LeadershipLost { .. }
-            | RaftError::TermChanged { .. }
-            | RaftError::Timeout { .. },
-        ) => (503, None),
-        _ => (500, None),
+    let meta = match &e {
+        NativeError::Metadata(m) | NativeError::Raft(RaftError::Rejected(m)) => Some(m),
+        _ => None,
     };
-    Response::json(status, &json!({ "error": e.to_string(), "leader": leader }))
+    // `code` is stable for clients (the FUSE client maps it to an errno); `error` is for humans.
+    let (status, code, leader) = match (&e, meta) {
+        (NativeError::NotFound(_), _) | (_, Some(MetaError::NotFound(_))) => {
+            (404, "not_found", None)
+        }
+        (_, Some(m)) => (
+            409,
+            match m {
+                MetaError::Exists(_) => "exists",
+                MetaError::NotEmpty(_) => "not_empty",
+                MetaError::NotDir(_) => "not_dir",
+                MetaError::IsDir(_) => "is_dir",
+                _ => "invalid",
+            },
+            None,
+        ),
+        (NativeError::Invalid(_) | NativeError::Raft(RaftError::Config(_)), _) => {
+            (400, "invalid", None)
+        }
+        (NativeError::ReadOnly(_), _) => (409, "read_only", None),
+        (NativeError::Raft(RaftError::NotLeader { leader }), _) => {
+            (421, "not_leader", leader.clone())
+        }
+        (NativeError::Raft(RaftError::MembershipBusy), _) => (409, "busy", None),
+        (
+            NativeError::InsufficientReplicas { .. }
+            | NativeError::Fenced { .. }
+            | NativeError::Raft(
+                RaftError::LeadershipLost { .. }
+                | RaftError::TermChanged { .. }
+                | RaftError::Timeout { .. },
+            ),
+            _,
+        ) => (503, "unavailable", None),
+        _ => (500, "internal", None),
+    };
+    Response::json(
+        status,
+        &json!({ "error": e.to_string(), "code": code, "leader": leader }),
+    )
 }
 
 fn query_u64(req: &Request, key: &str) -> Result<u64, Response> {
@@ -700,6 +727,9 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
     let Some(e) = &sh.engine else {
         return Response::text(404, "the metadata role is not enabled on this node");
     };
+    if let ["v1", "fs" | "fs-snapshots", ..] = segs.as_slice() {
+        return fs_api::route(sh, e, &req, &segs).unwrap_or_else(error_response);
+    }
     let result = match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["v1", "volumes"]) => e
             .volumes()
