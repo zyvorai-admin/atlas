@@ -4,7 +4,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::{alloc::FreeList, membership::Membership};
+use crate::{
+    alloc::FreeList,
+    membership::Membership,
+    namespace::{FsId, FsMeta, FsOp, FsSnapshotMeta},
+};
 
 pub type VolumeId = String;
 pub type SnapshotId = String;
@@ -69,6 +73,10 @@ pub struct Catalog {
     /// Raft transport address (`host:port`) of every node named by a membership change.
     #[serde(default)]
     pub raft_addrs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub filesystems: BTreeMap<FsId, FsMeta>,
+    #[serde(default)]
+    pub fs_snapshots: BTreeMap<SnapshotId, FsSnapshotMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +135,10 @@ pub enum MetaCommand {
         #[serde(default)]
         addrs: BTreeMap<String, String>,
     },
+    /// A file or directory namespace change ([`crate::namespace`]).
+    Fs {
+        op: FsOp,
+    },
     /// Appended by a new Raft leader so entries from earlier terms can be committed.
     Noop,
 }
@@ -137,6 +149,14 @@ pub enum MetaError {
     NotFound(String),
     #[error("invalid metadata transition: {0}")]
     Invalid(String),
+    #[error("already exists: {0}")]
+    Exists(String),
+    #[error("directory not empty: {0}")]
+    NotEmpty(String),
+    #[error("not a directory: {0}")]
+    NotDir(String),
+    #[error("is a directory: {0}")]
+    IsDir(String),
 }
 
 impl Catalog {
@@ -185,20 +205,7 @@ impl Catalog {
                         .ok_or_else(|| MetaError::NotFound(volume_id.clone()))?;
                     vol.extents.insert(*logical_offset, extent.id.clone())
                 };
-                if !self.extents.contains_key(&extent.id) {
-                    for r in &extent.replicas {
-                        self.free
-                            .reserve(&r.node_id, r.device_index, r.offset, extent.len as u64);
-                    }
-                }
-                self.extents
-                    .entry(extent.id.clone())
-                    .and_modify(|e| e.refs += 1)
-                    .or_insert(ExtentMeta {
-                        extent: extent.clone(),
-                        refs: 1,
-                        tombstoned: false,
-                    });
+                self.add_extent_ref(extent);
                 if let Some(old_id) = old {
                     self.dec_ref(&old_id, &mut gc_candidates)?;
                 }
@@ -393,6 +400,7 @@ impl Catalog {
                     .extend(addrs.iter().map(|(k, v)| (k.clone(), v.clone())));
                 self.membership = Some(membership.clone());
             }
+            MetaCommand::Fs { op } => self.apply_fs(op, &mut gc_candidates)?,
             MetaCommand::Noop => {}
         }
         self.applied(term, index, gc_candidates)
@@ -444,7 +452,29 @@ impl Catalog {
             .unwrap_or(0)
     }
 
-    fn dec_ref(&mut self, extent_id: &str, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
+    /// Takes a reference on `extent`, reserving its device ranges the first time it is seen.
+    pub(crate) fn add_extent_ref(&mut self, extent: &ExtentRef) {
+        if !self.extents.contains_key(&extent.id) {
+            for r in &extent.replicas {
+                self.free
+                    .reserve(&r.node_id, r.device_index, r.offset, extent.len as u64);
+            }
+        }
+        self.extents
+            .entry(extent.id.clone())
+            .and_modify(|e| e.refs += 1)
+            .or_insert(ExtentMeta {
+                extent: extent.clone(),
+                refs: 1,
+                tombstoned: false,
+            });
+    }
+
+    pub(crate) fn dec_ref(
+        &mut self,
+        extent_id: &str,
+        gc: &mut Vec<ExtentId>,
+    ) -> Result<(), MetaError> {
         let e = self
             .extents
             .get_mut(extent_id)

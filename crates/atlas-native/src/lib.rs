@@ -22,6 +22,7 @@ pub mod http;
 pub mod membership;
 pub mod metadata;
 pub mod metrics;
+pub mod namespace;
 pub mod node;
 pub mod placement;
 pub mod raft;
@@ -39,6 +40,7 @@ pub use engine::{
 pub use gc::GcStats;
 pub use membership::Membership;
 pub use metadata::{Catalog, MetaCommand, SnapshotId, VolumeId};
+pub use namespace::{FsId, FsOp, Inode, InodeKind, NodeType, SetAttr, ROOT_INO};
 pub use placement::{FailureDomain, Node, PlacementPolicy};
 pub use raft::{Envelope, Message, RaftConfig, RaftCounters, RaftError, RaftNode, Role};
 pub use raft_server::{RaftServer, RaftStatus};
