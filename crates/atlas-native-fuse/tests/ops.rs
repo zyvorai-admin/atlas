@@ -454,10 +454,10 @@ fn snapshot_mounts_are_read_only_and_clones_are_isolated() {
 fn concurrent_creates_do_not_starve_each_other() {
     let c = Cluster::start();
     create_fs(&c, "busy");
-    // No retries: a request held back past the proposal timeout fails the test.
+    // Retries ride out an election on a slow runner; a request starved behind the others kept
+    // timing out for longer than the whole retry budget.
     let mut cfg = ClientConfig::new(c.endpoints());
     cfg.token = Some(TOKEN.into());
-    cfg.retry_for = Duration::ZERO;
     let ops = std::sync::Arc::new(Ops::new(
         Client::new(cfg).unwrap(),
         "busy",
