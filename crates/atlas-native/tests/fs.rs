@@ -37,6 +37,7 @@ fn node(name: &str, kind: NodeType) -> NewNode {
         op_id: format!("op-{name}"),
         kind,
         target: (kind == NodeType::Symlink).then(|| "target".into()),
+        rdev: 0,
         mode: 0o644,
         uid: 1000,
         gid: 1000,

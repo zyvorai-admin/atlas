@@ -70,6 +70,11 @@ pub enum InodeKind {
     Symlink {
         target: String,
     },
+    /// A FIFO, socket or device node: metadata only, the kernel implements its behaviour.
+    Special {
+        node_type: NodeType,
+        rdev: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +83,10 @@ pub enum NodeType {
     File,
     Dir,
     Symlink,
+    Fifo,
+    Socket,
+    CharDevice,
+    BlockDevice,
 }
 
 /// Attribute changes; `None` leaves a field alone. A smaller `size` truncates (dropping whole
@@ -117,6 +126,9 @@ pub enum FsOp {
         node_type: NodeType,
         #[serde(default)]
         target: Option<String>,
+        /// Device number of a character or block device node.
+        #[serde(default)]
+        rdev: u64,
         mode: u32,
         uid: u32,
         gid: u32,
@@ -216,6 +228,7 @@ impl Inode {
             InodeKind::Dir { entries, .. } => entries.len() as u64,
             InodeKind::File { size, .. } => *size,
             InodeKind::Symlink { target } => target.len() as u64,
+            InodeKind::Special { .. } => 0,
         }
     }
 
@@ -407,6 +420,7 @@ impl Catalog {
                 op_id,
                 node_type,
                 target,
+                rdev,
                 mode,
                 uid,
                 gid,
@@ -440,6 +454,10 @@ impl Catalog {
                             })?;
                         InodeKind::Symlink { target: t.clone() }
                     }
+                    t => InodeKind::Special {
+                        node_type: *t,
+                        rdev: *rdev,
+                    },
                 };
                 let ino = f.next_ino;
                 f.next_ino += 1;
@@ -771,6 +789,7 @@ mod tests {
             op_id: op_id.into(),
             node_type: t,
             target: (t == NodeType::Symlink).then(|| "/tmp/x".to_string()),
+            rdev: 0,
             mode: 0o100644,
             uid: 1000,
             gid: 1000,
@@ -803,6 +822,15 @@ mod tests {
         let mut t = T::new();
         let a = t.mk(ROOT_INO, "a", NodeType::File);
         assert_eq!(t.fs().inode(a).unwrap().mode, 0o644);
+        let fifo = t.mk(ROOT_INO, "p", NodeType::Fifo);
+        assert!(matches!(
+            t.fs().inode(fifo).unwrap().kind,
+            InodeKind::Special {
+                node_type: NodeType::Fifo,
+                rdev: 0
+            }
+        ));
+        t.ok(unlink(ROOT_INO, "p"));
         // The retried create (same op id) is a no-op; a different create of the name is EEXIST.
         t.ok(mknode(ROOT_INO, "a", NodeType::File, "a"));
         assert_eq!(t.fs().inodes.len(), 2);

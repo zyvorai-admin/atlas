@@ -22,6 +22,9 @@ pub struct Attr {
     pub gid: u32,
     pub nlink: u32,
     pub size: u64,
+    /// Device number of a character or block device node.
+    #[serde(default)]
+    pub rdev: u64,
     /// Allocated 512-byte blocks (holes take none).
     pub blocks: u64,
     pub atime_ns: i64,
@@ -73,6 +76,8 @@ pub struct NewNode {
     #[serde(default)]
     pub target: Option<String>,
     #[serde(default)]
+    pub rdev: u64,
+    #[serde(default)]
     pub mode: u32,
     #[serde(default)]
     pub uid: u32,
@@ -85,6 +90,7 @@ fn kind_of(i: &Inode) -> NodeType {
         InodeKind::Dir { .. } => NodeType::Dir,
         InodeKind::File { .. } => NodeType::File,
         InodeKind::Symlink { .. } => NodeType::Symlink,
+        InodeKind::Special { node_type, .. } => node_type,
     }
 }
 
@@ -105,6 +111,10 @@ fn attr(c: &Catalog, i: &Inode) -> Attr {
         gid: i.gid,
         nlink: i.nlink,
         size: i.size(),
+        rdev: match i.kind {
+            InodeKind::Special { rdev, .. } => rdev,
+            _ => 0,
+        },
         blocks: allocated.div_ceil(512),
         atime_ns: i.atime_ns,
         mtime_ns: i.mtime_ns,
@@ -224,6 +234,7 @@ impl NativeEngine {
             op_id: node.op_id,
             node_type: node.kind,
             target: node.target,
+            rdev: node.rdev,
             mode: node.mode,
             uid: node.uid,
             gid: node.gid,
