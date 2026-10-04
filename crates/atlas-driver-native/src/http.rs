@@ -11,7 +11,7 @@ use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{NativeApi, NativeVolume, NodeStatus};
+use crate::{NativeApi, NativeFs, NativeVolume, NodeStatus};
 
 /// How long to keep retrying while every reachable node says it is not the leader (an
 /// election in progress). Only 421 is retried this way: nothing was proposed, so a retry cannot
@@ -61,6 +61,11 @@ struct Created {
 #[derive(Deserialize)]
 struct Volumes {
     volumes: Vec<NativeVolume>,
+}
+
+#[derive(Deserialize)]
+struct Filesystems {
+    filesystems: Vec<NativeFs>,
 }
 
 impl HttpApi {
@@ -332,5 +337,51 @@ impl NativeApi for HttpApi {
         self.call(Method::PUT, &path, Some(Body::Raw(data)))
             .await
             .map(drop)
+    }
+
+    async fn filesystems(&self) -> Result<Vec<NativeFs>, DriverError> {
+        match self.get::<Filesystems>("/v1/fs").await {
+            Ok(f) => Ok(f.filesystems),
+            // Nodes from before the file namespace have no `/v1/fs`.
+            Err(DriverError::Backend(m)) if m.starts_with("not found") => Ok(vec![]),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn create_fs(&self, id: &str, name: &str) -> Result<String, DriverError> {
+        self.post_created("/v1/fs", json!({ "id": path_id(id)?, "name": name }))
+            .await
+    }
+
+    async fn delete_fs(&self, id: &str) -> Result<(), DriverError> {
+        let path = format!("/v1/fs/{}", path_id(id)?);
+        self.call(Method::DELETE, &path, None).await.map(drop)
+    }
+
+    async fn create_fs_snapshot(
+        &self,
+        id: &str,
+        fs_id: &str,
+        name: &str,
+    ) -> Result<String, DriverError> {
+        let path = format!("/v1/fs/{}/snapshots", path_id(fs_id)?);
+        self.post_created(&path, json!({ "id": path_id(id)?, "name": name }))
+            .await
+    }
+
+    async fn clone_fs_snapshot(
+        &self,
+        id: &str,
+        snapshot_id: &str,
+        name: &str,
+    ) -> Result<String, DriverError> {
+        let path = format!("/v1/fs-snapshots/{}/clone", path_id(snapshot_id)?);
+        self.post_created(&path, json!({ "id": path_id(id)?, "name": name }))
+            .await
+    }
+
+    async fn delete_fs_snapshot(&self, id: &str) -> Result<(), DriverError> {
+        let path = format!("/v1/fs-snapshots/{}", path_id(id)?);
+        self.call(Method::DELETE, &path, None).await.map(drop)
     }
 }

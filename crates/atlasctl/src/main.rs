@@ -233,12 +233,19 @@ enum Command {
     CancelJob { id: String },
     /// GET /api/atlas/v1/snapshots
     Snapshots,
-    /// POST /api/atlas/v1/volumes — create a Ceph-backed volume (PVC)
+    /// POST /api/atlas/v1/volumes — create a volume: a Ceph-backed PVC by default, or directly on
+    /// another backend with `--backend` (e.g. `bkd_native`)
     CreateVolume {
         name: String,
-        /// Size in GiB.
+        /// Size in GiB (atlas-native filesystems have no size limit and ignore it).
         #[arg(long, default_value_t = 2)]
         size_gib: i64,
+        /// `block` or `filesystem`.
+        #[arg(long, default_value = "block")]
+        kind: String,
+        /// Create on this backend instead of provisioning a PVC.
+        #[arg(long)]
+        backend: Option<String>,
         #[arg(long, default_value = "database")]
         policy: String,
         #[arg(long, default_value = "default")]
@@ -526,7 +533,10 @@ async fn get_print(client: &reqwest::Client, token: Option<&str>, url: &str) -> 
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let resp = req.send().await.with_context(|| format!("request to {url}"))?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("request to {url}"))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     match serde_json::from_str::<serde_json::Value>(&body) {
@@ -787,6 +797,8 @@ async fn main() -> Result<()> {
         Command::CreateVolume {
             name,
             size_gib,
+            kind,
+            backend,
             policy,
             namespace,
             tenant,
@@ -797,9 +809,13 @@ async fn main() -> Result<()> {
                 "tenant_id": tenant,
                 "name": name,
                 "size_bytes": size_gib * 1024 * 1024 * 1024,
-                "kind": "block",
+                "kind": kind,
                 "policy": policy,
-                "kubernetes": { "namespace": namespace, "create_pvc": true }
+                "kubernetes": {
+                    "namespace": namespace,
+                    "create_pvc": backend.is_none(),
+                    "backend_id": backend,
+                }
             })),
         ),
         Command::SnapshotVolume { volume_id, name } => (

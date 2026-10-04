@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use atlas_driver_core::DriverError;
 
-use crate::{DataNodeInfo, Layout, NativeApi, NativeVolume, NodeStatus, RaftInfo};
+use crate::{DataNodeInfo, Layout, NativeApi, NativeFs, NativeVolume, NodeStatus, RaftInfo};
 
 #[derive(Default)]
 pub struct FakeApi {
@@ -23,6 +23,9 @@ struct State {
     snapshots: BTreeMap<String, (u64, u64)>,
     /// Written bytes per volume, up to the last written byte.
     data: BTreeMap<String, Vec<u8>>,
+    filesystems: BTreeMap<String, NativeFs>,
+    /// Filesystem snapshot id → the filesystem as it was.
+    fs_snapshots: BTreeMap<String, NativeFs>,
 }
 
 fn lock(m: &Mutex<State>) -> Result<std::sync::MutexGuard<'_, State>, DriverError> {
@@ -200,5 +203,88 @@ impl NativeApi for FakeApi {
         } else {
             Err(DriverError::Backend(format!("not found: snapshot {id}")))
         }
+    }
+
+    async fn filesystems(&self) -> Result<Vec<NativeFs>, DriverError> {
+        Ok(lock(&self.state)?.filesystems.values().cloned().collect())
+    }
+
+    async fn create_fs(&self, id: &str, name: &str) -> Result<String, DriverError> {
+        let mut s = lock(&self.state)?;
+        if let Some(f) = s.filesystems.get(id) {
+            return if f.name == name {
+                Ok(id.to_string())
+            } else {
+                Err(DriverError::Backend(format!(
+                    "filesystem {id} already exists"
+                )))
+            };
+        }
+        s.next += 1;
+        s.filesystems.insert(
+            id.to_string(),
+            NativeFs {
+                id: id.to_string(),
+                name: name.into(),
+                bytes: 0,
+                inodes: 1,
+                source_snapshot: None,
+            },
+        );
+        Ok(id.to_string())
+    }
+
+    async fn delete_fs(&self, id: &str) -> Result<(), DriverError> {
+        lock(&self.state)?
+            .filesystems
+            .remove(id)
+            .map(|_| ())
+            .ok_or_else(|| DriverError::Backend(format!("not found: filesystem {id}")))
+    }
+
+    async fn create_fs_snapshot(
+        &self,
+        id: &str,
+        fs_id: &str,
+        _name: &str,
+    ) -> Result<String, DriverError> {
+        let mut s = lock(&self.state)?;
+        let f = s
+            .filesystems
+            .get(fs_id)
+            .cloned()
+            .ok_or_else(|| DriverError::Backend(format!("not found: filesystem {fs_id}")))?;
+        s.next += 1;
+        s.fs_snapshots.insert(id.to_string(), f);
+        Ok(id.to_string())
+    }
+
+    async fn clone_fs_snapshot(
+        &self,
+        id: &str,
+        snapshot_id: &str,
+        name: &str,
+    ) -> Result<String, DriverError> {
+        let mut s = lock(&self.state)?;
+        let mut f = s.fs_snapshots.get(snapshot_id).cloned().ok_or_else(|| {
+            DriverError::Backend(format!("not found: filesystem snapshot {snapshot_id}"))
+        })?;
+        if s.filesystems.contains_key(id) {
+            return Ok(id.to_string());
+        }
+        s.next += 1;
+        f.id = id.to_string();
+        f.name = name.into();
+        f.source_snapshot = Some(snapshot_id.to_string());
+        s.filesystems.insert(id.to_string(), f);
+        Ok(id.to_string())
+    }
+
+    async fn delete_fs_snapshot(&self, id: &str) -> Result<(), DriverError> {
+        lock(&self.state)?
+            .fs_snapshots
+            .remove(id)
+            .map(|_| ())
+            .ok_or_else(|| DriverError::Backend(format!("not found: filesystem snapshot {id}")))
     }
 }

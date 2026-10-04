@@ -788,7 +788,15 @@ pub(crate) async fn enqueue_clone(
         .ok_or_else(|| {
             AppError::Validation("size_bytes is required (source volume unknown)".into())
         })?;
-    if size_bytes <= 0 {
+    // An atlas-native filesystem has no size limit; its size is the bytes in it, possibly 0.
+    let unsized_source = src
+        .as_ref()
+        .is_some_and(|v| v.kind == atlas_api_types::VolumeKind::Filesystem)
+        && atlas_inventory::volume_backend_id(&s.pool, &snap.volume_id)
+            .await?
+            .as_deref()
+            == Some(NATIVE_BACKEND_ID);
+    if size_bytes < 0 || (size_bytes == 0 && !unsized_source) {
         return Err(AppError::Validation("size_bytes must be > 0".into()));
     }
 
@@ -929,7 +937,7 @@ async fn clone_native_snapshot(
         Json(
             json!({ "volume_id": res.volume_id, "from_snapshot": snap.id, "mode": mode,
                      "backend_id": NATIVE_BACKEND_ID, "name": new_name,
-                     "size_bytes": size_bytes, "state": "available" }),
+                     "size_bytes": vol.size_bytes, "state": "available" }),
         ),
     ))
 }

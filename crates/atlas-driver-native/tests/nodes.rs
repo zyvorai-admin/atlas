@@ -301,3 +301,123 @@ async fn wrong_token_and_dead_cluster_are_unreachable() {
         Err(DriverError::Unreachable(_))
     ));
 }
+
+/// Sends to each node until one that is the leader answers.
+async fn on_leader(
+    c: &Cluster,
+    method: reqwest::Method,
+    path: &str,
+    body: Vec<u8>,
+) -> serde_json::Value {
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for ep in c.endpoints() {
+            let r = http
+                .request(method.clone(), format!("{ep}{path}"))
+                .bearer_auth(TOKEN)
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            if r.status().is_success() {
+                return r.json().await.unwrap_or(serde_json::Value::Null);
+            }
+            assert_eq!(r.status(), 421, "{path}: {}", r.text().await.unwrap());
+        }
+        assert!(Instant::now() < deadline, "no leader for {path}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_driver_manages_filesystems_on_a_live_cluster() {
+    let c = Cluster::start();
+    let d = driver(c.endpoints(), TOKEN);
+    wait_healthy(&d).await;
+
+    let mut req = create("shared");
+    req.kind = VolumeKind::Filesystem;
+    let fs = d.create_volume(req).await.unwrap();
+    let native = fs
+        .backend_native_id
+        .strip_prefix("fs:")
+        .unwrap()
+        .to_string();
+    let file = on_leader(
+        &c,
+        reqwest::Method::POST,
+        &format!("/v1/fs/{native}/inodes/1/entries"),
+        br#"{"name":"a.txt","op_id":"op1","kind":"file","mode":420}"#.to_vec(),
+    )
+    .await;
+    let ino = file["ino"].as_u64().unwrap();
+    on_leader(
+        &c,
+        reqwest::Method::PUT,
+        &format!("/v1/fs/{native}/inodes/{ino}/data?offset=0"),
+        vec![7u8; 5000],
+    )
+    .await;
+
+    let disc = d.discover().await.unwrap();
+    let v = disc.volumes.iter().find(|v| v.id == fs.volume_id).unwrap();
+    assert_eq!(v.kind, VolumeKind::Filesystem);
+    assert_eq!(v.size_bytes, 5000);
+    assert_eq!(
+        v.backend_native_id.as_deref(),
+        Some(fs.backend_native_id.as_str())
+    );
+
+    let snap = d
+        .create_snapshot(CreateSnapshotRequest {
+            volume_id: fs.backend_native_id.clone(),
+            name: "s1".into(),
+        })
+        .await
+        .unwrap();
+    // The source changes after the snapshot; the restored copy has the old contents.
+    on_leader(
+        &c,
+        reqwest::Method::PUT,
+        &format!("/v1/fs/{native}/inodes/{ino}/data?offset=5000"),
+        vec![8u8; 1000],
+    )
+    .await;
+    let restored = d
+        .clone_snapshot(CloneSnapshotRequest {
+            snapshot_id: snap.backend_native_id.clone(),
+            new_volume_name: "restored".into(),
+            size_bytes: Some(5000),
+        })
+        .await
+        .unwrap();
+    let sizes: BTreeMap<String, i64> = d
+        .list_volumes(POOL_NAME)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.id, v.size_bytes))
+        .collect();
+    assert_eq!(sizes[&fs.volume_id], 6000);
+    assert_eq!(sizes[&restored.volume_id], 5000);
+
+    assert!(d
+        .expand_volume(ExpandVolumeRequest {
+            volume_id: fs.backend_native_id.clone(),
+            new_size_bytes: 1 << 30,
+        })
+        .await
+        .is_err());
+    d.delete_snapshot(DeleteSnapshotRequest {
+        snapshot_id: snap.backend_native_id,
+    })
+    .await
+    .unwrap();
+    for id in [fs.backend_native_id, restored.backend_native_id] {
+        d.delete_volume(DeleteVolumeRequest { volume_id: id })
+            .await
+            .unwrap();
+    }
+    assert!(d.list_volumes(POOL_NAME).await.unwrap().is_empty());
+}

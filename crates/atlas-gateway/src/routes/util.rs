@@ -92,10 +92,14 @@ pub(crate) fn ceph_default_caps(t: BackendType) -> Capabilities {
             object: true,
             ..Capabilities::default()
         },
-        // atlas-driver-native creates/deletes block volumes and snapshots; no clone or resize yet.
+        // atlas-driver-native: block volumes (resizable) and filesystems, both with snapshots
+        // and clones.
         BackendType::Native => Capabilities {
             block: true,
+            file: true,
             snapshots: true,
+            clone: true,
+            expansion: true,
             ..Capabilities::default()
         },
         _ => Capabilities::default(),

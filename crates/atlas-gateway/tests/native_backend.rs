@@ -217,6 +217,93 @@ async fn native_backend_volume_and_snapshot_lifecycle() {
 }
 
 #[tokio::test]
+async fn native_backend_filesystem_snapshot_clone_and_restore() {
+    let base = format!("http://{}/api/atlas/v1", spawn().await);
+    let c = reqwest::Client::new();
+
+    let (_, backends) = send(c.get(format!("{base}/backends"))).await;
+    let native = backends
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == NATIVE_BACKEND_ID)
+        .unwrap()
+        .clone();
+    assert_eq!(native["capabilities"]["file"], true);
+    assert_eq!(native["capabilities"]["clone"], true);
+
+    let (st, created) = send(c.post(format!("{base}/volumes")).json(&json!({
+        "tenant_id": "acme",
+        "name": "shared",
+        "size_bytes": 1_073_741_824,
+        "kind": "filesystem",
+        "kubernetes": { "backend_id": NATIVE_BACKEND_ID }
+    })))
+    .await;
+    assert_eq!(st, 201, "{created}");
+    let fid = created["volume_id"].as_str().unwrap().to_string();
+    assert!(fid.starts_with("vol_native_fs_"), "{fid}");
+    let (st, vol) = send(c.get(format!("{base}/volumes/{fid}"))).await;
+    assert_eq!(st, 200, "{vol}");
+    assert_eq!(vol["kind"], "filesystem");
+    assert_eq!(
+        vol["size_bytes"], 0,
+        "a filesystem's size is the bytes in it"
+    );
+
+    let (st, body) = send(c.get(format!("{base}/volumes/{fid}/data?offset=0&len=1"))).await;
+    assert_eq!(st, 400, "no block I/O on a filesystem: {body}");
+    let (st, body) = send(
+        c.post(format!("{base}/volumes/{fid}/expand"))
+            .json(&json!({ "new_size_bytes": 2_147_483_648u64 })),
+    )
+    .await;
+    assert_eq!(st, 400, "a filesystem has no size limit: {body}");
+
+    let (st, snap) = send(
+        c.post(format!("{base}/volumes/{fid}/snapshots"))
+            .json(&json!({ "name": "before-upgrade" })),
+    )
+    .await;
+    assert_eq!(st, 201, "{snap}");
+    let sid = snap["snapshot_id"].as_str().unwrap().to_string();
+    assert!(sid.starts_with("snap_native_fs_"), "{sid}");
+
+    // An empty filesystem (size 0) can still be cloned and restored without a size.
+    let (st, clone) = send(
+        c.post(format!("{base}/snapshots/{sid}/clone"))
+            .json(&json!({ "name": "shared-copy" })),
+    )
+    .await;
+    assert_eq!(st, 201, "{clone}");
+    let cid = clone["volume_id"].as_str().unwrap().to_string();
+    let (_, cvol) = send(c.get(format!("{base}/volumes/{cid}"))).await;
+    assert_eq!(cvol["kind"], "filesystem");
+    assert_eq!(cvol["name"], "shared-copy");
+    let (st, restored) = send(
+        c.post(format!("{base}/snapshots/{sid}/restore"))
+            .json(&json!({})),
+    )
+    .await;
+    assert_eq!(st, 201, "{restored}");
+    let rid = restored["volume_id"].as_str().unwrap().to_string();
+    assert!(rid.starts_with("vol_native_fs_"), "{rid}");
+
+    let (st, body) = send(c.delete(format!("{base}/snapshots/{sid}"))).await;
+    assert_eq!(st, 409, "clones depend on the snapshot: {body}");
+    for id in [&cid, &rid] {
+        let (st, body) = send(c.delete(format!("{base}/volumes/{id}"))).await;
+        assert_eq!(st, 200, "{body}");
+    }
+    let (st, body) = send(c.delete(format!("{base}/snapshots/{sid}"))).await;
+    assert_eq!(st, 200, "{body}");
+    let (st, body) = send(c.delete(format!("{base}/volumes/{fid}"))).await;
+    assert_eq!(st, 200, "{body}");
+    let (st, _) = send(c.get(format!("{base}/volumes/{fid}"))).await;
+    assert_eq!(st, 404);
+}
+
+#[tokio::test]
 async fn native_backend_cannot_be_added_at_runtime() {
     let base = format!("http://{}/api/atlas/v1", spawn().await);
     let (st, body) = send(

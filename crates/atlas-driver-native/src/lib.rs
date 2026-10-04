@@ -5,8 +5,12 @@
 //!
 //! A native cluster maps to one Atlas cluster with one replicated pool (`native`); every native
 //! volume is a block `StorageVolume` with id `vol_native_<native id>`, snapshots are
-//! `snap_native_<native id>`. Capacity is not reported by the nodes, so it stays `None` rather
-//! than being made up; pool and volume `used_bytes` are the logical bytes of written extents.
+//! `snap_native_<native id>`. Native filesystems (`docs/NATIVE_FS.md`) are filesystem volumes
+//! with id `vol_native_fs_<native id>` and backend id `fs:<native id>`; their snapshots are
+//! `snap_native_fs_<native id>` / `fs:<native id>` (native ids never contain `_` or `:`).
+//! Capacity is not reported by the nodes, so it stays `None` rather than being made up; pool and
+//! volume `used_bytes` are the logical bytes of written extents. A filesystem has no size limit,
+//! so its `size_bytes` is the sum of its file sizes and expanding it is refused.
 //!
 //! Two implementations behind the same mapping, as with the other drivers:
 //! - [`FakeNativeDriver`] keeps volumes in memory (fixture; no network).
@@ -32,6 +36,10 @@ pub use http::{HttpApi, HttpApiConfig};
 pub const POOL_NAME: &str = "native";
 const VOLUME_PREFIX: &str = "vol_native_";
 const SNAPSHOT_PREFIX: &str = "snap_native_";
+const FS_VOLUME_PREFIX: &str = "vol_native_fs_";
+const FS_SNAPSHOT_PREFIX: &str = "snap_native_fs_";
+/// Marks a filesystem (or filesystem snapshot) in `backend_native_id`.
+const FS_NATIVE_PREFIX: &str = "fs:";
 
 /// `GET /v1/status`, the fields the driver uses.
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +81,18 @@ pub struct NativeVolume {
     pub extents: u64,
 }
 
+/// An entry of `GET /v1/fs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NativeFs {
+    pub id: String,
+    pub name: String,
+    /// Sum of file sizes.
+    pub bytes: u64,
+    pub inodes: u64,
+    #[serde(default)]
+    pub source_snapshot: Option<String>,
+}
+
 /// The node API operations the driver needs.
 #[async_trait]
 pub trait NativeApi: Send + Sync {
@@ -103,6 +123,22 @@ pub trait NativeApi: Send + Sync {
     async fn delete_snapshot(&self, id: &str) -> Result<(), DriverError>;
     async fn read(&self, volume_id: &str, offset: u64, len: u64) -> Result<Vec<u8>, DriverError>;
     async fn write(&self, volume_id: &str, offset: u64, data: Vec<u8>) -> Result<(), DriverError>;
+    async fn filesystems(&self) -> Result<Vec<NativeFs>, DriverError>;
+    async fn create_fs(&self, id: &str, name: &str) -> Result<String, DriverError>;
+    async fn delete_fs(&self, id: &str) -> Result<(), DriverError>;
+    async fn create_fs_snapshot(
+        &self,
+        id: &str,
+        fs_id: &str,
+        name: &str,
+    ) -> Result<String, DriverError>;
+    async fn clone_fs_snapshot(
+        &self,
+        id: &str,
+        snapshot_id: &str,
+        name: &str,
+    ) -> Result<String, DriverError>;
+    async fn delete_fs_snapshot(&self, id: &str) -> Result<(), DriverError>;
 }
 
 pub struct NativeDriver<A> {
@@ -134,14 +170,41 @@ impl FakeNativeDriver {
     }
 }
 
-/// The native volume id behind an Atlas volume id (or a bare native id).
-pub fn native_volume_id(id: &str) -> &str {
-    id.strip_prefix(VOLUME_PREFIX).unwrap_or(id)
+/// What an Atlas id or `backend_native_id` names on the native cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeRef<'a> {
+    Volume(&'a str),
+    Filesystem(&'a str),
 }
 
-/// The native snapshot id behind an Atlas snapshot id (or a bare native id).
-pub fn native_snapshot_id(id: &str) -> &str {
-    id.strip_prefix(SNAPSHOT_PREFIX).unwrap_or(id)
+/// The native volume or filesystem behind an Atlas volume id (or a backend native id).
+pub fn native_volume_ref(id: &str) -> NativeRef<'_> {
+    if let Some(fs) = id
+        .strip_prefix(FS_VOLUME_PREFIX)
+        .or_else(|| id.strip_prefix(FS_NATIVE_PREFIX))
+    {
+        NativeRef::Filesystem(fs)
+    } else {
+        NativeRef::Volume(id.strip_prefix(VOLUME_PREFIX).unwrap_or(id))
+    }
+}
+
+/// The native volume or filesystem snapshot behind an Atlas snapshot id (or a backend native id).
+pub fn native_snapshot_ref(id: &str) -> NativeRef<'_> {
+    if let Some(s) = id
+        .strip_prefix(FS_SNAPSHOT_PREFIX)
+        .or_else(|| id.strip_prefix(FS_NATIVE_PREFIX))
+    {
+        NativeRef::Filesystem(s)
+    } else {
+        NativeRef::Volume(id.strip_prefix(SNAPSHOT_PREFIX).unwrap_or(id))
+    }
+}
+
+fn block_only(what: &str) -> DriverError {
+    DriverError::Backend(format!(
+        "invalid: {what} is a filesystem; mount it with atlas-native-mount"
+    ))
 }
 
 fn sanitize(s: &str) -> String {
@@ -234,10 +297,43 @@ impl<A: NativeApi> NativeDriver<A> {
         }
     }
 
-    fn pool(&self, status: &NodeStatus, vols: &[NativeVolume]) -> StoragePool {
-        let used = status
-            .layout
-            .map(|l| vols.iter().filter_map(|v| Self::used(Some(l), v)).sum());
+    fn filesystem(&self, f: &NativeFs) -> StorageVolume {
+        StorageVolume {
+            id: format!("{FS_VOLUME_PREFIX}{}", f.id),
+            cluster_id: Some(self.cluster_id()),
+            pool_id: Some(self.pool_id()),
+            name: f.name.clone(),
+            kind: VolumeKind::Filesystem,
+            backend_native_id: Some(format!("{FS_NATIVE_PREFIX}{}", f.id)),
+            size_bytes: to_i64(f.bytes),
+            used_bytes: Some(to_i64(f.bytes)),
+            state: "available".into(),
+            health: Health::Ok,
+            kubernetes_namespace: None,
+            pvc_name: None,
+            storage_class_name: None,
+        }
+    }
+
+    fn all_volumes(
+        &self,
+        layout: Option<Layout>,
+        vols: &[NativeVolume],
+        fss: &[NativeFs],
+    ) -> Vec<StorageVolume> {
+        vols.iter()
+            .map(|v| self.volume(layout, v))
+            .chain(fss.iter().map(|f| self.filesystem(f)))
+            .collect()
+    }
+
+    fn pool(&self, status: &NodeStatus, vols: &[NativeVolume], fss: &[NativeFs]) -> StoragePool {
+        let used = status.layout.map(|l| {
+            vols.iter()
+                .filter_map(|v| Self::used(Some(l), v))
+                .chain(fss.iter().map(|f| to_i64(f.bytes)))
+                .sum()
+        });
         StoragePool {
             id: self.pool_id(),
             cluster_id: self.cluster_id(),
@@ -278,6 +374,7 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
     async fn discover(&self) -> Result<DiscoveryResult, DriverError> {
         let status = self.api.status().await?;
         let vols = self.api.volumes().await?;
+        let fss = self.api.filesystems().await?;
         let health = Self::storage_health(&status);
         Ok(DiscoveryResult {
             cluster: StorageCluster {
@@ -290,9 +387,9 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
                 used_capacity_bytes: None,
                 available_capacity_bytes: None,
             },
-            pools: vec![self.pool(&status, &vols)],
+            pools: vec![self.pool(&status, &vols, &fss)],
             osds: vec![],
-            volumes: vols.iter().map(|v| self.volume(status.layout, v)).collect(),
+            volumes: self.all_volumes(status.layout, &vols, &fss),
             health,
         })
     }
@@ -304,7 +401,8 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
     async fn list_pools(&self) -> Result<Vec<StoragePool>, DriverError> {
         let status = self.api.status().await?;
         let vols = self.api.volumes().await?;
-        Ok(vec![self.pool(&status, &vols)])
+        let fss = self.api.filesystems().await?;
+        Ok(vec![self.pool(&status, &vols, &fss)])
     }
 
     async fn list_volumes(&self, pool: &str) -> Result<Vec<StorageVolume>, DriverError> {
@@ -312,18 +410,15 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
             return Ok(vec![]);
         }
         let layout = self.api.status().await?.layout;
-        Ok(self
-            .api
-            .volumes()
-            .await?
-            .iter()
-            .map(|v| self.volume(layout, v))
-            .collect())
+        let vols = self.api.volumes().await?;
+        let fss = self.api.filesystems().await?;
+        Ok(self.all_volumes(layout, &vols, &fss))
     }
 
     async fn metrics(&self) -> Result<Vec<MetricSample>, DriverError> {
         let status = self.api.status().await?;
         let vols = self.api.volumes().await?;
+        let fss = self.api.filesystems().await?;
         let m = |name: &str, value: f64| MetricSample {
             name: name.into(),
             value,
@@ -332,6 +427,7 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
         let nodes = status.data_nodes.as_deref().unwrap_or_default();
         let mut out = vec![
             m("native_volumes_total", vols.len() as f64),
+            m("native_filesystems_total", fss.len() as f64),
             m("native_data_nodes_total", nodes.len() as f64),
             m(
                 "native_data_nodes_up",
@@ -353,9 +449,16 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
         &self,
         req: CreateVolumeRequest,
     ) -> Result<CreateVolumeResult, DriverError> {
+        if req.kind == VolumeKind::Filesystem {
+            let id = self.api.create_fs(&new_id(), &req.name).await?;
+            return Ok(CreateVolumeResult {
+                volume_id: format!("{FS_VOLUME_PREFIX}{id}"),
+                backend_native_id: format!("{FS_NATIVE_PREFIX}{id}"),
+            });
+        }
         if req.kind != VolumeKind::Block {
             return Err(DriverError::Backend(
-                "atlas-native provides block volumes only".into(),
+                "invalid: atlas-native provides block and filesystem volumes only".into(),
             ));
         }
         let size = positive(req.size_bytes)?;
@@ -368,24 +471,36 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
 
     async fn expand_volume(&self, req: ExpandVolumeRequest) -> Result<(), DriverError> {
         let size = positive(req.new_size_bytes)?;
-        self.api
-            .resize_volume(native_volume_id(&req.volume_id), size)
-            .await
+        match native_volume_ref(&req.volume_id) {
+            NativeRef::Volume(id) => self.api.resize_volume(id, size).await,
+            NativeRef::Filesystem(_) => Err(DriverError::Backend(
+                "invalid: atlas-native filesystems have no size limit to expand".into(),
+            )),
+        }
     }
 
     async fn clone_snapshot(
         &self,
         req: CloneSnapshotRequest,
     ) -> Result<CreateVolumeResult, DriverError> {
+        let snapshot = match native_snapshot_ref(&req.snapshot_id) {
+            // A filesystem has no size limit, so any requested size is moot.
+            NativeRef::Filesystem(snap) => {
+                let id = self
+                    .api
+                    .clone_fs_snapshot(&new_id(), snap, &req.new_volume_name)
+                    .await?;
+                return Ok(CreateVolumeResult {
+                    volume_id: format!("{FS_VOLUME_PREFIX}{id}"),
+                    backend_native_id: format!("{FS_NATIVE_PREFIX}{id}"),
+                });
+            }
+            NativeRef::Volume(snap) => snap,
+        };
         let size = req.size_bytes.map(positive).transpose()?;
         let id = self
             .api
-            .clone_snapshot(
-                &new_id(),
-                native_snapshot_id(&req.snapshot_id),
-                &req.new_volume_name,
-                size,
-            )
+            .clone_snapshot(&new_id(), snapshot, &req.new_volume_name, size)
             .await?;
         Ok(CreateVolumeResult {
             volume_id: format!("{VOLUME_PREFIX}{id}"),
@@ -394,19 +509,29 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
     }
 
     async fn delete_volume(&self, req: DeleteVolumeRequest) -> Result<(), DriverError> {
-        self.api
-            .delete_volume(native_volume_id(&req.volume_id))
-            .await
+        match native_volume_ref(&req.volume_id) {
+            NativeRef::Volume(id) => self.api.delete_volume(id).await,
+            NativeRef::Filesystem(id) => self.api.delete_fs(id).await,
+        }
     }
 
     async fn create_snapshot(
         &self,
         req: CreateSnapshotRequest,
     ) -> Result<CreateSnapshotResult, DriverError> {
-        let id = self
-            .api
-            .create_snapshot(&new_id(), native_volume_id(&req.volume_id), &req.name)
-            .await?;
+        let id = match native_volume_ref(&req.volume_id) {
+            NativeRef::Volume(vol) => self.api.create_snapshot(&new_id(), vol, &req.name).await?,
+            NativeRef::Filesystem(fs) => {
+                let id = self
+                    .api
+                    .create_fs_snapshot(&new_id(), fs, &req.name)
+                    .await?;
+                return Ok(CreateSnapshotResult {
+                    snapshot_id: format!("{FS_SNAPSHOT_PREFIX}{id}"),
+                    backend_native_id: format!("{FS_NATIVE_PREFIX}{id}"),
+                });
+            }
+        };
         Ok(CreateSnapshotResult {
             snapshot_id: format!("{SNAPSHOT_PREFIX}{id}"),
             backend_native_id: id,
@@ -414,9 +539,10 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
     }
 
     async fn delete_snapshot(&self, req: DeleteSnapshotRequest) -> Result<(), DriverError> {
-        self.api
-            .delete_snapshot(native_snapshot_id(&req.snapshot_id))
-            .await
+        match native_snapshot_ref(&req.snapshot_id) {
+            NativeRef::Volume(id) => self.api.delete_snapshot(id).await,
+            NativeRef::Filesystem(id) => self.api.delete_fs_snapshot(id).await,
+        }
     }
 
     async fn read_volume(
@@ -425,9 +551,10 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, DriverError> {
-        self.api
-            .read(native_volume_id(volume_id), offset, len)
-            .await
+        match native_volume_ref(volume_id) {
+            NativeRef::Volume(id) => self.api.read(id, offset, len).await,
+            NativeRef::Filesystem(_) => Err(block_only(volume_id)),
+        }
     }
 
     async fn write_volume(
@@ -436,12 +563,13 @@ impl<A: NativeApi> StorageDriver for NativeDriver<A> {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<(), DriverError> {
+        let NativeRef::Volume(id) = native_volume_ref(volume_id) else {
+            return Err(block_only(volume_id));
+        };
         if data.is_empty() {
             return Ok(());
         }
-        self.api
-            .write(native_volume_id(volume_id), offset, data)
-            .await
+        self.api.write(id, offset, data).await
     }
 }
 
@@ -545,12 +673,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_driver_round_trips_filesystems() {
+        let d = FakeNativeDriver::new("bkd_native");
+        let mut req = create("shared", 1 << 30);
+        req.kind = VolumeKind::Filesystem;
+        let fs = d.create_volume(req).await.unwrap();
+        assert!(fs.volume_id.starts_with("vol_native_fs_"));
+        assert!(fs.backend_native_id.starts_with("fs:"));
+        let vols = d.list_volumes(POOL_NAME).await.unwrap();
+        let v = vols.iter().find(|v| v.id == fs.volume_id).unwrap();
+        assert_eq!(v.kind, VolumeKind::Filesystem);
+        assert_eq!(
+            v.backend_native_id.as_deref(),
+            Some(fs.backend_native_id.as_str())
+        );
+
+        // The gateway passes backend native ids; Atlas ids work too.
+        let snap = d
+            .create_snapshot(CreateSnapshotRequest {
+                volume_id: fs.backend_native_id.clone(),
+                name: "s".into(),
+            })
+            .await
+            .unwrap();
+        assert!(snap.snapshot_id.starts_with("snap_native_fs_"));
+        let clone = d
+            .clone_snapshot(CloneSnapshotRequest {
+                snapshot_id: snap.backend_native_id.clone(),
+                new_volume_name: "restored".into(),
+                size_bytes: Some(1),
+            })
+            .await
+            .unwrap();
+        assert!(clone.volume_id.starts_with("vol_native_fs_"));
+        assert_eq!(d.discover().await.unwrap().volumes.len(), 2);
+
+        assert!(d
+            .expand_volume(ExpandVolumeRequest {
+                volume_id: fs.volume_id.clone(),
+                new_size_bytes: 2 << 30,
+            })
+            .await
+            .is_err());
+        assert!(d.read_volume(&fs.volume_id, 0, 1).await.is_err());
+        assert!(d.write_volume(&fs.volume_id, 0, vec![1]).await.is_err());
+
+        d.delete_snapshot(DeleteSnapshotRequest {
+            snapshot_id: snap.snapshot_id,
+        })
+        .await
+        .unwrap();
+        for id in [fs.volume_id, clone.backend_native_id] {
+            d.delete_volume(DeleteVolumeRequest { volume_id: id })
+                .await
+                .unwrap();
+        }
+        assert!(d.list_volumes(POOL_NAME).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn ids_map_to_volumes_or_filesystems() {
+        for (id, want) in [
+            ("vol_native_abc", NativeRef::Volume("abc")),
+            ("abc", NativeRef::Volume("abc")),
+            ("vol_native_fs_abc", NativeRef::Filesystem("abc")),
+            ("fs:abc", NativeRef::Filesystem("abc")),
+        ] {
+            assert_eq!(native_volume_ref(id), want, "{id}");
+        }
+        assert_eq!(native_snapshot_ref("snap_native_x"), NativeRef::Volume("x"));
+        assert_eq!(
+            native_snapshot_ref("snap_native_fs_x"),
+            NativeRef::Filesystem("x")
+        );
+        assert_eq!(native_snapshot_ref("fs:x"), NativeRef::Filesystem("x"));
+    }
+
+    #[tokio::test]
     async fn invalid_requests_are_refused() {
         let d = FakeNativeDriver::new("bkd_native");
         assert!(d.create_volume(create("x", 0)).await.is_err());
-        let mut fs = create("x", 4096);
-        fs.kind = VolumeKind::Filesystem;
-        assert!(d.create_volume(fs).await.is_err());
+        let mut obj = create("x", 4096);
+        obj.kind = VolumeKind::Object;
+        assert!(d.create_volume(obj).await.is_err());
         assert!(matches!(
             d.delete_volume(DeleteVolumeRequest {
                 volume_id: "vol_native_missing".into()
