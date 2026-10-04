@@ -18,7 +18,9 @@ futures-util = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = "0.7"
 # MySQL/MariaDB discovery rides the workspace sqlx with the `mysql` protocol feature added on top.
-sqlx = { workspace = true, features = ["mysql"] }
+# `mysql-rsa`: without TLS, MySQL 8's default caching_sha2_password exchanges the password under
+# the server's RSA key, and sqlx 0.9 only builds that path behind this feature.
+sqlx = { workspace = true, features = ["mysql", "mysql-rsa"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
