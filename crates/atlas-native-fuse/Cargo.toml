@@ -1,0 +1,35 @@
+# Copyright (c) 2026 ZyvorAI Labs Private Limited.
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "atlas-native-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "atlas-native-mount"
+path = "src/bin/atlas-native-mount.rs"
+
+[features]
+# The kernel FUSE adapter (Linux only); without it the binary only reports how it was built.
+fuse = ["dep:fuser"]
+
+[dependencies]
+atlas-native.workspace = true
+clap.workspace = true
+libc = "0.2"
+reqwest = { workspace = true, features = ["blocking"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", optional = true, default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true
