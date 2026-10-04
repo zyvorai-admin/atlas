@@ -261,6 +261,59 @@ impl Ops {
         v["target"].as_str().map(str::to_string).ok_or(libc::EIO)
     }
 
+    pub fn listxattr(&self, ino: u64) -> Result<Vec<String>, Errno> {
+        let v = self.call(
+            Method::GET,
+            &format!("/inodes/{ino}/xattrs"),
+            Body::Empty,
+            Retry::Idempotent,
+        )?;
+        serde_json::from_value(v["names"].clone()).map_err(|_| libc::EIO)
+    }
+
+    pub fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, Errno> {
+        self.client
+            .request(
+                Method::GET,
+                &self.path(&format!("/inodes/{ino}/xattrs/{}", encode(name))),
+                Body::Empty,
+                Retry::Idempotent,
+            )
+            .map_err(errno)
+    }
+
+    /// `create`/`replace` follow `XATTR_CREATE`/`XATTR_REPLACE`.
+    pub fn setxattr(
+        &self,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        create: bool,
+        replace: bool,
+    ) -> Result<(), Errno> {
+        let mode = match (create, replace) {
+            (true, true) => return Err(libc::EINVAL),
+            (true, false) => "create",
+            (false, true) => "replace",
+            (false, false) => "set",
+        };
+        self.void(
+            Method::PUT,
+            &format!("/inodes/{ino}/xattrs/{}?mode={mode}", encode(name)),
+            Body::Bytes(value),
+            Retry::Idempotent,
+        )
+    }
+
+    pub fn removexattr(&self, ino: u64, name: &str) -> Result<(), Errno> {
+        self.void(
+            Method::DELETE,
+            &format!("/inodes/{ino}/xattrs/{}", encode(name)),
+            Body::Empty,
+            Retry::Remove,
+        )
+    }
+
     pub fn statfs(&self) -> Result<FsStat, Errno> {
         decode(self.call(Method::GET, "/statfs", Body::Empty, Retry::Idempotent)?)
     }

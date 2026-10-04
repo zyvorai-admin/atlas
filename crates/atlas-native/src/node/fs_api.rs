@@ -11,7 +11,7 @@ use super::{body_json, client_id, query_u64, read_range, NodeShared};
 use crate::{
     engine::{NativeEngine, NativeError, NewNode},
     http::{Request, Response},
-    namespace::SetAttr,
+    namespace::{SetAttr, XattrMode},
 };
 
 type Routed = Result<Response, NativeError>;
@@ -144,6 +144,28 @@ fn inode_route(
                 u64_field(&body, "parent")?,
                 str_field(&body, "name")?,
             )?)
+        }
+        ("GET", ["xattrs"]) => Ok(Response::json(
+            200,
+            &json!({ "names": e.fs_listxattr(fs, ino)? }),
+        )),
+        ("GET", ["xattrs", name]) => Ok(Response::bytes(
+            200,
+            e.fs_getxattr(fs, ino, &pct_decode(name)?)?,
+        )),
+        ("PUT", ["xattrs", name]) => {
+            let mode = match req.query.get("mode").map(String::as_str) {
+                None | Some("set") => XattrMode::Set,
+                Some("create") => XattrMode::Create,
+                Some("replace") => XattrMode::Replace,
+                Some(m) => return Err(NativeError::Invalid(format!("unknown xattr mode {m:?}"))),
+            };
+            e.fs_setxattr(fs, ino, &pct_decode(name)?, &req.body, mode)?;
+            Ok(Response::text(204, ""))
+        }
+        ("DELETE", ["xattrs", name]) => {
+            e.fs_removexattr(fs, ino, &pct_decode(name)?)?;
+            Ok(Response::text(204, ""))
         }
         ("GET", ["target"]) => Ok(Response::json(
             200,

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{now_ns, NativeEngine, NativeError, Target};
 use crate::{
-    metadata::{Catalog, MetaCommand, SnapshotId},
-    namespace::{file_extents, FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr},
+    metadata::{Catalog, MetaCommand, MetaError, SnapshotId},
+    namespace::{file_extents, FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode},
 };
 
 /// File extent grid for new filesystems: a 4 KiB write rewrites at most this much.
@@ -247,6 +247,52 @@ impl NativeEngine {
             _ => Err(NativeError::Invalid(format!(
                 "inode {ino} is not a symlink"
             ))),
+        })
+    }
+
+    /// Names of the inode's extended attributes.
+    pub fn fs_listxattr(&self, fs: &str, ino: u64) -> Result<Vec<String>, NativeError> {
+        self.with_fs(fs, |_, f| {
+            Ok(f.inode(ino)?.xattrs.keys().cloned().collect())
+        })
+    }
+
+    pub fn fs_getxattr(&self, fs: &str, ino: u64, name: &str) -> Result<Vec<u8>, NativeError> {
+        self.with_fs(fs, |_, f| {
+            f.inode(ino)?
+                .xattrs
+                .get(name)
+                .cloned()
+                .ok_or_else(|| MetaError::NoAttr(name.into()).into())
+        })
+    }
+
+    pub fn fs_setxattr(
+        &self,
+        fs: &str,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        mode: XattrMode,
+    ) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::SetXattr {
+            fs: fs.into(),
+            ino,
+            name: name.into(),
+            value: value.to_vec(),
+            mode,
+            now_ns: now_ns(),
+        })
+    }
+
+    pub fn fs_removexattr(&self, fs: &str, ino: u64, name: &str) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::RemoveXattr {
+            fs: fs.into(),
+            ino,
+            name: name.into(),
+            now_ns: now_ns(),
         })
     }
 

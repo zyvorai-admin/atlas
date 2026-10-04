@@ -585,6 +585,7 @@ fn error_response(e: NativeError) -> Response {
         (NativeError::NotFound(_), _) | (_, Some(MetaError::NotFound(_))) => {
             (404, "not_found", None)
         }
+        (_, Some(MetaError::NoAttr(_))) => (404, "no_attr", None),
         (_, Some(m)) => (
             409,
             match m {
@@ -592,6 +593,8 @@ fn error_response(e: NativeError) -> Response {
                 MetaError::NotEmpty(_) => "not_empty",
                 MetaError::NotDir(_) => "not_dir",
                 MetaError::IsDir(_) => "is_dir",
+                MetaError::TooBig(_) => "too_big",
+                MetaError::Unsupported(_) => "unsupported",
                 _ => "invalid",
             },
             None,

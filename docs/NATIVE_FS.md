@@ -56,6 +56,10 @@ All routes need the API token (and client certificate where configured), like th
 | `POST /v1/fs/{fs}/inodes/{dir}/unlink`, `/rmdir` | `{name}` → 204. |
 | `POST /v1/fs/{fs}/inodes/{ino}/links` | `{parent, name}`: a hard link → attributes. |
 | `GET /v1/fs/{fs}/inodes/{ino}/target` | `{"target"}` of a symlink. |
+| `GET /v1/fs/{fs}/inodes/{ino}/xattrs` | `{"names": [...]}` of the extended attributes. |
+| `GET /v1/fs/{fs}/inodes/{ino}/xattrs/{name}` | Raw value (`name` percent-encoded); 404 `no_attr` if unset. |
+| `PUT /v1/fs/{fs}/inodes/{ino}/xattrs/{name}?mode=` | Raw body as the value → 204. `mode`: `set` (default), `create` (409 `exists` if set), `replace` (404 `no_attr` if unset). |
+| `DELETE /v1/fs/{fs}/inodes/{ino}/xattrs/{name}` | 204; 404 `no_attr` if unset. |
 | `GET /v1/fs/{fs}/inodes/{ino}/data?offset=N&len=M` | Raw bytes; short at end of file. |
 | `PUT /v1/fs/{fs}/inodes/{ino}/data?offset=N` | Raw body written at `offset` (extends the file) → attributes. |
 
@@ -63,8 +67,9 @@ All routes need the API token (and client certificate where configured), like th
 
 Errors are `{"error", "code", "leader"}`. `code` is stable and maps to an errno in the client:
 `not_found` (404, ENOENT), `exists` (EEXIST), `not_empty` (ENOTEMPTY), `not_dir` (ENOTDIR),
-`is_dir` (EISDIR), `invalid` (EINVAL), `read_only` (EROFS), `busy` (EBUSY) — all 409 except where
-noted — plus `not_leader` (421), `unavailable` (503) and `internal` (500).
+`is_dir` (EISDIR), `invalid` (EINVAL), `read_only` (EROFS), `busy` (EBUSY), `no_attr` (404,
+ENODATA), `too_big` (E2BIG), `unsupported` (EOPNOTSUPP) — all 409 except where noted — plus
+`not_leader` (421), `unavailable` (503) and `internal` (500).
 
 Reads are served by the leader once it has applied its log as of the request, so a client always
 sees its own writes; `?stale=1` on a `GET` reads whatever the receiving replica has applied.
@@ -109,7 +114,13 @@ default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default
   concurrent writers to the same file range see last-writer-wins at the extent level.
 - Unlink-while-open only protects handles in the same mount; a file removed by another client
   disappears for everyone.
-- Not implemented: POSIX ACLs, extended attributes, quotas, `flock`/`fcntl` locks, `O_DIRECT`.
+- **Extended attributes** in the `user.`, `trusted.` and `security.` namespaces are stored on the
+  inode (replicated, copied by snapshots and clones): at most 64 KiB per value and 256 KiB per
+  inode. `system.*` (POSIX ACLs) is refused with EOPNOTSUPP rather than stored unenforced.
+- **Locks**: `flock` and `fcntl` locks are enforced by the kernel within one mount (the client
+  does not take them over), so processes sharing a mount exclude each other; locks are not seen
+  by other mounts.
+- Not implemented: POSIX ACLs, cross-mount locks, quotas, `O_DIRECT`.
 
 ## Atlas gateway
 
