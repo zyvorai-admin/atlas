@@ -259,6 +259,9 @@ pub struct RaftNode {
     commit_index: u64,
     /// Applied state machine; `catalog.applied_index` is the applied index.
     catalog: Catalog,
+    /// Leader only: `catalog` plus every logged entry, kept up to date as entries are appended,
+    /// so a proposal is validated without copying the catalog. Built on first use in a term.
+    spec: Option<Catalog>,
     wal: Wal,
     votes: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, u64>,
@@ -354,6 +357,7 @@ impl RaftNode {
             snapshot_term: catalog.current_term,
             commit_index: applied,
             catalog,
+            spec: None,
             wal,
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
@@ -619,13 +623,21 @@ impl RaftNode {
     /// Appends `command` after checking it applies on top of the applied state plus every
     /// uncommitted entry.
     fn append_validated(&mut self, command: MetaCommand) -> Result<u64, RaftError> {
-        let mut spec = self.catalog.clone();
-        let applied = spec.applied_index;
-        for e in self.log.iter().filter(|e| e.index > applied) {
-            let _ = spec.apply_committed(e.term, e.index, &e.command);
+        let (term, index) = (self.hard.term, self.last_index() + 1);
+        self.spec_mut().apply(term, index, &command)?;
+        self.append_local(command).inspect_err(|_| self.spec = None)
+    }
+
+    fn spec_mut(&mut self) -> &mut Catalog {
+        if self.spec.is_none() {
+            let mut spec = self.catalog.clone();
+            let applied = spec.applied_index;
+            for e in self.log.iter().filter(|e| e.index > applied) {
+                let _ = spec.apply_committed(e.term, e.index, &e.command);
+            }
+            self.spec = Some(spec);
         }
-        spec.apply(self.hard.term, self.last_index() + 1, &command)?;
-        self.append_local(command)
+        self.spec.as_mut().expect("built above")
     }
 
     pub fn step(&mut self, env: Envelope) -> Result<(), RaftError> {
@@ -954,6 +966,7 @@ impl RaftNode {
             self.persist_hard()?;
         }
         self.role = Role::Follower;
+        self.spec = None;
         self.leader = leader;
         self.votes.clear();
         self.reset_election_timer();
@@ -963,6 +976,7 @@ impl RaftNode {
     fn become_leader(&mut self) -> Result<(), RaftError> {
         self.counters.leader_terms += 1;
         self.role = Role::Leader;
+        self.spec = None;
         self.leader = Some(self.cfg.id.clone());
         self.heartbeat_elapsed = 0;
         self.check_quorum_elapsed = 0;
@@ -987,6 +1001,10 @@ impl RaftNode {
         // The leader writes in parallel with replication and counts itself towards a quorum only
         // up to `wal.synced_index()` (Raft thesis §10.2.1), so concurrent proposals share fsyncs.
         self.wal.append_unsynced(&e)?;
+        if let Some(spec) = &mut self.spec {
+            // A no-op for proposals, which append_validated already applied.
+            let _ = spec.apply_committed(e.term, e.index, &e.command);
+        }
         self.log.push(e);
         if config {
             self.refresh_membership();

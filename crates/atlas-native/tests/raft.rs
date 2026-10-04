@@ -481,3 +481,39 @@ fn unanswered_snapshots_are_not_resent_on_every_append() {
     let want: Vec<&str> = want.iter().map(String::as_str).collect();
     assert!(c.run_until(200, |c| c.converged(&want)));
 }
+
+#[test]
+fn proposals_are_validated_against_uncommitted_entries_across_leaders() {
+    let mut c = Cluster::new(3, 0);
+    let l = c.elect();
+    // Neither entry commits before the next proposal is checked against it.
+    c.node_mut(&l).propose(create("a")).unwrap();
+    let conflicting = MetaCommand::CreateVolume {
+        id: "vol-a".into(),
+        name: "a".into(),
+        size_bytes: 8192,
+    };
+    assert!(matches!(
+        c.node_mut(&l).propose(conflicting.clone()),
+        Err(RaftError::Rejected(_))
+    ));
+    c.node_mut(&l)
+        .propose(MetaCommand::DeleteVolume {
+            volume_id: "vol-a".into(),
+        })
+        .unwrap();
+    c.node_mut(&l).propose(conflicting.clone()).unwrap();
+    assert!(c.run_until(50, |c| c.converged(&["a"])));
+
+    c.isolated.insert(l.clone());
+    let l2 = c.elect();
+    assert_ne!(l, l2);
+    assert!(matches!(
+        c.node_mut(&l2).propose(create("a")),
+        Err(RaftError::Rejected(_))
+    ));
+    c.node_mut(&l2).propose(create("b")).unwrap();
+    c.isolated.clear();
+    assert!(c.run_until(200, |c| c.converged(&["a", "b"])));
+    assert_eq!(c.node(&l).catalog().volumes["vol-a"].size_bytes, 8192);
+}

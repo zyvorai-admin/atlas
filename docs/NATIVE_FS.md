@@ -129,25 +129,29 @@ mount them with `atlas-native-mount` instead.
 
 ## Limits and performance
 
-The whole namespace lives in one Raft group's in-memory catalog, so metadata throughput falls as a
-cluster accumulates inodes. Each command is checked against, and then applied to, a fresh copy of
-the catalog (so a command that fails halfway leaves no trace), which makes a create cost time
-proportional to the total inode count across all filesystems and volumes.
+The whole namespace lives in one Raft group's in-memory catalog. Commands apply in place: every
+command checks its inputs before it changes anything, so a rejected one leaves the catalog as it
+was (debug builds assert this on every apply), and the leader validates proposals against one
+running copy of the catalog plus its uncommitted entries. A create therefore costs the same at
+100k inodes as at 10k; the catalog is still written whole at each log compaction (every 1024
+entries, amortised) and the leader holds two copies of it in memory.
 
 Measured 2026-10-04, file creates through the node API with 16 concurrent clients on a 3-node
-cluster on one laptop (Apple SSD, release build), all filesystems in one cluster counted:
+cluster on one laptop (Apple SSD, release build, other load on the machine), all filesystems in
+one cluster counted:
 
 | Inodes | Creates/s | p50 ms | p99 ms | Catalog MiB | Leader RSS MiB |
 | --- | --- | --- | --- | --- | --- |
-| 10k | 200 | 76 | 156 | 2.2 | 186 |
-| 20k | 127 | 119 | 251 | 4.6 | 210 |
-| 40k | 62 | 249 | 499 | 9.5 | 236 |
-| 60k | 36 | 428 | 870 | 14.1 | 248 |
+| 10k | 126 | 123 | 296 | 2.2 | 168 |
+| 50k | 156 | 69 | 338 | 11.9 | 356 |
+| 80k | 263 | 55 | 166 | 19.0 | 367 |
+| 100k | 271 | 54 | 174 | 23.6 | 628 |
 
-No requests were retried or failed, and memory stayed flat. On the lab host (fsync p50 about 67 ms)
-creates are bound by disk latency at about 40/s from the start. Treat **about 50k inodes per
-cluster** as the practical limit for interactive use today; beyond that the cluster still works,
-but every metadata operation slows down proportionally.
+No requests were retried or failed; the spread between rows is load from other processes on the
+laptop, not the inode count. Before commands applied in place, each create copied the catalog and
+throughput fell from 200/s at 10k inodes to 36/s at 60k. On the lab host (fsync p50 about 67 ms)
+creates are bound by disk latency at about 40/s. The practical limit is now memory: about 6 KiB
+of leader RSS per inode, so plan on roughly 1M inodes per 8 GiB node.
 
 Data path, lab FUSE mount (3 nodes on one host, fio, one job, `psync`): 1 MiB sequential write
 12.5 MiB/s, sequential read 72.5 MiB/s cold, 4 KiB random read about 94 IOPS.
@@ -155,7 +159,7 @@ Data path, lab FUSE mount (3 nodes on one host, fio, one job, `psync`): 1 MiB se
 Known limits:
 
 - One Raft group and one leader serve all metadata; there is no namespace sharding.
-- The catalog is copied for every command (see above) and written whole to disk at each log
+- The catalog lives in memory (twice on the leader) and is written whole to disk at each log
   compaction.
 - A write that covers part of an extent reads, merges and rewrites the whole extent
   (`extent_bytes`, 4 MiB by default), so small random writes are expensive.

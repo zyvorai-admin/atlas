@@ -100,8 +100,8 @@ read-ahead; close-to-open consistency across mounts. The gateway serves them as 
 volumes `vol_native_fs_<id>` (create/snapshot/clone/restore/delete via `atlasctl create-volume
 --backend bkd_native --kind filesystem`). pjdfstest (12 suites, 8565 tests), git clone + fsck and
 snapshot/clone isolation verified over FUSE on the lab. Scaling limit: one Raft group and a
-whole-catalog clone per proposal, so creates slow as the inode count grows (measured: 200/s at
-10k inodes, 36/s at 60k; ~50k per cluster is the practical limit — see the doc).
+in-memory catalog (commands apply in place; creates hold ~270/s locally from 10k to 100k inodes,
+memory ~6 KiB/inode on the leader — see the doc).
 
 **Licensed** under the [Apache License 2.0](LICENSE) (`Apache-2.0`; relicensed from the Zyvor
 Production License v1.0 at the maintainer's explicit request — history in

@@ -420,26 +420,32 @@ impl Catalog {
     /// Applies an already-committed entry. A command that fails validation still consumes its
     /// index and leaves the catalog otherwise untouched, so every replica that applies the same
     /// log reaches the same state.
+    ///
+    /// `apply` checks every input before it changes anything; only a catalog that is already
+    /// inconsistent (a referenced extent missing, a free range released twice) can fail halfway,
+    /// and then every replica fails the same way. Debug builds verify the no-change part.
     pub fn apply_committed(
         &mut self,
         term: u64,
         index: u64,
         cmd: &MetaCommand,
     ) -> Result<Vec<ExtentId>, MetaError> {
-        let mut next = self.clone();
-        match next.apply(term, index, cmd) {
-            Ok(gc) => {
-                *self = next;
-                Ok(gc)
-            }
-            Err(e) => {
-                if index > self.applied_index {
-                    self.applied_index = index;
-                    self.current_term = term;
-                }
-                Err(e)
+        #[cfg(debug_assertions)]
+        let before = serde_json::to_value(&*self).expect("catalog serializes");
+        let result = self.apply(term, index, cmd);
+        if result.is_err() {
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                serde_json::to_value(&*self).expect("catalog serializes"),
+                before,
+                "a rejected {cmd:?} changed the catalog"
+            );
+            if index > self.applied_index {
+                self.applied_index = index;
+                self.current_term = term;
             }
         }
+        result
     }
 
     /// End of the last written byte among `extents`.
