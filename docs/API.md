@@ -13,6 +13,9 @@
 > The proto is at `crates/atlas-gateway/proto/atlas.proto`. Product ownership conventions: [PRODUCTS.md](PRODUCTS.md).
 > In-console curated map: **API Docs** page (`/api-docs`).
 
+> **Go client:** [`clients/go`](../clients/go/README.md) (`github.com/zyvorai/atlas/clients/go`,
+> stdlib-only), contract-tested against a live gateway in CI.
+
 Base path: `/api/atlas/v1`. All responses are JSON. Errors use
 `{ "error": { "code": "...", "message": "..." } }` with an appropriate HTTP status.
 
