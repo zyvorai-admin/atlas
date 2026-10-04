@@ -438,7 +438,7 @@ stream reports caught-up (0).
 | Engine | Discover | Full-load | Validate | CDC | Cutover |
 |---|---|---|---|---|---|
 | Postgres | **live** | **live** | **live** | **live** | **live** |
-| MySQL | **live** | **live** | **live** | **live** (incl. TIMESTAMP columns via the Debezium JDBC sink, see note) | pending |
+| MySQL | **live** | **live** | **live** | **live** (incl. TIMESTAMP columns via the Debezium JDBC sink, see note) | **live** |
 | MariaDB | **live** | **live** | **live** | **live** | **live** |
 | MongoDB | **live** | **live** | **live** | **live** | **live** |
 | SQL Server | **live** | via Debezium `initial` | advisory | **live** (podman, see note) | pending |
@@ -451,15 +451,27 @@ Fake path covers **all six** engines discover→cutover in CI (`tests/databridge
   `ATLAS_DATABRIDGE_CONNECT_IMAGE=localhost/databridge-connect:dev`. Fake MySQL plan walked
   assess→provision→full-load→**cdc_streaming**. Real MariaDB/Mongo CDC+cutover later verified on
   `212.8.248.187` (2026-09-01).
-- **Follow-ups (verify on live infra)**: **MySQL cutover** through the in-cluster pipeline (CDC,
-  including TIMESTAMP columns, is verified; the lab host currently has no Ceph/Percona/Strimzi
-  stack to run the full gateway pipeline). Postgres, MariaDB, and MongoDB are verified
-  through live cutover. SQL Server / Oracle CDC is verified with the generated connectors in podman,
-  not yet through the in-cluster gateway pipeline.
+- **MySQL in-cluster pipeline through cutover — verified live (2026-10-04, `212.8.248.187`)**:
+  single-node Rook Ceph (Squid, OSD on a loop device), CloudNativePG + Percona XtraDB + Strimzi
+  (`zyvor-kafka`, Kafka 4.3.0), the real-Ceph gateway and the Debezium 3.7 Connect image. A MySQL
+  8.4 source (binlog ROW, GTID) with a `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` column and a
+  composite-key table went discover → assess → provision (PXC edge, PVC on `zyvor-rbd-prod`) →
+  full-load → `cdc/start` → validate (`passed`) → cutover (`draining` → `cutover_complete` in 4 s,
+  connectors and the KafkaConnect cluster torn down). Inserts, updates and deletes on both tables
+  landed on the edge identical to the source. The run surfaced two bugs, both fixed:
+  `tls_mode: disable` sources failed discovery because sqlx 0.9 builds MySQL's RSA password
+  exchange only behind `mysql-rsa` (#102), and the generated KafkaConnect had no heap or memory
+  limit, so one worker grew to 5.4 GiB and drove the 32 GiB node into OOM (#103).
+- **Follow-ups (verify on live infra)**: SQL Server / Oracle CDC is verified with the generated
+  connectors in podman, not yet through the in-cluster gateway pipeline.
 - **Known limitation — writes during the full-load**: homogeneous relational CDC starts after the
   dump→restore, from the source's current WAL/binlog position (`no_data`), so a write made between
-  the dump and `cdc/start` reaches the edge only if the row changes again. `validate`'s row-count
-  compare reports the drift; quiesce writes during the full-load until CDC starts first.
+  the dump and the moment Debezium records that position reaches the edge only if the row changes
+  again. That moment is later than `cdc/start` returning and later than the `KafkaConnector`s
+  reporting `Ready`: on the lab run, an insert and an update made after both connectors were
+  `Ready` were missed because the source task took its binlog position two seconds later. Wait
+  for `Snapshot completed` / `Connected to binlog` in the Connect log (or the plan's CDC lag to
+  report), or quiesce writes until then. `validate`'s row-count compare reports the drift.
 - **CDC Connect image — multi-engine** (`deploy/databridge/connect/Dockerfile`): one Strimzi-based
   image bundles Debezium PostgreSQL + MySQL + **MariaDB** + MongoDB + Oracle + SQL Server source
   connectors (Debezium 3.7), the Debezium JDBC sink (every relational edge; ships its own drivers),

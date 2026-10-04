@@ -59,10 +59,10 @@ Percona `Cluster` binds its PVCs on `zyvor-rbd-prod`; Atlas's reconciler advance
 | Engine | Discover | Full-load | Validate | CDC | Cutover |
 |---|---|---|---|---|---|
 | Postgres | live | live | live | live | live |
-| MySQL | live | live | live | live (DATETIME only) | pending |
+| MySQL | live | live | live | live | live |
 | MariaDB | live | live | live | live | live |
 | MongoDB | live | live | live | live | live |
-| Oracle / SQL Server | live | via Debezium `initial` | advisory | pending | pending |
+| Oracle / SQL Server | live | via Debezium `initial` | advisory | live (podman) | pending |
 
 ## Lab CDC stack (`deploy/databridge/up.sh`)
 
@@ -79,6 +79,6 @@ kubectl -n rook-ceph set env deploy/atlas-gateway-ceph \
 
 **Lab `212.8.248.187` (2026-09-01):** Strimzi + CNPG + PXC + PSMDB + `zyvor-kafka` Ready; Connect
 image includes MariaDB + Mongo plugins; gateway Ceph image built with `mongodb`/`kafka-lag` features.
-**MariaDB and MongoDB** verified live through CDC + cutover (alongside Postgres). MySQL cutover still
-pending. Prefer MySQL **DATETIME** over TIMESTAMP. Atlas **refuses** real `cdc/start` without
+**MariaDB and MongoDB** verified live through CDC + cutover (alongside Postgres); **MySQL** followed
+on 2026-10-04 (see `docs/DATABRIDGE.md`). Atlas **refuses** real `cdc/start` without
 `ATLAS_DATABRIDGE_CONNECT_IMAGE`. Fake mode still runs discover→cutover for all six engines in CI.

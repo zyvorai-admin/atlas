@@ -65,7 +65,9 @@ fi
 if [[ "$WITH_MONGO" == "1" ]]; then
   log "4/5 Percona Server for MongoDB operator ($PSMDB_VERSION)"
   # Bundle installs CRDs + operator Deployment into the target namespace.
-  kubectl apply -f \
+  # Server-side: the PSMDB CRD is larger than the 256 KiB last-applied annotation client-side
+  # apply writes, so a plain apply fails on a fresh cluster and the operator crash-loops.
+  kubectl apply --server-side -f \
     "https://raw.githubusercontent.com/percona/percona-server-mongodb-operator/v${PSMDB_VERSION}/deploy/bundle.yaml" \
     -n "$NS" || {
       echo "WARN: PSMDB bundle apply failed — check version pin / already-installed CRDs" >&2
