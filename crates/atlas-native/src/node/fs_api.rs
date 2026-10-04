@@ -31,9 +31,15 @@ pub(super) fn route(sh: &NodeShared, e: &NativeEngine, req: &Request, segs: &[&s
             let body = parse(req)?;
             let name = str_field(&body, "name")?;
             let id = client_id(&body).map_err(bad)?;
+            let extent_bytes = match body.get("extent_bytes") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => Some(v.as_u64().ok_or_else(|| {
+                    NativeError::Invalid("extent_bytes must be an integer".into())
+                })?),
+            };
             Ok(Response::json(
                 201,
-                &json!({ "id": e.create_fs_as(id, name)? }),
+                &json!({ "id": e.create_fs_with(id, name, extent_bytes)? }),
             ))
         }
         ("DELETE", ["v1", "fs", fs]) => {

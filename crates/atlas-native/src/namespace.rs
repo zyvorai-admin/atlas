@@ -27,6 +27,9 @@ pub struct FsMeta {
     /// The snapshot this filesystem was cloned from, if any.
     #[serde(default)]
     pub source_snapshot: Option<SnapshotId>,
+    /// File extent grid; `None` (filesystems created before it was recorded) uses the cluster's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +117,9 @@ pub enum FsOp {
         fs: FsId,
         name: String,
         now_ns: i64,
+        /// File extent grid in bytes; `None` uses the cluster's.
+        #[serde(default)]
+        extent_bytes: Option<u64>,
     },
     DeleteFs {
         fs: FsId,
@@ -375,7 +381,15 @@ impl Catalog {
 
     pub(crate) fn apply_fs(&mut self, op: &FsOp, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
         match op {
-            FsOp::CreateFs { fs, name, now_ns } => {
+            FsOp::CreateFs {
+                fs,
+                name,
+                now_ns,
+                extent_bytes,
+            } => {
+                if *extent_bytes == Some(0) {
+                    return Err(MetaError::Invalid("extent_bytes must be positive".into()));
+                }
                 if let Some(f) = self.filesystems.get(fs) {
                     if f.name == *name {
                         return Ok(());
@@ -401,6 +415,7 @@ impl Catalog {
                         next_ino: ROOT_INO + 1,
                         inodes: BTreeMap::from([(ROOT_INO, root)]),
                         source_snapshot: None,
+                        extent_bytes: *extent_bytes,
                     },
                 );
             }
@@ -736,6 +751,7 @@ mod tests {
                 fs: "f".into(),
                 name: "fs".into(),
                 now_ns: 1,
+                extent_bytes: None,
             });
             t
         }
@@ -815,6 +831,28 @@ mod tests {
             new_name: new_name.into(),
             now_ns: 4,
         }
+    }
+
+    #[test]
+    fn create_fs_records_its_grid_and_refuses_zero() {
+        let mut t = T::new();
+        assert_eq!(t.fs().extent_bytes, None, "created without a grid");
+        let err = t
+            .run(FsOp::CreateFs {
+                fs: "g".into(),
+                name: "g".into(),
+                now_ns: 1,
+                extent_bytes: Some(0),
+            })
+            .unwrap_err();
+        assert!(matches!(err, MetaError::Invalid(_)));
+        t.ok(FsOp::CreateFs {
+            fs: "g".into(),
+            name: "g".into(),
+            now_ns: 1,
+            extent_bytes: Some(65536),
+        });
+        assert_eq!(t.c.filesystem("g").unwrap().extent_bytes, Some(65536));
     }
 
     #[test]

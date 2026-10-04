@@ -4,7 +4,7 @@
 
 An atlas-native cluster (`docs/NATIVE_NODE.md`) serves POSIX filesystems next to its block volumes.
 Files and directories live in the same replicated catalog as volumes, and file data uses the same
-copy-on-write extents (3 replicas, `extent_bytes` grid). Clients mount a filesystem through FUSE
+copy-on-write extents (3 replicas) on a per-filesystem grid. Clients mount a filesystem through FUSE
 with `atlas-native-mount`; the Atlas gateway creates, snapshots and clones filesystems as
 `filesystem` volumes on backend `bkd_native`.
 
@@ -23,8 +23,9 @@ with `atlas-native-mount`; the Atlas gateway creates, snapshots and clones files
 - Hard links, `rename` (including over an existing entry, across directories, and refusing to move a
   directory into itself), `setattr` (mode, owner, size, times) and `truncate` follow POSIX. Shrinking
   a file drops the extents past the new end and trims the extent that straddles it.
-- File data is written through the extent path the volumes use: a write covering part of an extent
-  rewrites that extent with the old bytes merged in; never-written ranges are holes and read as
+- File data is written through the extent path the volumes use, on the filesystem's own grid
+  (`extent_bytes`, chosen at create time): a write covering part of an extent rewrites that extent
+  with the old bytes merged in; never-written ranges are holes and read as
   zeros; reads stop at end of file.
 - **Snapshots** copy a filesystem's inode table under a snapshot id and take a reference on every
   extent it points to; no data is copied. A snapshot is read-only and addressed as `<fs>@<snapshot>`.
@@ -38,8 +39,8 @@ All routes need the API token (and client certificate where configured), like th
 
 | Method and path | Description |
 | --- | --- |
-| `GET /v1/fs` | `{"filesystems": [{id, name, inodes, bytes, source_snapshot}]}`. |
-| `POST /v1/fs` | `{"name", "id"?}` → 201 `{"id"}`. Idempotent with the same `id` and name. |
+| `GET /v1/fs` | `{"filesystems": [{id, name, inodes, bytes, source_snapshot, extent_bytes}]}`. |
+| `POST /v1/fs` | `{"name", "id"?, "extent_bytes"?}` → 201 `{"id"}`. Idempotent with the same `id` and name. `extent_bytes` (default 1 MiB, at most the cluster's `extent_bytes`) is the file extent grid; snapshots and clones keep it. |
 | `DELETE /v1/fs/{fs}` | 204. Snapshots and clones of it are unaffected. |
 | `GET /v1/fs/{fs}/statfs` | `{inodes, used_bytes, free_list_bytes}`. |
 | `POST /v1/fs/{fs}/rename` | `{parent, name, new_parent, new_name}` → 204. |
@@ -170,8 +171,12 @@ Known limits:
 - One Raft group and one leader serve all metadata; there is no namespace sharding.
 - The catalog lives in memory (twice on the leader) and is written whole to disk at each log
   compaction.
-- A write that covers part of an extent reads, merges and rewrites the whole extent
-  (`extent_bytes`, 4 MiB by default), so small random writes are expensive.
+- A write that covers part of an extent reads, merges and rewrites the whole extent: up to the
+  filesystem's `extent_bytes` (1 MiB by default). With the cluster on its default 4 MiB grid,
+  random 4 KiB writes measured 24/s at a 4 MiB file grid, 28/s at 1 MiB, 35/s at 256 KiB and
+  42/s at 64 KiB (p50 40 → 22 ms); the remaining ~20 ms is the replicated commit. A smaller grid
+  means more extents in the in-memory catalog, so use 64–256 KiB only for random-write-heavy
+  filesystems.
 - The client reuses connections (one per concurrent request) but does not pipeline or batch
   requests, so each metadata operation is one round trip to the leader.
 - Unlink-while-open works only within one mount (see Consistency).
