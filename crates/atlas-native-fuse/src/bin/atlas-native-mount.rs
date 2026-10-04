@@ -46,6 +46,12 @@ struct Args {
     /// Buffer up to this many bytes of sequential writes per file before sending them.
     #[arg(long, default_value_t = 4 << 20)]
     writeback_bytes: usize,
+    /// Fetch at least this much per read and serve following reads from it (0 disables).
+    #[arg(long, default_value_t = 4 << 20)]
+    readahead_bytes: usize,
+    /// Largest single request; keep at or below the nodes' `max_request_bytes`.
+    #[arg(long, default_value_t = 8 << 20)]
+    max_io_bytes: usize,
     /// Keep retrying through elections and unreachable nodes for this long before failing a call.
     #[arg(long, default_value_t = 30)]
     retry_secs: u64,
@@ -81,7 +87,8 @@ fn ops(args: &Args) -> Result<Ops, String> {
         OpsConfig {
             ttl: Duration::from_millis(args.ttl_ms),
             writeback_bytes: args.writeback_bytes,
-            ..OpsConfig::default()
+            readahead_bytes: args.readahead_bytes,
+            max_io_bytes: args.max_io_bytes,
         },
     );
     // Fail fast on a wrong endpoint, token or filesystem id instead of at first access.

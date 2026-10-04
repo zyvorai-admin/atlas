@@ -9,7 +9,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use atlas_native::{engine::Attr, NodeType, SetAttr};
+use atlas_native::{
+    engine::{Attr, NewNode},
+    NodeType, SetAttr,
+};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
@@ -55,7 +58,7 @@ fn file_attr(a: &Attr) -> FileAttr {
         nlink: a.nlink,
         uid: a.uid,
         gid: a.gid,
-        rdev: 0,
+        rdev: a.rdev as u32,
         blksize: 4096,
         flags: 0,
     }
@@ -66,6 +69,10 @@ fn kind(k: NodeType) -> FileType {
         NodeType::File => FileType::RegularFile,
         NodeType::Dir => FileType::Directory,
         NodeType::Symlink => FileType::Symlink,
+        NodeType::Fifo => FileType::NamedPipe,
+        NodeType::Socket => FileType::Socket,
+        NodeType::CharDevice => FileType::CharDevice,
+        NodeType::BlockDevice => FileType::BlockDevice,
     }
 }
 
@@ -172,25 +179,30 @@ impl Filesystem for AtlasFs {
         n: &OsStr,
         mode: u32,
         umask: u32,
-        _rdev: u32,
+        rdev: u32,
         reply: ReplyEntry,
     ) {
         tri!(reply, self.mutate());
         let n = tri!(reply, name(n));
-        // Only regular files: there is no device, FIFO or socket inode type.
-        if mode & libc::S_IFMT != libc::S_IFREG && mode & libc::S_IFMT != 0 {
-            return reply.error(Errno::EPERM);
-        }
-        let r = self.ops.mknode(
-            parent.0,
-            n,
-            NodeType::File,
-            None,
-            mode & !umask,
-            req.uid(),
-            req.gid(),
-        );
-        self.entry(r, reply);
+        let kind = match mode & libc::S_IFMT {
+            0 | libc::S_IFREG => NodeType::File,
+            libc::S_IFIFO => NodeType::Fifo,
+            libc::S_IFSOCK => NodeType::Socket,
+            libc::S_IFCHR => NodeType::CharDevice,
+            libc::S_IFBLK => NodeType::BlockDevice,
+            _ => return reply.error(Errno::EINVAL),
+        };
+        let node = NewNode {
+            name: n.into(),
+            op_id: String::new(),
+            kind,
+            target: None,
+            rdev: u64::from(rdev),
+            mode: mode & !umask,
+            uid: req.uid(),
+            gid: req.gid(),
+        };
+        self.entry(self.ops.create(parent.0, node), reply);
     }
 
     fn mkdir(
@@ -285,10 +297,11 @@ impl Filesystem for AtlasFs {
         self.entry(self.ops.link(ino.0, new_parent.0, nn), reply);
     }
 
-    fn open(&self, _req: &Request, _ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if self.ops.read_only() && flags.acc_mode() != OpenAccMode::O_RDONLY {
             return reply.error(Errno::EROFS);
         }
+        self.ops.opened(ino.0);
         reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
@@ -313,13 +326,16 @@ impl Filesystem for AtlasFs {
             req.uid(),
             req.gid(),
         ) {
-            Ok(a) => reply.created(
-                &self.ttl(),
-                &file_attr(&a),
-                Generation(0),
-                FileHandle(0),
-                FopenFlags::empty(),
-            ),
+            Ok(a) => {
+                self.ops.opened(a.ino);
+                reply.created(
+                    &self.ttl(),
+                    &file_attr(&a),
+                    Generation(0),
+                    FileHandle(0),
+                    FopenFlags::empty(),
+                )
+            }
             Err(e) => reply.error(err(e)),
         }
     }
@@ -383,7 +399,7 @@ impl Filesystem for AtlasFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.ops.flush(ino.0) {
+        match self.ops.released(ino.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }

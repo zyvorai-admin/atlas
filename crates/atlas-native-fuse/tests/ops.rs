@@ -153,8 +153,16 @@ impl Cluster {
     }
 }
 
+/// The test nodes accept at most 1 MiB per request.
 fn mount(c: &Cluster, fs: &str, cfg: OpsConfig) -> Ops {
-    Ops::new(c.client(), fs, cfg)
+    Ops::new(
+        c.client(),
+        fs,
+        OpsConfig {
+            max_io_bytes: 1 << 20,
+            ..cfg
+        },
+    )
 }
 
 fn create_fs(c: &Cluster, id: &str) {
@@ -252,6 +260,24 @@ fn posix_operations_through_the_ops_layer() {
         .collect();
     assert_eq!(names, ["big.bin", "dir", "hard", "link", "moved.txt"]);
 
+    // A file unlinked while open stays readable through the handle until the last close.
+    let o = ops
+        .mknode(ROOT_INO, "open.txt", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    ops.opened(o.ino);
+    ops.write(o.ino, 0, b"still here").unwrap();
+    ops.unlink(ROOT_INO, "open.txt").unwrap();
+    assert_eq!(ops.lookup(ROOT_INO, "open.txt"), Err(libc::ENOENT));
+    assert_eq!(ops.getattr(o.ino).unwrap().nlink, 0);
+    assert_eq!(ops.read(o.ino, 0, 64).unwrap(), b"still here");
+    assert!(ops
+        .readdir(ROOT_INO)
+        .unwrap()
+        .iter()
+        .all(|e| e.name != "open.txt" && !e.name.starts_with(".atlas_hidden_")));
+    ops.released(o.ino).unwrap();
+    assert_eq!(ops.getattr(o.ino), Err(libc::ENOENT));
+
     assert_eq!(ops.rmdir(ROOT_INO, "moved.txt"), Err(libc::ENOTDIR));
     ops.mknode(d.ino, "x", NodeType::File, None, 0o644, 0, 0)
         .unwrap();
@@ -275,8 +301,9 @@ fn posix_operations_through_the_ops_layer() {
             Retry::Idempotent,
         )
         .unwrap();
+    // g was read (and read ahead) above; this mount's own write must be visible at once.
     ops.write(g.ino, 0, b"changed").unwrap();
-    ops.flush(g.ino).unwrap();
+    assert_eq!(ops.read(g.ino, 0, 7).unwrap(), b"changed");
     let snap = mount(&c, "f1@s1", OpsConfig::default());
     assert!(snap.read_only());
     assert_eq!(snap.read(g.ino, 0, 7).unwrap(), &big[..7]);

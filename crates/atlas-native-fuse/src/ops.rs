@@ -6,7 +6,11 @@
 //! TTL; writes are buffered per inode and sent on fsync, close, a non-sequential write, or once
 //! a run reaches the flush size.
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use atlas_native::{
     engine::{Attr, DirEntry, FsStat, NewNode},
@@ -23,6 +27,9 @@ use crate::{
 
 pub type Errno = i32;
 
+/// A read-ahead window: its file offset and the bytes read from there.
+type Window = (u64, Arc<Vec<u8>>);
+
 #[derive(Debug, Clone)]
 pub struct OpsConfig {
     /// How long attributes and name lookups may be served from cache (also the kernel TTL).
@@ -31,6 +38,9 @@ pub struct OpsConfig {
     pub writeback_bytes: usize,
     /// Largest single read or write request sent to the cluster.
     pub max_io_bytes: usize,
+    /// A read fetches at least this much (from the read offset) and serves following reads from
+    /// it until the TTL expires or the file is written through this mount; 0 disables it.
+    pub readahead_bytes: usize,
 }
 
 impl Default for OpsConfig {
@@ -39,6 +49,7 @@ impl Default for OpsConfig {
             ttl: Duration::from_secs(1),
             writeback_bytes: 4 << 20,
             max_io_bytes: 8 << 20,
+            readahead_bytes: 4 << 20,
         }
     }
 }
@@ -51,7 +62,18 @@ pub struct Ops {
     attrs: Mutex<TtlCache<u64, Attr>>,
     names: Mutex<TtlCache<(u64, String), u64>>,
     dirty: Mutex<WriteBack>,
+    readahead: Mutex<TtlCache<u64, Window>>,
+    /// Where each inode's last read ended: only a read that continues there reads ahead.
+    last_read_end: Mutex<TtlCache<u64, u64>>,
+    /// Open handles per inode in this mount.
+    opens: Mutex<HashMap<u64, u32>>,
+    /// Files unlinked while open here: renamed to a hidden name in their directory and removed
+    /// on last close, so open handles keep working (as libfuse does without `hard_remove`).
+    hidden: Mutex<HashMap<u64, (u64, String)>>,
 }
+
+/// Prefix of the names open-but-unlinked files are parked under; hidden from listings.
+pub const HIDDEN_PREFIX: &str = ".atlas_hidden_";
 
 fn errno(e: Error) -> Errno {
     tracing::debug!(error = %e, "native fs call failed");
@@ -80,6 +102,14 @@ impl Ops {
             attrs: Mutex::new(TtlCache::new(cfg.ttl)),
             names: Mutex::new(TtlCache::new(cfg.ttl)),
             dirty: Mutex::new(WriteBack::new(cfg.writeback_bytes)),
+            readahead: Mutex::new(TtlCache::new(if cfg.readahead_bytes > 0 {
+                cfg.ttl
+            } else {
+                Duration::ZERO
+            })),
+            last_read_end: Mutex::new(TtlCache::new(Duration::from_secs(10))),
+            opens: Mutex::new(HashMap::new()),
+            hidden: Mutex::new(HashMap::new()),
             cfg,
         }
     }
@@ -119,7 +149,49 @@ impl Ops {
         if let Some(end) = self.dirty.lock().ok().and_then(|d| d.end(a.ino)) {
             a.size = a.size.max(end);
         }
+        if self.hidden.lock().is_ok_and(|h| h.contains_key(&a.ino)) {
+            a.nlink = a.nlink.saturating_sub(1);
+        }
         a
+    }
+
+    pub fn opened(&self, ino: u64) {
+        if let Ok(mut o) = self.opens.lock() {
+            *o.entry(ino).or_default() += 1;
+        }
+    }
+
+    /// Drops one open handle; the last one sends buffered writes and removes the file if it
+    /// was unlinked while open.
+    pub fn released(&self, ino: u64) -> Result<(), Errno> {
+        let flushed = self.flush(ino);
+        let last = self.opens.lock().is_ok_and(|mut o| match o.get_mut(&ino) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            _ => {
+                o.remove(&ino);
+                true
+            }
+        });
+        if last {
+            let parked = self.hidden.lock().ok().and_then(|mut h| h.remove(&ino));
+            if let Some((parent, name)) = parked {
+                self.forget_attr(ino);
+                self.remove_entry(parent, &name)?;
+            }
+        }
+        flushed
+    }
+
+    fn remove_entry(&self, parent: u64, name: &str) -> Result<(), Errno> {
+        self.void(
+            Method::POST,
+            &format!("/inodes/{parent}/unlink"),
+            Body::Json(json!({ "name": name })),
+            Retry::Remove,
+        )
     }
 
     fn forget_attr(&self, ino: u64) {
@@ -169,7 +241,9 @@ impl Ops {
             Body::Empty,
             Retry::Idempotent,
         )?;
-        decode(v["entries"].clone())
+        let mut entries: Vec<DirEntry> = decode(v["entries"].clone())?;
+        entries.retain(|e| !e.name.starts_with(HIDDEN_PREFIX));
+        Ok(entries)
     }
 
     pub fn readlink(&self, ino: u64) -> Result<String, Errno> {
@@ -197,17 +271,27 @@ impl Ops {
         uid: u32,
         gid: u32,
     ) -> Result<Attr, Errno> {
-        check_name(name)?;
-        let node = NewNode {
-            name: name.into(),
-            // Fresh per call: a retry of this request is recognised, a later create is EEXIST.
-            op_id: uuid::Uuid::new_v4().to_string(),
-            kind,
-            target,
-            mode,
-            uid,
-            gid,
-        };
+        self.create(
+            parent,
+            NewNode {
+                name: name.into(),
+                op_id: String::new(),
+                kind,
+                target,
+                rdev: 0,
+                mode,
+                uid,
+                gid,
+            },
+        )
+    }
+
+    /// Creates `node` in `parent` under a fresh op id: a retry of this request is recognised,
+    /// a later create of the same name is EEXIST.
+    pub fn create(&self, parent: u64, mut node: NewNode) -> Result<Attr, Errno> {
+        check_name(&node.name)?;
+        node.op_id = uuid::Uuid::new_v4().to_string();
+        let name = node.name.clone();
         let body = serde_json::to_value(&node).map_err(|_| libc::EINVAL)?;
         let a: Attr = decode(self.call(
             Method::POST,
@@ -217,7 +301,7 @@ impl Ops {
         )?)?;
         self.forget_attr(parent);
         if let Ok(mut n) = self.names.lock() {
-            n.put((parent, name.to_string()), a.ino);
+            n.put((parent, name), a.ino);
         }
         Ok(self.remember(a))
     }
@@ -249,16 +333,24 @@ impl Ops {
 
     pub fn unlink(&self, parent: u64, name: &str) -> Result<(), Errno> {
         if let Ok(a) = self.lookup(parent, name) {
+            let open = self.opens.lock().is_ok_and(|o| o.contains_key(&a.ino));
+            if open && a.nlink == 1 && a.kind != NodeType::Dir {
+                let parked = format!(
+                    "{HIDDEN_PREFIX}{}_{}",
+                    a.ino,
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                );
+                self.rename(parent, name, parent, &parked)?;
+                if let Ok(mut h) = self.hidden.lock() {
+                    h.insert(a.ino, (parent, parked));
+                }
+                return Ok(());
+            }
             // Buffered bytes must not land on an inode that is about to disappear.
             self.flush(a.ino)?;
         }
         self.drop_name(parent, name);
-        self.void(
-            Method::POST,
-            &format!("/inodes/{parent}/unlink"),
-            Body::Json(json!({ "name": name })),
-            Retry::Remove,
-        )
+        self.remove_entry(parent, name)
     }
 
     pub fn rmdir(&self, parent: u64, name: &str) -> Result<(), Errno> {
@@ -299,6 +391,7 @@ impl Ops {
     }
 
     pub fn setattr(&self, ino: u64, attr: SetAttr) -> Result<Attr, Errno> {
+        self.drop_readahead(ino);
         if let Some(size) = attr.size {
             // Bytes buffered below the new size must reach the file before it is cut.
             self.flush(ino)?;
@@ -318,6 +411,46 @@ impl Ops {
 
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, Errno> {
         self.flush(ino)?;
+        let cached = self.readahead.lock().ok().and_then(|mut r| r.get(&ino));
+        if let Some((at, buf)) = cached {
+            let end = at + buf.len() as u64;
+            // A window shorter than requested ended at EOF, so it still answers fully.
+            if offset >= at && (offset + len as u64 <= end || buf.len() < self.cfg.readahead_bytes)
+            {
+                let from = ((offset - at) as usize).min(buf.len());
+                let to = (from + len).min(buf.len());
+                if let Ok(mut l) = self.last_read_end.lock() {
+                    l.put(ino, at + to as u64);
+                }
+                return Ok(buf[from..to].to_vec());
+            }
+        }
+        let sequential = self
+            .last_read_end
+            .lock()
+            .ok()
+            .and_then(|mut l| {
+                let prev = l.get(&ino);
+                l.put(ino, offset + len as u64);
+                prev
+            })
+            .map_or(offset == 0, |end| end == offset);
+        let want = if sequential {
+            len.max(self.cfg.readahead_bytes)
+        } else {
+            len
+        };
+        let data = self.fetch(ino, offset, want)?;
+        let out = data[..len.min(data.len())].to_vec();
+        if want > len {
+            if let Ok(mut r) = self.readahead.lock() {
+                r.put(ino, (offset, Arc::new(data)));
+            }
+        }
+        Ok(out)
+    }
+
+    fn fetch(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, Errno> {
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
             let want = (len - out.len()).min(self.cfg.max_io_bytes);
@@ -340,10 +473,17 @@ impl Ops {
         Ok(out)
     }
 
+    fn drop_readahead(&self, ino: u64) {
+        if let Ok(mut r) = self.readahead.lock() {
+            r.remove(&ino);
+        }
+    }
+
     pub fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
         if self.read_only() {
             return Err(libc::EROFS);
         }
+        self.drop_readahead(ino);
         let mut d = self.dirty.lock().map_err(|_| libc::EIO)?;
         for run in d.write(ino, offset, data) {
             self.send(&run)?;
@@ -360,11 +500,22 @@ impl Ops {
         }
     }
 
+    /// Sends every buffered write and removes files parked by unlink-while-open (at unmount).
     pub fn flush_all(&self) -> Result<(), Errno> {
-        let mut d = self.dirty.lock().map_err(|_| libc::EIO)?;
         let mut result = Ok(());
-        for run in d.take_all() {
+        let runs = self.dirty.lock().map_err(|_| libc::EIO)?.take_all();
+        for run in runs {
             if let Err(e) = self.send(&run) {
+                result = Err(e);
+            }
+        }
+        let parked: Vec<(u64, String)> = self
+            .hidden
+            .lock()
+            .map(|mut h| h.drain().map(|(_, v)| v).collect())
+            .unwrap_or_default();
+        for (parent, name) in parked {
+            if let Err(e) = self.remove_entry(parent, &name) {
                 result = Err(e);
             }
         }
