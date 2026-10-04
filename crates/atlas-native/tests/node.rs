@@ -33,7 +33,7 @@ fn http(
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: test\r\n{auth}Content-Length: {}\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n{auth}Content-Length: {}\r\n\r\n",
         body.len()
     );
     // The server may refuse a request before reading its body; the reply is still readable.

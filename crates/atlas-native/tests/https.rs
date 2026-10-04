@@ -86,7 +86,7 @@ fn https(
         .map_err(std::io::Error::other)?;
     let mut s = StreamOwned::new(conn, sock);
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: {}\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
     s.write_all(head.as_bytes())?;

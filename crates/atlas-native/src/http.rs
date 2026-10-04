@@ -1,8 +1,9 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A minimal blocking HTTP/1.1 server for the native node's ops and volume API: one request per
-//! connection (`Connection: close`), `Content-Length` bodies only, bounded headers and bodies.
+//! A minimal blocking HTTP/1.1 server for the native node's ops and volume API: persistent
+//! connections (closed on `Connection: close`, HTTP/1.0, a malformed request or
+//! [`IDLE_TIMEOUT`]), `Content-Length` bodies only, bounded headers and bodies.
 
 use std::{
     collections::BTreeMap,
@@ -26,11 +27,18 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// much so closing the socket does not reset the connection before the client reads the reply.
 const LINGER_DRAIN_BYTES: usize = 4 << 20;
 const LINGER_TIMEOUT: Duration = Duration::from_millis(500);
+/// A kept-alive connection idle this long is closed. Clients should drop pooled connections
+/// sooner, or their next request on one can race the close.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often an idle connection checks for shutdown.
+const IDLE_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub struct Request {
     pub method: String,
     pub path: String,
+    /// `HTTP/1.1` or `HTTP/1.0`.
+    pub version: String,
     pub query: BTreeMap<String, String>,
     /// Header names lower-cased.
     pub headers: BTreeMap<String, String>,
@@ -108,8 +116,9 @@ impl HttpServer {
                         Ok((stream, _)) => {
                             let handler = handler.clone();
                             let tls = tls.clone();
+                            let stop = stop.clone();
                             let h = thread::spawn(move || {
-                                serve(stream, max_body, &handler, tls.as_ref())
+                                serve(stream, max_body, &handler, tls.as_ref(), &stop)
                             });
                             if let Ok(mut w) = workers.lock() {
                                 w.retain(|h| !h.is_finished());
@@ -159,7 +168,13 @@ impl Drop for HttpServer {
     }
 }
 
-fn serve(stream: TcpStream, max_body: usize, handler: &Handler, tls: Option<&Arc<ServerConfig>>) {
+fn serve(
+    stream: TcpStream,
+    max_body: usize,
+    handler: &Handler,
+    tls: Option<&Arc<ServerConfig>>,
+    stop: &AtomicBool,
+) {
     if stream.set_nonblocking(false).is_err()
         || stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
@@ -169,19 +184,32 @@ fn serve(stream: TcpStream, max_body: usize, handler: &Handler, tls: Option<&Arc
     let Ok(raw) = stream.try_clone() else {
         return;
     };
-    let Ok(mut conn) = Conn::accept(stream, tls, IO_TIMEOUT) else {
+    let Ok(conn) = Conn::accept(stream, tls, IO_TIMEOUT) else {
         return;
     };
-    let resp = match read_request(&mut conn, max_body) {
-        Ok(mut req) => {
-            req.client_verified = conn.client_verified();
-            handler(req)
+    let mut r = BufReader::new(conn);
+    loop {
+        let (resp, keep_alive) = match read_request(&mut r, max_body) {
+            Ok(None) => return,
+            Ok(Some(mut req)) => {
+                let keep_alive = keeps_alive(&req) && !stop.load(Ordering::SeqCst);
+                req.client_verified = r.get_ref().client_verified();
+                (handler(req), keep_alive)
+            }
+            // The stream position is unknown after a refused request.
+            Err(resp) => (resp, false),
+        };
+        if write_response(r.get_mut(), &resp, keep_alive).is_err() {
+            return;
         }
-        Err(resp) => resp,
-    };
-    if write_response(&mut conn, &resp).is_err() {
-        return;
+        if !keep_alive {
+            break;
+        }
+        if r.buffer().is_empty() && !wait_readable(&raw, stop) {
+            return;
+        }
     }
+    let mut conn = r.into_inner();
     conn.close_notify();
     let _ = raw.shutdown(Shutdown::Write);
     let _ = raw.set_read_timeout(Some(LINGER_TIMEOUT));
@@ -196,16 +224,58 @@ fn serve(stream: TcpStream, max_body: usize, handler: &Handler, tls: Option<&Arc
     }
 }
 
-fn read_request(stream: &mut impl Read, max_body: usize) -> Result<Request, Response> {
+fn keeps_alive(req: &Request) -> bool {
+    req.version == "HTTP/1.1"
+        && !req
+            .headers
+            .get("connection")
+            .is_some_and(|v| v.eq_ignore_ascii_case("close"))
+}
+
+/// Waits for the next request's first byte; false on EOF, error, shutdown or idle timeout.
+fn wait_readable(raw: &TcpStream, stop: &AtomicBool) -> bool {
+    if raw.set_read_timeout(Some(IDLE_POLL)).is_err() {
+        return false;
+    }
+    let mut waited = Duration::ZERO;
+    let ready = loop {
+        match raw.peek(&mut [0u8; 1]) {
+            Ok(0) => break false,
+            Ok(_) => break true,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                waited += IDLE_POLL;
+                if stop.load(Ordering::SeqCst) || waited >= IDLE_TIMEOUT {
+                    break false;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    ready && raw.set_read_timeout(Some(IO_TIMEOUT)).is_ok()
+}
+
+/// The next request on the connection; `None` if the client closed it between requests.
+fn read_request<R: Read>(
+    r: &mut BufReader<R>,
+    max_body: usize,
+) -> Result<Option<Request>, Response> {
     let bad = |msg: &str| Response::text(400, msg.to_string());
-    let mut r = BufReader::new(stream);
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
-        let n = (&mut r)
+        let n = r
+            .by_ref()
             .take((MAX_HEADER_BYTES - head.len()) as u64 + 1)
             .read_until(b'\n', &mut line)
             .map_err(|_| bad("unreadable request"))?;
+        if n == 0 && head.is_empty() {
+            return Ok(None);
+        }
         if n == 0 {
             return Err(bad("connection closed mid-request"));
         }
@@ -220,7 +290,7 @@ fn read_request(stream: &mut impl Read, max_body: usize) -> Result<Request, Resp
     let head = String::from_utf8(head).map_err(|_| bad("non-UTF-8 request head"))?;
     let mut lines = head.lines();
     let mut parts = lines.next().unwrap_or_default().split_whitespace();
-    let (Some(method), Some(target), Some(_version)) = (parts.next(), parts.next(), parts.next())
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
     else {
         return Err(bad("malformed request line"));
     };
@@ -254,14 +324,15 @@ fn read_request(stream: &mut impl Read, max_body: usize) -> Result<Request, Resp
         Some((p, q)) => (p, parse_query(q)),
         None => (target, BTreeMap::new()),
     };
-    Ok(Request {
+    Ok(Some(Request {
         method: method.to_string(),
         path: path.to_string(),
+        version: version.to_string(),
         query,
         headers,
         body,
         client_verified: false,
-    })
+    }))
 }
 
 fn parse_query(q: &str) -> BTreeMap<String, String> {
@@ -293,13 +364,14 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn write_response(w: &mut impl Write, resp: &Response) -> io::Result<()> {
+fn write_response(w: &mut impl Write, resp: &Response, keep_alive: bool) -> io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
         resp.status,
         reason(resp.status),
         resp.content_type,
-        resp.body.len()
+        resp.body.len(),
+        if keep_alive { "keep-alive" } else { "close" }
     );
     w.write_all(head.as_bytes())?;
     w.write_all(&resp.body)?;
@@ -333,7 +405,9 @@ mod tests {
             s.read_to_string(&mut out).unwrap();
             out
         };
-        let ok = send(b"PUT /v1/x?offset=4 HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc");
+        let ok = send(
+            b"PUT /v1/x?offset=4 HTTP/1.1\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc",
+        );
         assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
         assert!(ok.ends_with("PUT /v1/x Some(\"4\") 3"), "{ok}");
         let big = send(b"PUT / HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789");
@@ -343,5 +417,57 @@ mod tests {
         let junk = send(b"nonsense\r\n\r\n");
         assert!(junk.starts_with("HTTP/1.1 400"), "{junk}");
         srv.shutdown();
+    }
+
+    #[test]
+    fn keeps_connections_alive_until_asked_to_close() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let handler: Handler = Arc::new(|req: Request| Response::text(200, req.path));
+        let mut srv = HttpServer::start(l, 8, handler).unwrap();
+        let s = TcpStream::connect(srv.local_addr()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let mut w = s;
+        let mut reply = |req: &[u8]| {
+            w.write_all(req).unwrap();
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                head.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            (head, String::from_utf8(body).unwrap())
+        };
+        let (h, b) = reply(b"GET /a HTTP/1.1\r\n\r\n");
+        assert!(h.contains("Connection: keep-alive"), "{h}");
+        assert_eq!(b, "/a");
+        let (h, b) = reply(b"GET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(h.contains("Connection: close"), "{h}");
+        assert_eq!(b, "/b");
+        let mut rest = Vec::new();
+        assert_eq!(
+            r.read_to_end(&mut rest).unwrap(),
+            0,
+            "closed after the reply"
+        );
+
+        // An idle kept-alive connection does not hold up shutdown.
+        let idle = TcpStream::connect(srv.local_addr()).unwrap();
+        (&idle).write_all(b"GET /c HTTP/1.1\r\n\r\n").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let t = std::time::Instant::now();
+        srv.shutdown();
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
 }

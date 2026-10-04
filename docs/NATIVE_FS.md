@@ -172,7 +172,8 @@ Known limits:
   compaction.
 - A write that covers part of an extent reads, merges and rewrites the whole extent
   (`extent_bytes`, 4 MiB by default), so small random writes are expensive.
-- The client opens a new connection per request; there is no pipelining or request batching.
+- The client reuses connections (one per concurrent request) but does not pipeline or batch
+  requests, so each metadata operation is one round trip to the leader.
 - Unlink-while-open works only within one mount (see Consistency).
 
 ## Verification
