@@ -16,8 +16,8 @@ use atlas_native::{
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow, WriteFlags,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 use crate::ops::Ops;
@@ -82,6 +82,17 @@ fn err(e: i32) -> Errno {
 
 fn name(n: &OsStr) -> Result<&str, Errno> {
     n.to_str().ok_or(Errno::EINVAL)
+}
+
+/// `size == 0` asks for the length; a buffer too small for the value is ERANGE.
+fn xattr_reply(reply: ReplyXattr, value: &[u8], size: u32) {
+    if size == 0 {
+        reply.size(value.len() as u32);
+    } else if value.len() > size as usize {
+        reply.error(Errno::ERANGE);
+    } else {
+        reply.data(value);
+    }
 }
 
 impl AtlasFs {
@@ -168,6 +179,60 @@ impl Filesystem for AtlasFs {
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         match self.ops.readlink(ino.0) {
             Ok(t) => reply.data(t.as_bytes()),
+            Err(e) => reply.error(err(e)),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        n: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        tri!(reply, self.mutate());
+        if position != 0 {
+            return reply.error(Errno::EINVAL);
+        }
+        let n = tri!(reply, name(n));
+        let create = flags & libc::XATTR_CREATE != 0;
+        let replace = flags & libc::XATTR_REPLACE != 0;
+        match self.ops.setxattr(ino.0, n, value, create, replace) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(err(e)),
+        }
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, n: &OsStr, size: u32, reply: ReplyXattr) {
+        let n = tri!(reply, name(n));
+        match self.ops.getxattr(ino.0, n) {
+            Ok(v) => xattr_reply(reply, &v, size),
+            Err(e) => reply.error(err(e)),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        match self.ops.listxattr(ino.0) {
+            Ok(names) => {
+                let mut buf = Vec::new();
+                for n in names {
+                    buf.extend_from_slice(n.as_bytes());
+                    buf.push(0);
+                }
+                xattr_reply(reply, &buf, size);
+            }
+            Err(e) => reply.error(err(e)),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, n: &OsStr, reply: ReplyEmpty) {
+        tri!(reply, self.mutate());
+        let n = tri!(reply, name(n));
+        match self.ops.removexattr(ino.0, n) {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
         }
     }

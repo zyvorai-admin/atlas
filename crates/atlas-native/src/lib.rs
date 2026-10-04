@@ -40,7 +40,7 @@ pub use engine::{
 pub use gc::GcStats;
 pub use membership::Membership;
 pub use metadata::{Catalog, MetaCommand, SnapshotId, VolumeId};
-pub use namespace::{FsId, FsOp, Inode, InodeKind, NodeType, SetAttr, ROOT_INO};
+pub use namespace::{FsId, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode, ROOT_INO};
 pub use placement::{FailureDomain, Node, PlacementPolicy};
 pub use raft::{Envelope, Message, RaftConfig, RaftCounters, RaftError, RaftNode, Role};
 pub use raft_server::{RaftServer, RaftStatus};
