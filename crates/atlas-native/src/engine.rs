@@ -679,6 +679,17 @@ impl NativeEngine {
         Ok(st)
     }
 
+    /// Errors with "not the leader" unless this engine can commit (always true for a local WAL).
+    pub fn ensure_leader(&self) -> Result<(), NativeError> {
+        if let Meta::Raft { server, .. } = &self.meta {
+            let s = server.status()?;
+            if s.role != crate::raft::Role::Leader {
+                return Err(RaftError::NotLeader { leader: s.leader }.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Volumes in the applied catalog, ordered by id.
     pub fn volumes(&self) -> Result<Vec<VolumeInfo>, NativeError> {
         self.with_catalog(|c| {

@@ -3,6 +3,7 @@
 
 //! `/v1/fs/...`: the inode-based file API. Paths address inodes by number; names travel in JSON
 //! bodies (or a percent-encoded `name` query on lookup). A snapshot tree is read as `<fs>@<id>`.
+//! Only the metadata leader answers, unless a read passes `?stale=1`.
 
 use serde_json::json;
 
@@ -16,6 +17,11 @@ use crate::{
 type Routed = Result<Response, NativeError>;
 
 pub(super) fn route(sh: &NodeShared, e: &NativeEngine, req: &Request, segs: &[&str]) -> Routed {
+    // A follower's catalog can lag the leader, so a client could miss its own writes there.
+    // `?stale=1` opts into reading whatever this replica has applied.
+    if req.method != "GET" || !req.query.contains_key("stale") {
+        e.ensure_leader()?;
+    }
     match (req.method.as_str(), segs) {
         ("GET", ["v1", "fs"]) => Ok(Response::json(
             200,

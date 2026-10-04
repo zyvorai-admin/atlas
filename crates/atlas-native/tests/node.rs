@@ -621,7 +621,7 @@ fn http_file_api_on_a_three_node_cluster() {
     let mut want = vec![0u8; 100];
     want.extend_from_slice(&payload);
     c.wait_read(
-        &format!("/v1/fs/f1/inodes/{a}/data?offset=0&len=9000"),
+        &format!("/v1/fs/f1/inodes/{a}/data?offset=0&len=9000&stale=1"),
         &want,
     );
 
@@ -719,7 +719,7 @@ fn http_file_api_on_a_three_node_cluster() {
         200
     );
     c.wait_read(
-        &format!("/v1/fs/f1@s1/inodes/{a}/data?offset=0&len=50"),
+        &format!("/v1/fs/f1@s1/inodes/{a}/data?offset=0&len=50&stale=1"),
         &want[..50],
     );
     assert_eq!(
@@ -737,7 +737,7 @@ fn http_file_api_on_a_three_node_cluster() {
     );
     assert_eq!(st, 201);
     c.wait_read(
-        &format!("/v1/fs/c1/inodes/{a}/data?offset=0&len=50"),
+        &format!("/v1/fs/c1/inodes/{a}/data?offset=0&len=50&stale=1"),
         &want[..50],
     );
     let (_, b) = call("GET", "/v1/fs", b"");
