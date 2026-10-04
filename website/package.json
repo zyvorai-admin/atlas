@@ -33,8 +33,10 @@
     "typescript": "~7.0.2"
   },
   "overrides": {
-    "serialize-javascript": "^7.1.1",
-    "uuid": "^11.1.1"
+    "serialize-javascript": "^7.1.2",
+    "uuid": "^11.1.1",
+    "fast-uri": "^3.1.8",
+    "brace-expansion@1": "^1.1.21"
   },
   "browserslist": {
     "production": [">0.5%", "not dead", "not op_mini all"],
