@@ -149,8 +149,17 @@ one cluster counted:
 
 No requests were retried or failed; the spread between rows is load from other processes on the
 laptop, not the inode count. Before commands applied in place, each create copied the catalog and
-throughput fell from 200/s at 10k inodes to 36/s at 60k. On the lab host (fsync p50 about 67 ms)
-creates are bound by disk latency at about 40/s. The practical limit is now memory: about 6 KiB
+throughput fell from 200/s at 10k inodes to 36/s at 60k. On the shared lab host, where fsync
+takes tens of milliseconds and other tenants keep I/O pressure around 15%, creates are bound by
+disk latency but stay flat with the inode count (same run shape, no retries):
+
+| Inodes | Creates/s | p50 ms | p99 ms | Catalog MiB | Leader RSS MiB |
+| --- | --- | --- | --- | --- | --- |
+| 5k | 40 | 362 | 1103 | 1.2 | 41 |
+| 15k | 47 | 321 | 811 | 3.4 | 99 |
+| 25k | 42 | 346 | 1214 | 5.8 | 112 |
+
+The practical limit is now memory: about 6 KiB
 of leader RSS per inode, so plan on roughly 1M inodes per 8 GiB node.
 
 Data path, lab FUSE mount (3 nodes on one host, fio, one job, `psync`): 1 MiB sequential write
