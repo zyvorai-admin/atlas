@@ -442,14 +442,32 @@ impl NativeEngine {
                 found: order.len(),
             });
         }
-        // Walk the preference order so a node that fails is replaced by the next eligible one.
+        // Write to the first `needed` nodes in parallel (each replica write is fsynced on its
+        // node); a node that fails is replaced by the next eligible one in preference order.
         let mut replicas = Vec::new();
-        for node_id in order {
-            if replicas.len() == needed {
+        let mut order = order.into_iter();
+        while replicas.len() < needed {
+            let batch: Vec<String> = order.by_ref().take(needed - replicas.len()).collect();
+            if batch.is_empty() {
                 break;
             }
-            if let Some(r) = self.place_replica(&node_id, fence, chunk)? {
-                replicas.push(r);
+            let placed: Vec<Result<Option<ReplicaRef>, NativeError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|node_id| s.spawn(|| self.place_replica(node_id, fence, chunk)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or(Err(NativeError::Poisoned("replica writer")))
+                    })
+                    .collect()
+            });
+            for r in placed {
+                if let Some(r) = r? {
+                    replicas.push(r);
+                }
             }
         }
         if replicas.len() < needed {
@@ -679,13 +697,12 @@ impl NativeEngine {
         Ok(st)
     }
 
-    /// Errors with "not the leader" unless this engine can commit (always true for a local WAL).
+    /// Errors with "not the leader" unless this engine is the leader and has applied its whole
+    /// log (so it serves every committed change, even right after an election). Always true for
+    /// a local WAL.
     pub fn ensure_leader(&self) -> Result<(), NativeError> {
-        if let Meta::Raft { server, .. } = &self.meta {
-            let s = server.status()?;
-            if s.role != crate::raft::Role::Leader {
-                return Err(RaftError::NotLeader { leader: s.leader }.into());
-            }
+        if let Meta::Raft { server, timeout } = &self.meta {
+            server.leader_ready(*timeout)?;
         }
         Ok(())
     }

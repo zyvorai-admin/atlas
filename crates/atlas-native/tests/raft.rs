@@ -265,9 +265,11 @@ fn full_cluster_restart_recovers_from_disk() {
     for id in c.cfgs.keys().cloned().collect::<Vec<_>>() {
         c.restart(&id);
     }
-    assert!(c.converged(&["a", "b"]));
+    // Entries applied since the last catalog checkpoint come back from the WAL once a leader
+    // commits in the new term.
     let l = c.elect();
     assert!(c.node(&l).term() > term);
+    assert!(c.run_until(50, |c| c.converged(&["a", "b"])));
     c.node_mut(&l).propose(create("c")).unwrap();
     assert!(c.run_until(50, |c| c.converged(&["a", "b", "c"])));
 }

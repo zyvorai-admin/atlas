@@ -1056,7 +1056,6 @@ impl RaftNode {
             let _ = self.catalog.apply_committed(e.term, e.index, &e.command);
         }
         if self.catalog.applied_index > start {
-            self.persist_catalog()?;
             self.maybe_compact()?;
         }
         Ok(())
@@ -1070,6 +1069,9 @@ impl RaftNode {
         let term = self
             .term_at(applied)
             .ok_or_else(|| RaftError::Inconsistent(format!("no term for {applied}")))?;
+        // The catalog is only written here: until then the WAL holds every applied entry and a
+        // restart re-applies them, so rewriting the whole catalog on every apply buys nothing.
+        self.persist_catalog()?;
         self.wal.compact_through(applied)?;
         self.log.drain(..(applied - self.snapshot_index) as usize);
         self.snapshot_index = applied;
@@ -1115,7 +1117,7 @@ impl RaftNode {
     }
 
     fn persist_catalog(&self) -> Result<(), RaftError> {
-        let bytes = serde_json::to_vec_pretty(&self.catalog)?;
+        let bytes = serde_json::to_vec(&self.catalog)?;
         durable::write_atomic(&self.cfg.root.join("catalog.json"), &bytes)?;
         Ok(())
     }
