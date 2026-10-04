@@ -67,6 +67,10 @@ pub fn connect_spec(bootstrap_servers: &str, replicas: i64, image: Option<&str>)
         // ever reports healthy, so it can never actually come up.
         "livenessProbe": { "initialDelaySeconds": 180, "timeoutSeconds": 10, "periodSeconds": 15, "failureThreshold": 6 },
         "readinessProbe": { "initialDelaySeconds": 180, "timeoutSeconds": 10, "periodSeconds": 15, "failureThreshold": 6 },
+        // Without a container limit the JVM sizes its heap from host RAM (a quarter of it); on a
+        // 32 GiB edge node one Connect worker grew to 5.4 GiB RSS and drove the node into OOM.
+        "jvmOptions": { "-Xms": "256m", "-Xmx": "1g" },
+        "resources": { "requests": { "memory": "1Gi" }, "limits": { "memory": "2Gi" } },
         "config": {
             "config.providers": "secrets",
             "config.providers.secrets.class": "io.strimzi.kafka.KubernetesSecretConfigProvider",
@@ -320,6 +324,13 @@ mod tests {
         assert_eq!(connect_name("abc123"), "dbz-connect-abc123");
         assert_eq!(source_connector_name("abc123"), "dbz-src-abc123");
         assert_eq!(topic_prefix("abc123"), "dbabc123");
+    }
+
+    #[test]
+    fn connect_workers_have_a_bounded_heap_and_memory_limit() {
+        let s = connect_spec("zyvor-kafka-kafka-bootstrap:9092", 1, None);
+        assert_eq!(s["jvmOptions"]["-Xmx"], "1g");
+        assert_eq!(s["resources"]["limits"]["memory"], "2Gi");
     }
 
     #[test]
