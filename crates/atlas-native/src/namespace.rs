@@ -35,8 +35,8 @@ pub struct FsSnapshotMeta {
     pub fs_id: FsId,
     pub name: String,
     pub created_ns: i64,
-    pub next_ino: u64,
-    pub inodes: BTreeMap<u64, Inode>,
+    /// The filesystem as it was when the snapshot was taken.
+    pub tree: FsMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -321,6 +321,18 @@ impl Catalog {
         self.filesystems
             .get(fs)
             .ok_or_else(|| MetaError::NotFound(format!("filesystem {fs}")))
+    }
+
+    /// A live filesystem, or `"<fs>@<snapshot>"` for the frozen tree of one of its snapshots.
+    pub fn fs_view(&self, fs: &str) -> Result<&FsMeta, MetaError> {
+        let Some((fs, snap)) = fs.split_once('@') else {
+            return self.filesystem(fs);
+        };
+        self.fs_snapshots
+            .get(snap)
+            .filter(|s| s.fs_id == fs)
+            .map(|s| &s.tree)
+            .ok_or_else(|| MetaError::NotFound(format!("snapshot {snap} of filesystem {fs}")))
     }
 
     fn fs_mut(&mut self, fs: &str) -> Result<&mut FsMeta, MetaError> {
@@ -638,9 +650,8 @@ impl Catalog {
                     }
                     return Err(MetaError::Exists(format!("filesystem snapshot {id}")));
                 }
-                let f = self.filesystem(fs)?;
-                let (inodes, next_ino) = (f.inodes.clone(), f.next_ino);
-                self.share_extents(&inodes)?;
+                let tree = self.filesystem(fs)?.clone();
+                self.share_extents(&tree.inodes)?;
                 self.fs_snapshots.insert(
                     id.clone(),
                     FsSnapshotMeta {
@@ -648,8 +659,7 @@ impl Catalog {
                         fs_id: fs.clone(),
                         name: name.clone(),
                         created_ns: *now_ns,
-                        next_ino,
-                        inodes,
+                        tree,
                     },
                 );
             }
@@ -658,7 +668,7 @@ impl Catalog {
                     .fs_snapshots
                     .remove(id)
                     .ok_or_else(|| MetaError::NotFound(format!("filesystem snapshot {id}")))?;
-                for inode in s.inodes.into_values() {
+                for inode in s.tree.inodes.into_values() {
                     self.drop_inode(inode, gc)?;
                 }
             }
@@ -676,18 +686,12 @@ impl Catalog {
                 let s = self.fs_snapshots.get(snapshot_id).ok_or_else(|| {
                     MetaError::NotFound(format!("filesystem snapshot {snapshot_id}"))
                 })?;
-                let (inodes, next_ino) = (s.inodes.clone(), s.next_ino);
-                self.share_extents(&inodes)?;
-                self.filesystems.insert(
-                    id.clone(),
-                    FsMeta {
-                        id: id.clone(),
-                        name: name.clone(),
-                        next_ino,
-                        inodes,
-                        source_snapshot: Some(snapshot_id.clone()),
-                    },
-                );
+                let mut tree = s.tree.clone();
+                self.share_extents(&tree.inodes)?;
+                tree.id = id.clone();
+                tree.name = name.clone();
+                tree.source_snapshot = Some(snapshot_id.clone());
+                self.filesystems.insert(id.clone(), tree);
             }
         }
         Ok(())

@@ -1,0 +1,424 @@
+// Copyright (c) 2026 ZyvorAI Labs Private Limited.
+// SPDX-License-Identifier: Apache-2.0
+
+//! File and directory operations over the namespace in the catalog. File data goes through the
+//! same extent grid, replication and copy-on-write path as volume data.
+
+use serde::{Deserialize, Serialize};
+
+use super::{now_ns, NativeEngine, NativeError, Target};
+use crate::{
+    metadata::{Catalog, MetaCommand, SnapshotId},
+    namespace::{file_extents, FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr},
+};
+
+/// What `stat(2)` needs about an inode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attr {
+    pub ino: u64,
+    pub kind: NodeType,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub size: u64,
+    /// Allocated 512-byte blocks (holes take none).
+    pub blocks: u64,
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub ino: u64,
+    pub kind: NodeType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsInfo {
+    pub id: FsId,
+    pub name: String,
+    pub inodes: usize,
+    /// Sum of file sizes.
+    pub bytes: u64,
+    pub source_snapshot: Option<SnapshotId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsSnapshotInfo {
+    pub id: SnapshotId,
+    pub fs_id: FsId,
+    pub name: String,
+    pub created_ns: i64,
+    pub inodes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsStat {
+    pub inodes: u64,
+    pub used_bytes: u64,
+    /// Device bytes (summed over replicas) on the free lists.
+    pub free_list_bytes: u64,
+}
+
+/// A directory entry to create.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewNode {
+    pub name: String,
+    /// Client-chosen id: retrying the same create returns the inode it made.
+    pub op_id: String,
+    pub kind: NodeType,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+}
+
+fn kind_of(i: &Inode) -> NodeType {
+    match i.kind {
+        InodeKind::Dir { .. } => NodeType::Dir,
+        InodeKind::File { .. } => NodeType::File,
+        InodeKind::Symlink { .. } => NodeType::Symlink,
+    }
+}
+
+fn attr(c: &Catalog, i: &Inode) -> Attr {
+    let allocated: u64 = match &i.kind {
+        InodeKind::File { extents, .. } => extents
+            .values()
+            .filter_map(|e| c.extents.get(e))
+            .map(|m| m.extent.len as u64)
+            .sum(),
+        _ => 0,
+    };
+    Attr {
+        ino: i.ino,
+        kind: kind_of(i),
+        mode: i.mode,
+        uid: i.uid,
+        gid: i.gid,
+        nlink: i.nlink,
+        size: i.size(),
+        blocks: allocated.div_ceil(512),
+        atime_ns: i.atime_ns,
+        mtime_ns: i.mtime_ns,
+        ctime_ns: i.ctime_ns,
+    }
+}
+
+/// Snapshot views (`fs@snap`) only serve reads.
+fn writable(fs: &str) -> Result<(), NativeError> {
+    if fs.contains('@') {
+        return Err(NativeError::ReadOnly(format!("{fs} is a snapshot")));
+    }
+    Ok(())
+}
+
+impl NativeEngine {
+    fn fs_commit(&self, op: FsOp) -> Result<(), NativeError> {
+        self.commit(MetaCommand::Fs { op }, None)
+    }
+
+    fn with_fs<R>(
+        &self,
+        fs: &str,
+        f: impl FnOnce(&Catalog, &FsMeta) -> Result<R, NativeError>,
+    ) -> Result<R, NativeError> {
+        self.with_catalog(|c| f(c, c.fs_view(fs)?))?
+    }
+
+    /// Creates an empty filesystem with a caller-chosen id (idempotent).
+    pub fn create_fs_as(&self, id: String, name: impl Into<String>) -> Result<FsId, NativeError> {
+        writable(&id)?;
+        self.fs_commit(FsOp::CreateFs {
+            fs: id.clone(),
+            name: name.into(),
+            now_ns: now_ns(),
+        })?;
+        Ok(id)
+    }
+
+    pub fn delete_fs(&self, fs: &str) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::DeleteFs { fs: fs.into() })
+    }
+
+    pub fn filesystems(&self) -> Result<Vec<FsInfo>, NativeError> {
+        self.with_catalog(|c| {
+            c.filesystems
+                .values()
+                .map(|f| FsInfo {
+                    id: f.id.clone(),
+                    name: f.name.clone(),
+                    inodes: f.inodes.len(),
+                    bytes: f
+                        .inodes
+                        .values()
+                        .filter(|i| matches!(i.kind, InodeKind::File { .. }))
+                        .map(Inode::size)
+                        .sum(),
+                    source_snapshot: f.source_snapshot.clone(),
+                })
+                .collect()
+        })
+    }
+
+    pub fn fs_statfs(&self, fs: &str) -> Result<FsStat, NativeError> {
+        self.with_fs(fs, |c, f| {
+            Ok(FsStat {
+                inodes: f.inodes.len() as u64,
+                used_bytes: file_extents(&f.inodes)
+                    .filter_map(|e| c.extents.get(e))
+                    .map(|m| m.extent.len as u64)
+                    .sum(),
+                free_list_bytes: c.free.total_bytes(),
+            })
+        })
+    }
+
+    pub fn fs_getattr(&self, fs: &str, ino: u64) -> Result<Attr, NativeError> {
+        self.with_fs(fs, |c, f| Ok(attr(c, f.inode(ino)?)))
+    }
+
+    pub fn fs_lookup(&self, fs: &str, parent: u64, name: &str) -> Result<Attr, NativeError> {
+        self.with_fs(fs, |c, f| Ok(attr(c, f.inode(f.lookup(parent, name)?)?)))
+    }
+
+    pub fn fs_readdir(&self, fs: &str, dir: u64) -> Result<Vec<DirEntry>, NativeError> {
+        self.with_fs(fs, |_, f| {
+            f.entries(dir)?
+                .iter()
+                .map(|(name, ino)| {
+                    Ok(DirEntry {
+                        name: name.clone(),
+                        ino: *ino,
+                        kind: kind_of(f.inode(*ino)?),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    pub fn fs_readlink(&self, fs: &str, ino: u64) -> Result<String, NativeError> {
+        self.with_fs(fs, |_, f| match &f.inode(ino)?.kind {
+            InodeKind::Symlink { target } => Ok(target.clone()),
+            _ => Err(NativeError::Invalid(format!(
+                "inode {ino} is not a symlink"
+            ))),
+        })
+    }
+
+    pub fn fs_mknode(&self, fs: &str, parent: u64, node: NewNode) -> Result<Attr, NativeError> {
+        writable(fs)?;
+        let name = node.name.clone();
+        self.fs_commit(FsOp::Mknode {
+            fs: fs.into(),
+            parent,
+            name: node.name,
+            op_id: node.op_id,
+            node_type: node.kind,
+            target: node.target,
+            mode: node.mode,
+            uid: node.uid,
+            gid: node.gid,
+            now_ns: now_ns(),
+        })?;
+        self.fs_lookup(fs, parent, &name)
+    }
+
+    pub fn fs_link(
+        &self,
+        fs: &str,
+        ino: u64,
+        parent: u64,
+        name: &str,
+    ) -> Result<Attr, NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::Link {
+            fs: fs.into(),
+            ino,
+            parent,
+            name: name.into(),
+            now_ns: now_ns(),
+        })?;
+        self.fs_getattr(fs, ino)
+    }
+
+    pub fn fs_unlink(&self, fs: &str, parent: u64, name: &str) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::Unlink {
+            fs: fs.into(),
+            parent,
+            name: name.into(),
+            now_ns: now_ns(),
+        })
+    }
+
+    pub fn fs_rmdir(&self, fs: &str, parent: u64, name: &str) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::Rmdir {
+            fs: fs.into(),
+            parent,
+            name: name.into(),
+            now_ns: now_ns(),
+        })
+    }
+
+    pub fn fs_rename(
+        &self,
+        fs: &str,
+        parent: u64,
+        name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::Rename {
+            fs: fs.into(),
+            parent,
+            name: name.into(),
+            new_parent,
+            new_name: new_name.into(),
+            now_ns: now_ns(),
+        })
+    }
+
+    /// Changes attributes. Truncating into the middle of an extent first rewrites that extent
+    /// without its tail, so growing the file again later reads zeros there, not stale bytes.
+    pub fn fs_setattr(&self, fs: &str, ino: u64, attr: SetAttr) -> Result<Attr, NativeError> {
+        writable(fs)?;
+        let _write = self
+            .write_lock
+            .lock()
+            .map_err(|_| NativeError::Poisoned("write"))?;
+        if let Some(size) = attr.size {
+            let grid = self.cfg.extent_bytes as u64;
+            let cell = size - size % grid;
+            let target = Target::File { fs, ino };
+            if size > cell {
+                if let Some(ext) = self.with_catalog(|c| target.extent_at(c, cell))?? {
+                    if cell + ext.len as u64 > size {
+                        let fence = self.write_fence()?;
+                        let mut buf = self.read_extent(&ext)?;
+                        buf.truncate((size - cell) as usize);
+                        self.install_extent(&target, cell, &buf, fence)?;
+                    }
+                }
+            }
+        }
+        self.fs_commit(FsOp::SetAttr {
+            fs: fs.into(),
+            ino,
+            attr,
+            now_ns: now_ns(),
+        })?;
+        self.fs_getattr(fs, ino)
+    }
+
+    /// Writes `data` at `offset`, growing the file as needed; a gap past the old end is a hole.
+    pub fn write_file(
+        &self,
+        fs: &str,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Attr, NativeError> {
+        writable(fs)?;
+        offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| NativeError::Invalid("write offset overflows".into()))?;
+        let target = Target::File { fs, ino };
+        if data.is_empty() {
+            self.with_catalog(|c| target.extent_at(c, 0))??;
+        } else {
+            let _write = self
+                .write_lock
+                .lock()
+                .map_err(|_| NativeError::Poisoned("write"))?;
+            let fence = self.write_fence()?;
+            self.write_locked(&target, offset, data, fence)?;
+        }
+        self.fs_getattr(fs, ino)
+    }
+
+    /// Reads up to `len` bytes at `offset`; short at end of file, holes read as zeros.
+    pub fn read_file(
+        &self,
+        fs: &str,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, NativeError> {
+        let (extents, len) = self.with_fs(fs, |c, f| {
+            let InodeKind::File { size, extents } = &f.inode(ino)?.kind else {
+                return Err(NativeError::Invalid(format!(
+                    "inode {ino} is not a regular file"
+                )));
+            };
+            let len = (*size).saturating_sub(offset).min(len as u64) as usize;
+            if len == 0 {
+                return Ok((Vec::new(), 0));
+            }
+            Ok((self.extents_in(c, extents, *size, offset, len)?, len))
+        })?;
+        self.read_range(extents, offset, len)
+    }
+
+    /// Freezes `fs` as a read-only snapshot (metadata only), with a caller-chosen id.
+    pub fn snapshot_fs_as(
+        &self,
+        id: String,
+        fs: &str,
+        name: impl Into<String>,
+    ) -> Result<SnapshotId, NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::SnapshotFs {
+            id: id.clone(),
+            fs: fs.into(),
+            name: name.into(),
+            now_ns: now_ns(),
+        })?;
+        Ok(id)
+    }
+
+    pub fn delete_fs_snapshot(&self, id: &str) -> Result<(), NativeError> {
+        self.fs_commit(FsOp::DeleteFsSnapshot { id: id.into() })
+    }
+
+    /// A writable copy-on-write filesystem from a snapshot, with a caller-chosen id.
+    pub fn clone_fs_as(
+        &self,
+        id: String,
+        snapshot_id: &str,
+        name: impl Into<String>,
+    ) -> Result<FsId, NativeError> {
+        writable(&id)?;
+        self.fs_commit(FsOp::CloneFs {
+            id: id.clone(),
+            name: name.into(),
+            snapshot_id: snapshot_id.into(),
+        })?;
+        Ok(id)
+    }
+
+    pub fn fs_snapshots(&self) -> Result<Vec<FsSnapshotInfo>, NativeError> {
+        self.with_catalog(|c| {
+            c.fs_snapshots
+                .values()
+                .map(|s| FsSnapshotInfo {
+                    id: s.id.clone(),
+                    fs_id: s.fs_id.clone(),
+                    name: s.name.clone(),
+                    created_ns: s.created_ns,
+                    inodes: s.tree.inodes.len(),
+                })
+                .collect()
+        })
+    }
+}

@@ -19,12 +19,49 @@ use crate::{
     durable, gc,
     metadata::{Catalog, ExtentRef, MetaCommand, MetaError, ReplicaRef, SnapshotId, VolumeId},
     metrics::PromText,
+    namespace::{FsOp, InodeKind},
     placement::{select_replicas, Node, PlacementPolicy},
     raft::RaftError,
     raft_server::RaftServer,
     telemetry::NativeIoCounters,
     wal::{Wal, WalError, WalRecord},
 };
+
+mod files;
+pub use files::{Attr, DirEntry, FsInfo, FsSnapshotInfo, FsStat, NewNode};
+
+/// What a data write lands in.
+enum Target<'a> {
+    Volume(&'a str),
+    File { fs: &'a str, ino: u64 },
+}
+
+impl Target<'_> {
+    /// The extent currently at grid cell `cell`, if any.
+    fn extent_at(&self, c: &Catalog, cell: u64) -> Result<Option<ExtentRef>, NativeError> {
+        let id = match self {
+            Target::Volume(v) => c.volumes.get(*v).and_then(|v| v.extents.get(&cell)),
+            Target::File { fs, ino } => match &c.filesystem(fs)?.inode(*ino)?.kind {
+                InodeKind::File { extents, .. } => extents.get(&cell),
+                _ => {
+                    return Err(
+                        MetaError::IsDir(format!("inode {ino} is not a regular file")).into(),
+                    )
+                }
+            },
+        };
+        Ok(id
+            .and_then(|id| c.extents.get(id))
+            .map(|m| m.extent.clone()))
+    }
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeError {
@@ -52,6 +89,8 @@ pub enum NativeError {
     Fenced { current: u64 },
     #[error("data node error: {0}")]
     Remote(String),
+    #[error("read-only: {0}")]
+    ReadOnly(String),
 }
 
 #[derive(Debug, Clone)]
@@ -321,19 +360,34 @@ impl NativeEngine {
             .write_lock
             .lock()
             .map_err(|_| NativeError::Poisoned("write"))?;
-        // Allocation reads the applied free list, so under Raft every earlier entry (including
-        // other terms') must be applied first; the term then fences the data writes.
-        let fence = match &self.meta {
-            Meta::Local { .. } => 0,
-            Meta::Raft { server, timeout } => server.leader_ready(*timeout)?,
-        };
+        let fence = self.write_fence()?;
         let size = self
             .with_catalog(|c| c.volumes.get(volume_id).map(|v| v.size_bytes))?
             .ok_or_else(|| NativeError::NotFound(volume_id.into()))?;
         if offset.saturating_add(data.len() as u64) > size {
             return Err(NativeError::Invalid("write exceeds volume size".into()));
         }
+        self.write_locked(&Target::Volume(volume_id), offset, data, fence)
+    }
 
+    /// Allocation reads the applied free list, so under Raft every earlier entry (including
+    /// other terms') must be applied first; the term then fences the data writes. Call with
+    /// `write_lock` held.
+    fn write_fence(&self) -> Result<u64, NativeError> {
+        Ok(match &self.meta {
+            Meta::Local { .. } => 0,
+            Meta::Raft { server, timeout } => server.leader_ready(*timeout)?,
+        })
+    }
+
+    /// Writes `data` at `offset` of `target` under `write_lock`.
+    fn write_locked(
+        &self,
+        target: &Target,
+        offset: u64,
+        data: &[u8],
+        fence: u64,
+    ) -> Result<(), NativeError> {
         // Extents sit on a fixed grid (extent i covers [i*E, (i+1)*E)), so a write never leaves
         // two extents covering the same bytes. A write that covers only part of an existing
         // extent's bytes rewrites the whole extent with the old bytes merged in.
@@ -345,13 +399,7 @@ impl NativeEngine {
             let within = (pos - cell) as usize;
             let n = rest.len().min(self.cfg.extent_bytes - within);
             let (part, tail) = rest.split_at(n);
-            let existing = self.with_catalog(|c| {
-                c.volumes
-                    .get(volume_id)
-                    .and_then(|v| v.extents.get(&cell))
-                    .and_then(|id| c.extents.get(id))
-                    .map(|m| m.extent.clone())
-            })?;
+            let existing = self.with_catalog(|c| target.extent_at(c, cell))??;
             let merged;
             let content: &[u8] = match existing {
                 Some(ext) if within > 0 || n < ext.len => {
@@ -371,7 +419,7 @@ impl NativeEngine {
                 }
                 _ => part,
             };
-            self.install_extent(volume_id, cell, content, fence)?;
+            self.install_extent(target, cell, content, fence)?;
             pos += n as u64;
             rest = tail;
         }
@@ -381,7 +429,7 @@ impl NativeEngine {
     /// Writes `chunk` to fresh replicas and commits it as the extent at `logical`.
     fn install_extent(
         &self,
-        volume_id: &str,
+        target: &Target,
         logical: u64,
         chunk: &[u8],
         fence: u64,
@@ -417,14 +465,24 @@ impl NativeEngine {
             checksum: checksum::sha256(chunk),
             replicas,
         };
-        self.commit(
-            MetaCommand::InstallExtent {
+        let cmd = match target {
+            Target::Volume(volume_id) => MetaCommand::InstallExtent {
                 volume_id: volume_id.to_string(),
                 logical_offset: logical,
                 extent,
             },
-            Some(fence),
-        )?;
+            Target::File { fs, ino } => MetaCommand::Fs {
+                op: FsOp::InstallFileExtent {
+                    fs: fs.to_string(),
+                    ino: *ino,
+                    logical_offset: logical,
+                    size: logical + chunk.len() as u64,
+                    extent,
+                    now_ns: now_ns(),
+                },
+            },
+        };
+        self.commit(cmd, Some(fence))?;
         self.telemetry.record_write(chunk.len());
         Ok(())
     }
