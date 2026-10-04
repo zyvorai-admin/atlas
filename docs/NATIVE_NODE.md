@@ -5,11 +5,9 @@
 `atlas-native-node --config <file.json>` runs one native storage node (`crates/atlas-native`,
 `node` module). A node runs a **data node** (serves one local device file to the cluster), a
 **metadata replica** (Raft + `NativeEngine`), or both, and always serves an HTTP endpoint for
-health, metrics, status and a small volume API. See `docs/NATIVE_METADATA.md` for the storage
-design behind it.
-
-It is not wired into the Atlas gateway yet; this is the standalone process for running and testing
-the native data plane.
+health, metrics, status, block volumes and POSIX filesystems. See `docs/NATIVE_METADATA.md` for the
+storage design behind it, `docs/NATIVE_FS.md` for filesystems and the `atlas-native-mount` FUSE
+client, and "Atlas gateway" below for how the gateway drives it.
 
 ## Roles and topology
 
@@ -97,9 +95,11 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `GET /v1/members` | yes | `{"membership": {"type": "stable", "voters": [...]}, "addrs": {id: "host:port"}}` (`type` is `joint` with `old`/`new` mid-change); `addrs` are the Raft addresses learned from membership changes. |
 | `POST /v1/members` | yes | `{"voters": {"<id>": "<host:port>", ...}}`: move to exactly this voter set (leader only) and return once the final configuration has committed. 409 while another change is in flight. |
 | `POST /v1/repair`, `POST /v1/gc` | yes | Run one pass now (leader only) and return its stats. |
+| `/v1/fs/...`, `/v1/fs-snapshots/...` | yes | Filesystems, inodes, file data and filesystem snapshots/clones: see `docs/NATIVE_FS.md`. |
 
-Errors are JSON `{"error": "...", "leader": ...}`. A mutation sent to a follower returns **421** with
-the leader's node id in `leader` (null while unknown). Status codes: 400 bad request, 401 missing or
+Errors are JSON `{"error": "...", "code": "...", "leader": ...}`; `code` is a stable machine-readable
+reason (`not_found`, `exists`, `invalid`, `read_only`, `not_leader`, `unavailable`, …). A mutation sent
+to a follower returns **421** with the leader's node id in `leader` (null while unknown). Status codes: 400 bad request, 401 missing or
 invalid token, 404 unknown volume/snapshot/route (or no metadata role), 409 rejected by the state
 machine, 413 body too large, 503 retryable (not enough data nodes, leadership changed, timeout).
 
@@ -118,6 +118,18 @@ The HTTP server is deliberately small: one request per connection, `Content-Leng
 - **Failure**: a data node that fails I/O is backed off for 5 s and writes move to the next eligible
   node; reads fall back to other replicas. Losing the metadata leader triggers an election
   (typically well under a second with the default tick) and clients retry against the new leader.
+- **Durability**: a follower fsyncs its log once per batch of AppendEntries, before acknowledging
+  any of it; the leader writes proposals in parallel with replicating them and counts itself towards
+  a quorum only for entries it has fsynced, so concurrent proposals share fsyncs (group commit). The
+  catalog is written to disk only when the log is compacted: once 2048 entries have been applied
+  since the last snapshot, everything but the newest 1024 is folded into it, so a briefly lagging
+  follower still catches up from the log rather than a full catalog transfer. A restart replays
+  the log since the last snapshot. A follower too far behind gets one InstallSnapshot per election
+  timeout until it answers.
+- **Slow disks**: the Raft core holds its lock while it fsyncs, so a disk whose fsyncs take hundreds
+  of milliseconds can delay heartbeats past the election timeout (10–20 ticks) under write load and
+  cause needless elections (clients retry through them). On such disks raise `metadata.tick_ms`
+  (e.g. 200 for 2–4 s elections).
 - **Restart**: all Raft state and data are crash-safe on disk, so stopping the process (any signal)
   needs no graceful path. A fatal storage error inside the Raft replica (e.g. a failed fsync) makes
   the process exit non-zero so its supervisor restarts it from disk.
@@ -194,11 +206,13 @@ repair after losing a data node, and config validation.
 backend `bkd_native`, discovers it at startup and every `ATLAS_MONITOR_INTERVAL_SECS`, and serves:
 
 - inventory: one cluster `cls_native_bkd_native`, one replicated pool `native` (replica size from
-  `/v1/status` `layout`), block volumes `vol_native_<native id>`; health is critical without a
+  `/v1/status` `layout`), block volumes `vol_native_<native id>` and filesystems
+  `vol_native_fs_<native id>` (kind `filesystem`, see `docs/NATIVE_FS.md`); health is critical without a
   metadata leader and warn while a data node is down. Capacity is not reported (the nodes do not
   know their disks' size), so it stays empty instead of being invented;
 - `POST /volumes` with `"kubernetes": {"backend_id": "bkd_native"}`: created synchronously through
-  the leader (201, no job), recorded under the request's tenant (quota admission and product
+  the leader (201, no job; `"kind": "filesystem"` makes a filesystem, `atlasctl create-volume
+  --backend bkd_native [--kind filesystem]`), recorded under the request's tenant (quota admission and product
   bindings as for any volume); `DELETE /volumes/{id}`, `POST /volumes/{id}/expand`,
   `POST /volumes/{id}/snapshots`, `DELETE /snapshots/{id}` and `POST /snapshots/{id}/clone` /
   `restore` (a new volume from the snapshot, recorded as its dependent so the snapshot can't be

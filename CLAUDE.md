@@ -91,6 +91,18 @@ block-layer attach** (`bpf` feature: `crates/atlas-io/bpf/atlas_bio.bpf.c`, CO-R
 pid/cgroup attribution; if attach fails, live mode reports the programs missing rather than
 fabricating data. NFS/ZFS/io_uring programs are still contracts only.
 
+**atlas-native filesystems** (`docs/NATIVE_FS.md`): POSIX files and directories in the native
+cluster's replicated catalog (inodes, hard links, rename, setattr/truncate, symlinks, special files),
+file data on the same copy-on-write extents as block volumes, metadata-only snapshots (read-only,
+`<fs>@<snap>`) and clones. `atlas-native-mount` (`crates/atlas-native-fuse`, `fuse` feature, Linux)
+mounts them through FUSE with leader failover, TTL attribute/name caching, write-back and
+read-ahead; close-to-open consistency across mounts. The gateway serves them as `filesystem`
+volumes `vol_native_fs_<id>` (create/snapshot/clone/restore/delete via `atlasctl create-volume
+--backend bkd_native --kind filesystem`). pjdfstest (12 suites, 8565 tests), git clone + fsck and
+snapshot/clone isolation verified over FUSE on the lab. Scaling limit: one Raft group and a
+whole-catalog clone per proposal, so creates slow as the inode count grows (measured: 200/s at
+10k inodes, 36/s at 60k; ~50k per cluster is the practical limit — see the doc).
+
 **Licensed** under the [Apache License 2.0](LICENSE) (`Apache-2.0`; relicensed from the Zyvor
 Production License v1.0 at the maintainer's explicit request — history in
 [`docs/LICENSING.md`](docs/LICENSING.md)). Don't weaken or remove license notices,
@@ -133,8 +145,12 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   `docs/NATIVE_NODE.md`.
 - `crates/atlas-driver-native` — `StorageDriver` over the `atlas-native-node` HTTP API (backend
   `bkd_native`, `ATLAS_NATIVE_*`); the one driver whose write methods the gateway calls
-  (synchronous volume create/expand/delete, snapshot create/delete, clone/restore) and the
-  only one with a gateway block data path (`GET`/`PUT /volumes/{id}/data`). Tested against in-process native nodes.
+  (synchronous volume create/expand/delete, snapshot create/delete, clone/restore — block volumes
+  and, as kind `filesystem`, native filesystems) and the only one with a gateway block data path
+  (`GET`/`PUT /volumes/{id}/data`). Tested against in-process native nodes.
+- `crates/atlas-native-fuse` — `atlas-native-mount` FUSE client for native filesystems (`fuse`
+  feature, Linux only; the kernel-independent `ops` layer is tested on any OS against in-process
+  nodes). See `docs/NATIVE_FS.md`.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
   DB-backed rate-limit counters (`rate_limit.rs`).
