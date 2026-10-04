@@ -50,6 +50,8 @@ SSH="ssh -o StrictHostKeyChecking=accept-new ${USER}@${HOST}"
 NS="zyvor-system"
 DEPLOY="atlas-gateway"
 NODEPORT=30510
+# Checks hit the node address, not loopback: Cilium's kube-proxy replacement doesn't serve
+# NodePorts on 127.0.0.1, so a loopback curl fails (and silently skips the upgrade pre-flight).
 # Prefer the user kubeconfig (~/.kube/config). Bare `kubectl` on k3s hosts often points at
 # /etc/rancher/k3s/k3s.yaml (root-only) and fails with permission denied mid-rollout.
 REMOTE_KUBE='if [ -r "$HOME/.kube/config" ]; then export KUBECONFIG="$HOME/.kube/config"; fi; KUBECTL="${KUBECTL:-kubectl}"'
@@ -61,13 +63,13 @@ warn() { printf '\033[1;33m!! %s\033[0m\n' "$*"; }
 if [[ "$ROLLBACK" == "1" ]]; then
   log "rollback: reverting ${DEPLOY} to its previous revision"
   $SSH "${REMOTE_KUBE}; \$KUBECTL -n ${NS} rollout undo deploy/${DEPLOY} && \$KUBECTL -n ${NS} rollout status deploy/${DEPLOY} --timeout=180s"
-  $SSH "curl -fsS http://127.0.0.1:${NODEPORT}/version; echo" || true
+  $SSH "curl -fsS http://${HOST}:${NODEPORT}/version; echo" || true
   log "rollback done."
   exit 0
 fi
 
 # Pre-flight: if the gateway is already up, gate the upgrade on its readiness (no upgrade mid-incident).
-if $SSH "curl -fsS http://127.0.0.1:${NODEPORT}/api/atlas/v1/upgrade/preflight" >/tmp/atlas-preflight.json 2>/dev/null; then
+if $SSH "curl -fsS http://${HOST}:${NODEPORT}/api/atlas/v1/upgrade/preflight" >/tmp/atlas-preflight.json 2>/dev/null; then
   if grep -q '"ready":false' /tmp/atlas-preflight.json; then
     warn "upgrade pre-flight reported blockers:"; cat /tmp/atlas-preflight.json; echo
     [[ "$FORCE" == "1" ]] || { warn "aborting (pass --force to override, or drain via POST /maintenance)"; exit 3; }
@@ -123,11 +125,11 @@ $SSH "set -e
   BOOT='${BOOT}'
   AUTH=()
   [[ -n \"\$BOOT\" ]] && AUTH=(-H \"Authorization: Bearer \$BOOT\")
-  echo '--- /health ---'; curl -fsS http://127.0.0.1:${NODEPORT}/health; echo
-  echo '--- /version ---'; curl -fsS http://127.0.0.1:${NODEPORT}/version; echo
-  echo '--- trigger discovery ---'; curl -fsS \"\${AUTH[@]}\" -X POST http://127.0.0.1:${NODEPORT}/api/atlas/v1/backends/bkd_ceph_lab/discover; echo
-  echo '--- /pools ---'; curl -fsS \"\${AUTH[@]}\" http://127.0.0.1:${NODEPORT}/api/atlas/v1/pools; echo
-  echo '--- /storage-classes (LIVE from k3s) ---'; curl -fsS \"\${AUTH[@]}\" http://127.0.0.1:${NODEPORT}/api/atlas/v1/storage-classes; echo
+  echo '--- /health ---'; curl -fsS http://${HOST}:${NODEPORT}/health; echo
+  echo '--- /version ---'; curl -fsS http://${HOST}:${NODEPORT}/version; echo
+  echo '--- trigger discovery ---'; curl -fsS \"\${AUTH[@]}\" -X POST http://${HOST}:${NODEPORT}/api/atlas/v1/backends/bkd_ceph_lab/discover; echo
+  echo '--- /pools ---'; curl -fsS \"\${AUTH[@]}\" http://${HOST}:${NODEPORT}/api/atlas/v1/pools; echo
+  echo '--- /storage-classes (LIVE from k3s) ---'; curl -fsS \"\${AUTH[@]}\" http://${HOST}:${NODEPORT}/api/atlas/v1/storage-classes; echo
 "
 
 log "done. Atlas gateway on http://${HOST}:${NODEPORT} (auth required; use bootstrap token or a minted JWT)"
