@@ -90,7 +90,7 @@ impl Sim {
         for _ in 0..10_000 {
             let mut batch = Vec::new();
             for n in self.nodes.values_mut().flatten() {
-                batch.extend(n.take_messages());
+                batch.extend(n.take_messages().unwrap());
             }
             if batch.is_empty() {
                 return;

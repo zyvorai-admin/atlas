@@ -41,6 +41,8 @@ pub struct Wal {
     path: PathBuf,
     file: File,
     last_index: u64,
+    /// Highest index known to be on disk (written by an fsynced append or a rewrite).
+    synced_index: u64,
     records: u64,
 }
 
@@ -56,6 +58,7 @@ impl Wal {
             path,
             file,
             last_index: lines.last().map(|(i, _)| *i).unwrap_or(0),
+            synced_index: lines.last().map(|(i, _)| *i).unwrap_or(0),
             records: lines.len() as u64,
         };
         if torn {
@@ -66,6 +69,13 @@ impl Wal {
     }
 
     pub fn append<T: Serialize>(&mut self, record: &WalRecord<T>) -> Result<(), WalError> {
+        self.append_unsynced(record)?;
+        self.sync()
+    }
+
+    /// Writes the record without waiting for the disk; it is durable once [`Self::sync`] returns
+    /// (or `synced_index()` covers it). A crash before that may lose it, never tear it.
+    pub fn append_unsynced<T: Serialize>(&mut self, record: &WalRecord<T>) -> Result<(), WalError> {
         if record.index <= self.last_index {
             return Err(WalError::IndexRegression {
                 last: self.last_index,
@@ -75,10 +85,22 @@ impl Wal {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         self.file.write_all(&line)?;
-        self.file.sync_data()?;
         self.last_index = record.index;
         self.records += 1;
         Ok(())
+    }
+
+    /// Flushes every unsynced append with one fsync; a no-op when there is none.
+    pub fn sync(&mut self) -> Result<(), WalError> {
+        if self.synced_index < self.last_index {
+            self.file.sync_data()?;
+            self.synced_index = self.last_index;
+        }
+        Ok(())
+    }
+
+    pub fn synced_index(&self) -> u64 {
+        self.synced_index
     }
 
     pub fn replay<T: DeserializeOwned>(&self) -> Result<Vec<WalRecord<T>>, WalError> {
@@ -106,6 +128,7 @@ impl Wal {
     /// compaction has removed every record from the file.
     pub fn raise_floor(&mut self, index: u64) {
         self.last_index = self.last_index.max(index);
+        self.synced_index = self.synced_index.max(index);
     }
 
     /// Drops every record with `index <= through`. Only safe once state covering `through` has
@@ -118,6 +141,7 @@ impl Wal {
     pub fn truncate_after(&mut self, after: u64) -> Result<u64, WalError> {
         let removed = self.rewrite(|i| i <= after)?;
         self.last_index = after;
+        self.synced_index = after;
         Ok(removed)
     }
 
@@ -125,6 +149,7 @@ impl Wal {
     pub fn reset(&mut self, floor: u64) -> Result<(), WalError> {
         self.rewrite(|_| false)?;
         self.last_index = floor;
+        self.synced_index = floor;
         Ok(())
     }
 
@@ -146,6 +171,7 @@ impl Wal {
         fs::rename(&tmp, &self.path)?;
         sync_dir(&self.dir)?;
         self.file = open_append(&self.path)?;
+        self.synced_index = self.last_index;
         let removed = self.records.saturating_sub(kept);
         self.records = kept;
         Ok(removed)
@@ -197,4 +223,44 @@ fn scan(path: &Path) -> Result<(Vec<(u64, String)>, bool), WalError> {
         }
     }
     Ok((out, torn))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(index: u64) -> WalRecord<String> {
+        WalRecord {
+            term: 1,
+            index,
+            command: format!("c{index}"),
+        }
+    }
+
+    #[test]
+    fn unsynced_appends_are_covered_by_one_sync() {
+        let td = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(td.path()).unwrap();
+        wal.append(&rec(1)).unwrap();
+        assert_eq!(wal.synced_index(), 1);
+        wal.append_unsynced(&rec(2)).unwrap();
+        wal.append_unsynced(&rec(3)).unwrap();
+        assert_eq!((wal.last_index(), wal.synced_index()), (3, 1));
+        wal.sync().unwrap();
+        assert_eq!(wal.synced_index(), 3);
+
+        wal.append_unsynced(&rec(4)).unwrap();
+        wal.truncate_after(2).unwrap();
+        assert_eq!((wal.last_index(), wal.synced_index()), (2, 2));
+        drop(wal);
+        let wal = Wal::open(td.path()).unwrap();
+        let replayed: Vec<u64> = wal
+            .replay::<String>()
+            .unwrap()
+            .iter()
+            .map(|r| r.index)
+            .collect();
+        assert_eq!(replayed, [1, 2]);
+        assert_eq!(wal.synced_index(), 2);
+    }
 }

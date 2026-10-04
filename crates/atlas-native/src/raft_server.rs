@@ -165,13 +165,13 @@ impl Shared {
         self.node.lock().map_err(|_| RaftError::Shutdown)
     }
 
-    fn flush(&self, node: &mut RaftNode) {
-        let msgs = node.take_messages();
+    fn flush(&self, node: &mut RaftNode) -> Result<(), RaftError> {
+        let msgs = node.take_messages()?;
         if msgs.is_empty() {
-            return;
+            return Ok(());
         }
         let Ok(peers) = self.peers.lock() else {
-            return;
+            return Ok(());
         };
         for env in msgs {
             if let Some(p) = peers.get(&env.to) {
@@ -181,6 +181,7 @@ impl Shared {
                 }
             }
         }
+        Ok(())
     }
 
     fn is_known_peer(&self, id: &str) -> bool {
@@ -427,7 +428,7 @@ impl RaftServer {
             .collect();
         let index = node.change_membership(target.clone(), addrs)?;
         self.shared.sync_peers(&node);
-        self.shared.flush(&mut node);
+        self.shared.flush(&mut node)?;
         loop {
             if self.shared.stop.load(Ordering::SeqCst) {
                 return Err(RaftError::Shutdown);
@@ -469,29 +470,31 @@ impl RaftServer {
         Ok(n.last_index() - n.snapshot_index())
     }
 
-    /// Blocks until this node is leader and has applied its whole log, including the no-op that
-    /// commits earlier terms' entries. Returns the term, which callers use as a data write fence
+    /// Blocks until this node is leader and has applied its log as of the call, including the
+    /// no-op that commits earlier terms' entries. Returns the term, which callers use as a data write fence
     /// and pass to [`Self::propose_in_term`].
     pub fn leader_ready(&self, timeout: Duration) -> Result<u64, RaftError> {
         let deadline = Instant::now() + timeout;
         let mut node = self.shared.lock()?;
+        // The log as of this call: entries proposed meanwhile must not hold the caller back, or
+        // a steady stream of writes starves every reader.
+        let target = node.last_index();
+        let term = node.term();
         loop {
             if self.shared.stop.load(Ordering::SeqCst) {
                 return Err(RaftError::Shutdown);
             }
-            if !node.is_leader() {
+            if !node.is_leader() || node.term() != term {
                 return Err(RaftError::NotLeader {
                     leader: node.leader().map(str::to_string),
                 });
             }
-            if node.applied_index() == node.last_index() {
-                return Ok(node.term());
+            if node.applied_index() >= target {
+                return Ok(term);
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(RaftError::Timeout {
-                    index: node.last_index(),
-                });
+                return Err(RaftError::Timeout { index: target });
             }
             node = self
                 .shared
@@ -701,7 +704,7 @@ impl RaftServer {
             });
         }
         let index = node.propose(command)?;
-        self.shared.flush(&mut node);
+        self.shared.flush(&mut node)?;
         loop {
             if self.shared.stop.load(Ordering::SeqCst) {
                 return Err(RaftError::Shutdown);
@@ -801,7 +804,7 @@ fn drive(shared: &Shared, inbound: Receiver<Envelope>, tick: Duration) {
             shared.sync_peers(&node);
             config_seen = Some(key);
         }
-        shared.flush(&mut node);
+        let result = result.and_then(|_| shared.flush(&mut node));
         drop(node);
         if let Err(e) = result {
             shared.fail(e);

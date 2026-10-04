@@ -449,3 +449,41 @@ fn snapshot_mounts_are_read_only_and_clones_are_isolated() {
     assert_eq!(after[..70_000], [0x55; 70_000]);
     assert_eq!(after[70_000..], original[70_000..]);
 }
+
+#[test]
+fn concurrent_creates_do_not_starve_each_other() {
+    let c = Cluster::start();
+    create_fs(&c, "busy");
+    // No retries: a request held back past the proposal timeout fails the test.
+    let mut cfg = ClientConfig::new(c.endpoints());
+    cfg.token = Some(TOKEN.into());
+    cfg.retry_for = Duration::ZERO;
+    let ops = std::sync::Arc::new(Ops::new(
+        Client::new(cfg).unwrap(),
+        "busy",
+        OpsConfig::default(),
+    ));
+    let threads: Vec<_> = (0..16)
+        .map(|t| {
+            let ops = ops.clone();
+            std::thread::spawn(move || {
+                for i in 0..25 {
+                    ops.mknode(
+                        ROOT_INO,
+                        &format!("f{t}-{i}"),
+                        NodeType::File,
+                        None,
+                        0o644,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(ops.readdir(ROOT_INO).unwrap().len(), 16 * 25);
+}

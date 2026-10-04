@@ -3,13 +3,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use atlas_native::{MetaCommand, RaftConfig, RaftError, RaftNode, Role};
+use atlas_native::{Message, MetaCommand, RaftConfig, RaftError, RaftNode, Role};
 
 struct Cluster {
     _td: tempfile::TempDir,
     cfgs: BTreeMap<String, RaftConfig>,
     nodes: BTreeMap<String, Option<RaftNode>>,
     isolated: BTreeSet<String>,
+    /// InstallSnapshot messages sent, delivered or not.
+    snapshots_sent: usize,
 }
 
 impl Cluster {
@@ -30,6 +32,7 @@ impl Cluster {
             cfgs,
             nodes,
             isolated: BTreeSet::new(),
+            snapshots_sent: 0,
         }
     }
 
@@ -65,12 +68,15 @@ impl Cluster {
         for _ in 0..10_000 {
             let mut batch = Vec::new();
             for n in self.nodes.values_mut().flatten() {
-                batch.extend(n.take_messages());
+                batch.extend(n.take_messages().unwrap());
             }
             if batch.is_empty() {
                 return;
             }
             for env in batch {
+                if matches!(env.msg, Message::InstallSnapshot { .. }) {
+                    self.snapshots_sent += 1;
+                }
                 if self.isolated.contains(&env.from) || self.isolated.contains(&env.to) {
                     continue;
                 }
@@ -451,4 +457,27 @@ fn lagging_follower_catches_up_via_snapshot() {
     c.crash(&lagger);
     c.restart(&lagger);
     assert_eq!(c.volumes(&lagger).len(), names.len());
+}
+
+#[test]
+fn unanswered_snapshots_are_not_resent_on_every_append() {
+    let mut c = Cluster::new(3, 4);
+    let l = c.elect();
+    let lagger = c.live_ids().into_iter().find(|id| *id != l).unwrap();
+    c.isolated.insert(lagger.clone());
+    // 60 proposals over 60 ticks: each proposal and heartbeat would otherwise carry a catalog.
+    for i in 0..60 {
+        c.node_mut(&l).propose(create(&format!("v{i}"))).unwrap();
+        c.run(1);
+    }
+    assert!(c.node(&l).snapshot_index() > c.node(&lagger).last_index());
+    assert!(
+        c.snapshots_sent <= 4,
+        "one snapshot per election timeout, got {}",
+        c.snapshots_sent
+    );
+    c.isolated.clear();
+    let want: Vec<String> = (0..60).map(|i| format!("v{i}")).collect();
+    let want: Vec<&str> = want.iter().map(String::as_str).collect();
+    assert!(c.run_until(200, |c| c.converged(&want)));
 }

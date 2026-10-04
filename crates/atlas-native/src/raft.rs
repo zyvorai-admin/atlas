@@ -83,8 +83,9 @@ pub struct RaftConfig {
     pub election_ticks: (u64, u64),
     pub heartbeat_ticks: u64,
     pub max_batch: usize,
-    /// Compact the log once this many applied entries sit above the last compaction point
-    /// (0 disables compaction).
+    /// Compact the log once twice this many applied entries sit above the last compaction point,
+    /// keeping the newest `compact_after` so a follower that is a little behind catches up through
+    /// AppendEntries rather than a full snapshot (0 disables compaction).
     pub compact_after: u64,
 }
 
@@ -268,6 +269,11 @@ pub struct RaftNode {
     election_elapsed: u64,
     election_timeout: u64,
     heartbeat_elapsed: u64,
+    /// Ticks since start; times snapshot sends.
+    ticks: u64,
+    /// Peers sent an InstallSnapshot, with the tick it went out: one at a time per peer, re-sent
+    /// only after an election timeout without an answer.
+    snapshot_sent: BTreeMap<NodeId, u64>,
     rng: u64,
     outbox: Vec<Envelope>,
 }
@@ -357,6 +363,8 @@ impl RaftNode {
             election_elapsed: 0,
             election_timeout: 0,
             heartbeat_elapsed: 0,
+            ticks: 0,
+            snapshot_sent: BTreeMap::new(),
             rng: rng | 1,
             outbox: Vec::new(),
             cfg,
@@ -549,12 +557,22 @@ impl RaftNode {
             .unwrap_or(self.snapshot_term)
     }
 
-    pub fn take_messages(&mut self) -> Vec<Envelope> {
-        std::mem::take(&mut self.outbox)
+    /// The messages to send. A non-leader's log is made durable first: its outbox may hold
+    /// AppendEntries acknowledgements for entries that were only written.
+    pub fn take_messages(&mut self) -> Result<Vec<Envelope>, RaftError> {
+        if self.role != Role::Leader {
+            self.wal.sync()?;
+        }
+        Ok(std::mem::take(&mut self.outbox))
     }
 
     pub fn tick(&mut self) -> Result<(), RaftError> {
+        self.ticks += 1;
         if self.role == Role::Leader {
+            if self.wal.synced_index() < self.last_index() {
+                self.wal.sync()?;
+                self.advance_commit()?;
+            }
             self.check_quorum_elapsed += 1;
             if self.check_quorum_elapsed >= self.cfg.election_ticks.0 {
                 self.check_quorum_elapsed = 0;
@@ -734,6 +752,8 @@ impl RaftNode {
                     *m = (*m).max(match_index);
                     let next = *m + 1;
                     self.next_index.insert(from.clone(), next);
+                    // Covers every proposal appended since the last ack with one fsync.
+                    self.wal.sync()?;
                     self.advance_commit()?;
                     if next <= self.last_index() {
                         self.send_append(&from);
@@ -771,6 +791,7 @@ impl RaftNode {
                     return Ok(());
                 }
                 self.recent_active.insert(from.clone());
+                self.snapshot_sent.remove(&from);
                 let last = self.last_index();
                 let m = self.match_index.entry(from.clone()).or_insert(0);
                 *m = (*m).max(match_index.min(last));
@@ -830,7 +851,9 @@ impl RaftNode {
                 }
                 None => {}
             }
-            self.wal.append(&e)?;
+            // Synced by `take_messages` before the acknowledgement leaves this node, so a burst of
+            // AppendEntries stepped together shares one fsync.
+            self.wal.append_unsynced(&e)?;
             self.log.push(e);
         }
         self.refresh_membership();
@@ -923,6 +946,8 @@ impl RaftNode {
     }
 
     fn become_follower(&mut self, term: u64, leader: Option<NodeId>) -> Result<(), RaftError> {
+        // Only a leader has unsynced entries; a follower or candidate advertises a durable log.
+        self.wal.sync()?;
         if term > self.hard.term {
             self.hard.term = term;
             self.hard.voted_for = None;
@@ -959,7 +984,9 @@ impl RaftNode {
             index,
             command,
         };
-        self.wal.append(&e)?;
+        // The leader writes in parallel with replication and counts itself towards a quorum only
+        // up to `wal.synced_index()` (Raft thesis §10.2.1), so concurrent proposals share fsyncs.
+        self.wal.append_unsynced(&e)?;
         self.log.push(e);
         if config {
             self.refresh_membership();
@@ -982,6 +1009,15 @@ impl RaftNode {
             .min(self.last_index() + 1);
         let prev = next - 1;
         if prev < self.snapshot_index {
+            // A catalog clone per heartbeat or proposal would pile up in the peer's queue.
+            if self
+                .snapshot_sent
+                .get(peer)
+                .is_some_and(|t| self.ticks < t + self.cfg.election_ticks.1)
+            {
+                return;
+            }
+            self.snapshot_sent.insert(peer.clone(), self.ticks);
             let snapshot = Box::new(self.catalog.clone());
             self.send(
                 peer.clone(),
@@ -1012,6 +1048,13 @@ impl RaftNode {
         // Committing a config entry can append the next one, which may commit at once (e.g. a
         // single-voter group), hence the loop.
         while self.role == Role::Leader {
+            if self
+                .membership
+                .has_quorum(&BTreeSet::from([self.cfg.id.clone()]))
+            {
+                self.wal.sync()?;
+            }
+            let synced = self.wal.synced_index();
             let mut new_commit = self.commit_index;
             for n in (self.commit_index + 1..=self.last_index()).rev() {
                 if self.term_at(n) != Some(self.hard.term) {
@@ -1022,7 +1065,7 @@ impl RaftNode {
                     .iter()
                     .filter(|(_, m)| **m >= n)
                     .map(|(p, _)| p.clone())
-                    .chain([self.cfg.id.clone()])
+                    .chain((synced >= n).then(|| self.cfg.id.clone()))
                     .collect();
                 if self.membership.has_quorum(&acks) {
                     new_commit = n;
@@ -1063,18 +1106,21 @@ impl RaftNode {
 
     fn maybe_compact(&mut self) -> Result<(), RaftError> {
         let applied = self.catalog.applied_index;
-        if self.cfg.compact_after == 0 || applied - self.snapshot_index < self.cfg.compact_after {
+        let keep = self.cfg.compact_after;
+        if keep == 0 || applied - self.snapshot_index < 2 * keep {
             return Ok(());
         }
+        let through = applied - keep;
         let term = self
-            .term_at(applied)
-            .ok_or_else(|| RaftError::Inconsistent(format!("no term for {applied}")))?;
+            .term_at(through)
+            .ok_or_else(|| RaftError::Inconsistent(format!("no term for {through}")))?;
         // The catalog is only written here: until then the WAL holds every applied entry and a
         // restart re-applies them, so rewriting the whole catalog on every apply buys nothing.
+        // It covers everything through `applied`; a restart starts its log above that.
         self.persist_catalog()?;
-        self.wal.compact_through(applied)?;
-        self.log.drain(..(applied - self.snapshot_index) as usize);
-        self.snapshot_index = applied;
+        self.wal.compact_through(through)?;
+        self.log.drain(..(through - self.snapshot_index) as usize);
+        self.snapshot_index = through;
         self.snapshot_term = term;
         Ok(())
     }
