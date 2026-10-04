@@ -93,7 +93,7 @@ fn ops(args: &Args) -> Result<Ops, String> {
     );
     // Fail fast on a wrong endpoint, token or filesystem id instead of at first access.
     ops.getattr(atlas_native::ROOT_INO)
-        .map_err(|e| format!("filesystem {} is not reachable (errno {e})", args.fs))?;
+        .map_err(|e| format!("filesystem {} is not reachable (errno {e})", ops.fs()))?;
     Ok(ops)
 }
 
@@ -102,7 +102,7 @@ fn mount(args: &Args, ops: Ops) -> Result<(), String> {
     use fuser::{Config, MountOption, SessionACL};
     let mut cfg = Config::default();
     cfg.mount_options = vec![
-        MountOption::FSName(format!("atlas-native:{}", args.fs)),
+        MountOption::FSName(format!("atlas-native:{}", ops.fs())),
         MountOption::Subtype("atlas".into()),
         MountOption::DefaultPermissions,
     ];

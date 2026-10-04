@@ -114,6 +114,11 @@ impl Ops {
         }
     }
 
+    /// The mounted filesystem: `<fs>` or `<fs>@<snapshot>`.
+    pub fn fs(&self) -> &str {
+        &self.fs
+    }
+
     pub fn read_only(&self) -> bool {
         self.fs.contains('@')
     }

@@ -345,3 +345,107 @@ fn calls_ride_through_a_leader_failure() {
     ops.unlink(ROOT_INO, "a").unwrap();
     assert_eq!(ops.lookup(ROOT_INO, "a"), Err(libc::ENOENT));
 }
+
+#[test]
+fn snapshot_mounts_are_read_only_and_clones_are_isolated() {
+    let c = Cluster::start();
+    create_fs(&c, "src");
+    let ops = mount(&c, "src", OpsConfig::default());
+    let d = ops
+        .mknode(ROOT_INO, "d", NodeType::Dir, None, 0o755, 0, 0)
+        .unwrap();
+    let f = ops
+        .mknode(d.ino, "f", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    // Spans several 64 KiB extents so overwrites, truncates and clones share some of them.
+    let original: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    ops.write(f.ino, 0, &original).unwrap();
+    ops.flush(f.ino).unwrap();
+
+    let snap = c
+        .client()
+        .json(
+            Method::POST,
+            "/v1/fs/src/snapshots",
+            Body::Json(json!({ "id": "s1", "name": "before" })),
+            Retry::Idempotent,
+        )
+        .unwrap();
+    assert_eq!(snap["id"], "s1");
+
+    // Change the source after the snapshot: overwrite the middle, truncate, add and remove names.
+    ops.write(f.ino, 70_000, &[0xAA; 1000]).unwrap();
+    ops.flush(f.ino).unwrap();
+    ops.setattr(
+        f.ino,
+        SetAttr {
+            size: Some(150_000),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    ops.mknode(ROOT_INO, "new", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+
+    let ro = mount(&c, "src@s1", OpsConfig::default());
+    assert!(ro.read_only());
+    let rd = ro.lookup(ROOT_INO, "d").unwrap();
+    let rf = ro.lookup(rd.ino, "f").unwrap();
+    assert_eq!(rf.size, original.len() as u64);
+    assert_eq!(ro.read(rf.ino, 0, original.len()).unwrap(), original);
+    assert_eq!(ro.lookup(ROOT_INO, "new"), Err(libc::ENOENT));
+    assert_eq!(
+        ro.mknode(ROOT_INO, "x", NodeType::File, None, 0o644, 0, 0),
+        Err(libc::EROFS)
+    );
+    assert_eq!(ro.unlink(rd.ino, "f"), Err(libc::EROFS));
+    assert_eq!(ro.write(rf.ino, 0, b"no"), Err(libc::EROFS));
+
+    // A clone starts from the snapshot; writes to it touch neither the snapshot nor the source.
+    let cl = c
+        .client()
+        .json(
+            Method::POST,
+            "/v1/fs-snapshots/s1/clone",
+            Body::Json(json!({ "id": "cl", "name": "clone" })),
+            Retry::Idempotent,
+        )
+        .unwrap();
+    assert_eq!(cl["id"], "cl");
+    let clone = mount(&c, "cl", OpsConfig::default());
+    let cd = clone.lookup(ROOT_INO, "d").unwrap();
+    let cf = clone.lookup(cd.ino, "f").unwrap();
+    assert_eq!(clone.read(cf.ino, 0, original.len()).unwrap(), original);
+    clone.write(cf.ino, 0, &[0x55; 70_000]).unwrap();
+    clone.flush(cf.ino).unwrap();
+    clone
+        .mknode(ROOT_INO, "only-in-clone", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    assert_eq!(ro.lookup(ROOT_INO, "only-in-clone"), Err(libc::ENOENT));
+    assert_eq!(ops.lookup(ROOT_INO, "only-in-clone"), Err(libc::ENOENT));
+    assert_eq!(clone.read(cf.ino, 0, 4).unwrap(), [0x55; 4]);
+    assert_eq!(ro.read(rf.ino, 0, original.len()).unwrap(), original);
+    let now = ops.read(f.ino, 0, 200_000).unwrap();
+    assert_eq!(now.len(), 150_000);
+    assert_eq!(now[..70_000], original[..70_000]);
+    assert_eq!(now[70_000..71_000], [0xAA; 1000]);
+
+    // Deleting the source keeps the snapshot readable; deleting the snapshot keeps the clone.
+    c.client()
+        .request(Method::DELETE, "/v1/fs/src", Body::Empty, Retry::Remove)
+        .unwrap();
+    let ro = mount(&c, "src@s1", OpsConfig::default());
+    assert_eq!(ro.read(rf.ino, 0, original.len()).unwrap(), original);
+    c.client()
+        .request(
+            Method::DELETE,
+            "/v1/fs-snapshots/s1",
+            Body::Empty,
+            Retry::Remove,
+        )
+        .unwrap();
+    assert_eq!(ro.getattr(rf.ino), Err(libc::ENOENT));
+    let after = clone.read(cf.ino, 0, original.len()).unwrap();
+    assert_eq!(after[..70_000], [0x55; 70_000]);
+    assert_eq!(after[70_000..], original[70_000..]);
+}
