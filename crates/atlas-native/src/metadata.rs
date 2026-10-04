@@ -157,6 +157,12 @@ pub enum MetaError {
     NotDir(String),
     #[error("is a directory: {0}")]
     IsDir(String),
+    #[error("no such extended attribute: {0}")]
+    NoAttr(String),
+    #[error("too large: {0}")]
+    TooBig(String),
+    #[error("not supported: {0}")]
+    Unsupported(String),
 }
 
 impl Catalog {

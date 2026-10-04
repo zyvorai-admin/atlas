@@ -69,6 +69,9 @@ impl Error {
                 "is_dir" => libc::EISDIR,
                 "read_only" => libc::EROFS,
                 "invalid" => libc::EINVAL,
+                "no_attr" => libc::ENODATA,
+                "too_big" => libc::E2BIG,
+                "unsupported" => libc::EOPNOTSUPP,
                 _ if *status == 413 => libc::EFBIG,
                 _ => libc::EIO,
             },
@@ -116,7 +119,9 @@ impl Client {
         }
         let mut b = blocking::Client::builder()
             .timeout(cfg.request_timeout)
-            .connect_timeout(Duration::from_secs(5));
+            .connect_timeout(Duration::from_secs(5))
+            // Below the node's 30 s idle close, so a pooled connection is never reused as it closes.
+            .pool_idle_timeout(Duration::from_secs(20));
         if let Some(pem) = &cfg.ca_pem {
             for c in reqwest::Certificate::from_pem_bundle(pem)
                 .map_err(|e| Error::Config(format!("CA bundle: {e}")))?

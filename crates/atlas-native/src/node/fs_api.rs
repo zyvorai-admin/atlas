@@ -11,7 +11,7 @@ use super::{body_json, client_id, query_u64, read_range, NodeShared};
 use crate::{
     engine::{NativeEngine, NativeError, NewNode},
     http::{Request, Response},
-    namespace::SetAttr,
+    namespace::{SetAttr, XattrMode},
 };
 
 type Routed = Result<Response, NativeError>;
@@ -31,9 +31,15 @@ pub(super) fn route(sh: &NodeShared, e: &NativeEngine, req: &Request, segs: &[&s
             let body = parse(req)?;
             let name = str_field(&body, "name")?;
             let id = client_id(&body).map_err(bad)?;
+            let extent_bytes = match body.get("extent_bytes") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => Some(v.as_u64().ok_or_else(|| {
+                    NativeError::Invalid("extent_bytes must be an integer".into())
+                })?),
+            };
             Ok(Response::json(
                 201,
-                &json!({ "id": e.create_fs_as(id, name)? }),
+                &json!({ "id": e.create_fs_with(id, name, extent_bytes)? }),
             ))
         }
         ("DELETE", ["v1", "fs", fs]) => {
@@ -138,6 +144,28 @@ fn inode_route(
                 u64_field(&body, "parent")?,
                 str_field(&body, "name")?,
             )?)
+        }
+        ("GET", ["xattrs"]) => Ok(Response::json(
+            200,
+            &json!({ "names": e.fs_listxattr(fs, ino)? }),
+        )),
+        ("GET", ["xattrs", name]) => Ok(Response::bytes(
+            200,
+            e.fs_getxattr(fs, ino, &pct_decode(name)?)?,
+        )),
+        ("PUT", ["xattrs", name]) => {
+            let mode = match req.query.get("mode").map(String::as_str) {
+                None | Some("set") => XattrMode::Set,
+                Some("create") => XattrMode::Create,
+                Some("replace") => XattrMode::Replace,
+                Some(m) => return Err(NativeError::Invalid(format!("unknown xattr mode {m:?}"))),
+            };
+            e.fs_setxattr(fs, ino, &pct_decode(name)?, &req.body, mode)?;
+            Ok(Response::text(204, ""))
+        }
+        ("DELETE", ["xattrs", name]) => {
+            e.fs_removexattr(fs, ino, &pct_decode(name)?)?;
+            Ok(Response::text(204, ""))
         }
         ("GET", ["target"]) => Ok(Response::json(
             200,

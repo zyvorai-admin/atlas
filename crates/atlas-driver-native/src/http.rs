@@ -81,7 +81,10 @@ impl HttpApi {
                 "atlas-native: at least one endpoint is required".into(),
             ));
         }
-        let mut builder = reqwest::Client::builder().timeout(cfg.timeout);
+        // Below the node's 30 s idle close, so a pooled connection is never reused as it closes.
+        let mut builder = reqwest::Client::builder()
+            .timeout(cfg.timeout)
+            .pool_idle_timeout(std::time::Duration::from_secs(20));
         if let Some(pem) = &cfg.ca_pem {
             let certs = reqwest::Certificate::from_pem_bundle(pem)
                 .map_err(|e| DriverError::Backend(format!("atlas-native CA bundle: {e}")))?;

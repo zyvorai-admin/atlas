@@ -17,6 +17,9 @@ pub type FsId = String;
 pub const ROOT_INO: u64 = 1;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_SYMLINK_BYTES: usize = 4096;
+pub const MAX_XATTR_VALUE_BYTES: usize = 64 << 10;
+/// Names plus values of every extended attribute on one inode.
+pub const MAX_XATTR_TOTAL_BYTES: usize = 256 << 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FsMeta {
@@ -27,6 +30,9 @@ pub struct FsMeta {
     /// The snapshot this filesystem was cloned from, if any.
     #[serde(default)]
     pub source_snapshot: Option<SnapshotId>,
+    /// File extent grid; `None` (filesystems created before it was recorded) uses the cluster's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,6 +60,22 @@ pub struct Inode {
     /// Client-chosen id of the create that made this inode, so a retried create is a no-op.
     #[serde(default)]
     pub op_id: String,
+    /// Extended attributes (`user.*`, `trusted.*`, `security.*`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub xattrs: BTreeMap<String, Vec<u8>>,
+}
+
+/// How `setxattr(2)` treats an existing attribute.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XattrMode {
+    /// Create or replace.
+    #[default]
+    Set,
+    /// Fail with `exists` if the attribute is already set (`XATTR_CREATE`).
+    Create,
+    /// Fail with `no_attr` if the attribute is not set (`XATTR_REPLACE`).
+    Replace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +136,9 @@ pub enum FsOp {
         fs: FsId,
         name: String,
         now_ns: i64,
+        /// File extent grid in bytes; `None` uses the cluster's.
+        #[serde(default)]
+        extent_bytes: Option<u64>,
     },
     DeleteFs {
         fs: FsId,
@@ -169,6 +194,21 @@ pub enum FsOp {
         attr: SetAttr,
         now_ns: i64,
     },
+    SetXattr {
+        fs: FsId,
+        ino: u64,
+        name: String,
+        value: Vec<u8>,
+        #[serde(default)]
+        mode: XattrMode,
+        now_ns: i64,
+    },
+    RemoveXattr {
+        fs: FsId,
+        ino: u64,
+        name: String,
+        now_ns: i64,
+    },
     /// Installs an already-replicated extent at `logical_offset` of a file and grows the file to
     /// at least `size`.
     InstallFileExtent {
@@ -215,6 +255,7 @@ impl Inode {
             mtime_ns: now_ns,
             ctime_ns: now_ns,
             op_id: String::new(),
+            xattrs: BTreeMap::new(),
         }
     }
 
@@ -317,6 +358,22 @@ pub fn file_extents(inodes: &BTreeMap<u64, Inode>) -> impl Iterator<Item = &Exte
         .flatten()
 }
 
+/// An extended attribute name in a namespace we store. `system.*` (POSIX ACLs and the like)
+/// is refused: the kernel would not enforce what we stored.
+pub fn check_xattr_name(name: &str) -> Result<(), MetaError> {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.contains('\0') {
+        return Err(MetaError::Invalid(format!(
+            "invalid extended attribute name {name:?}"
+        )));
+    }
+    match name.split_once('.') {
+        Some(("user" | "trusted" | "security", rest)) if !rest.is_empty() => Ok(()),
+        _ => Err(MetaError::Unsupported(format!(
+            "extended attribute namespace of {name:?}"
+        ))),
+    }
+}
+
 fn check_name(name: &str) -> Result<(), MetaError> {
     if name.is_empty()
         || name.len() > MAX_NAME_BYTES
@@ -375,7 +432,15 @@ impl Catalog {
 
     pub(crate) fn apply_fs(&mut self, op: &FsOp, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
         match op {
-            FsOp::CreateFs { fs, name, now_ns } => {
+            FsOp::CreateFs {
+                fs,
+                name,
+                now_ns,
+                extent_bytes,
+            } => {
+                if *extent_bytes == Some(0) {
+                    return Err(MetaError::Invalid("extent_bytes must be positive".into()));
+                }
                 if let Some(f) = self.filesystems.get(fs) {
                     if f.name == *name {
                         return Ok(());
@@ -401,6 +466,7 @@ impl Catalog {
                         next_ino: ROOT_INO + 1,
                         inodes: BTreeMap::from([(ROOT_INO, root)]),
                         source_snapshot: None,
+                        extent_bytes: *extent_bytes,
                     },
                 );
             }
@@ -634,6 +700,57 @@ impl Catalog {
                     self.dec_ref(eid, gc)?;
                 }
             }
+            FsOp::SetXattr {
+                fs,
+                ino,
+                name,
+                value,
+                mode,
+                now_ns,
+            } => {
+                check_xattr_name(name)?;
+                if value.len() > MAX_XATTR_VALUE_BYTES {
+                    return Err(MetaError::TooBig(format!(
+                        "extended attribute values are at most {MAX_XATTR_VALUE_BYTES} bytes"
+                    )));
+                }
+                let i = self.fs_mut(fs)?.inode_mut(*ino)?;
+                let old = i.xattrs.get(name);
+                match (mode, old) {
+                    (XattrMode::Create, Some(_)) => {
+                        return Err(MetaError::Exists(format!("extended attribute {name:?}")))
+                    }
+                    (XattrMode::Replace, None) => return Err(MetaError::NoAttr(name.clone())),
+                    _ => {}
+                }
+                let total: usize = i
+                    .xattrs
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len())
+                    .sum::<usize>()
+                    - old.map_or(0, |v| name.len() + v.len())
+                    + name.len()
+                    + value.len();
+                if total > MAX_XATTR_TOTAL_BYTES {
+                    return Err(MetaError::TooBig(format!(
+                        "extended attributes of inode {ino} would exceed {MAX_XATTR_TOTAL_BYTES} bytes"
+                    )));
+                }
+                i.xattrs.insert(name.clone(), value.clone());
+                i.ctime_ns = *now_ns;
+            }
+            FsOp::RemoveXattr {
+                fs,
+                ino,
+                name,
+                now_ns,
+            } => {
+                let i = self.fs_mut(fs)?.inode_mut(*ino)?;
+                if i.xattrs.remove(name).is_none() {
+                    return Err(MetaError::NoAttr(name.clone()));
+                }
+                i.ctime_ns = *now_ns;
+            }
             FsOp::InstallFileExtent {
                 fs,
                 ino,
@@ -736,6 +853,7 @@ mod tests {
                 fs: "f".into(),
                 name: "fs".into(),
                 now_ns: 1,
+                extent_bytes: None,
             });
             t
         }
@@ -815,6 +933,60 @@ mod tests {
             new_name: new_name.into(),
             now_ns: 4,
         }
+    }
+
+    #[test]
+    fn xattrs_respect_the_per_inode_total_and_stamp_ctime() {
+        let mut t = T::new();
+        let f = t.mk(ROOT_INO, "f", NodeType::File);
+        let set = |name: &str, len: usize, now_ns| FsOp::SetXattr {
+            fs: "f".into(),
+            ino: f,
+            name: name.into(),
+            value: vec![1; len],
+            mode: XattrMode::Set,
+            now_ns,
+        };
+        for i in 0..3 {
+            t.ok(set(&format!("user.{i}"), MAX_XATTR_VALUE_BYTES, 10 + i));
+        }
+        assert_eq!(t.fs().inode(f).unwrap().ctime_ns, 12);
+        let err = t.run(set("user.3", MAX_XATTR_VALUE_BYTES, 20)).unwrap_err();
+        assert!(matches!(err, MetaError::TooBig(_)));
+        // Replacing an attribute only counts its new size.
+        t.ok(set("user.0", MAX_XATTR_VALUE_BYTES, 21));
+        let err = t.run(set("bad", 1, 22)).unwrap_err();
+        assert!(matches!(err, MetaError::Unsupported(_)));
+        t.ok(FsOp::RemoveXattr {
+            fs: "f".into(),
+            ino: f,
+            name: "user.1".into(),
+            now_ns: 23,
+        });
+        t.ok(set("user.3", MAX_XATTR_VALUE_BYTES, 24));
+        assert_eq!(t.fs().inode(f).unwrap().xattrs.len(), 3);
+    }
+
+    #[test]
+    fn create_fs_records_its_grid_and_refuses_zero() {
+        let mut t = T::new();
+        assert_eq!(t.fs().extent_bytes, None, "created without a grid");
+        let err = t
+            .run(FsOp::CreateFs {
+                fs: "g".into(),
+                name: "g".into(),
+                now_ns: 1,
+                extent_bytes: Some(0),
+            })
+            .unwrap_err();
+        assert!(matches!(err, MetaError::Invalid(_)));
+        t.ok(FsOp::CreateFs {
+            fs: "g".into(),
+            name: "g".into(),
+            now_ns: 1,
+            extent_bytes: Some(65536),
+        });
+        assert_eq!(t.c.filesystem("g").unwrap().extent_bytes, Some(65536));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 An atlas-native cluster (`docs/NATIVE_NODE.md`) serves POSIX filesystems next to its block volumes.
 Files and directories live in the same replicated catalog as volumes, and file data uses the same
-copy-on-write extents (3 replicas, `extent_bytes` grid). Clients mount a filesystem through FUSE
+copy-on-write extents (3 replicas) on a per-filesystem grid. Clients mount a filesystem through FUSE
 with `atlas-native-mount`; the Atlas gateway creates, snapshots and clones filesystems as
 `filesystem` volumes on backend `bkd_native`.
 
@@ -23,8 +23,9 @@ with `atlas-native-mount`; the Atlas gateway creates, snapshots and clones files
 - Hard links, `rename` (including over an existing entry, across directories, and refusing to move a
   directory into itself), `setattr` (mode, owner, size, times) and `truncate` follow POSIX. Shrinking
   a file drops the extents past the new end and trims the extent that straddles it.
-- File data is written through the extent path the volumes use: a write covering part of an extent
-  rewrites that extent with the old bytes merged in; never-written ranges are holes and read as
+- File data is written through the extent path the volumes use, on the filesystem's own grid
+  (`extent_bytes`, chosen at create time): a write covering part of an extent rewrites that extent
+  with the old bytes merged in; never-written ranges are holes and read as
   zeros; reads stop at end of file.
 - **Snapshots** copy a filesystem's inode table under a snapshot id and take a reference on every
   extent it points to; no data is copied. A snapshot is read-only and addressed as `<fs>@<snapshot>`.
@@ -38,8 +39,8 @@ All routes need the API token (and client certificate where configured), like th
 
 | Method and path | Description |
 | --- | --- |
-| `GET /v1/fs` | `{"filesystems": [{id, name, inodes, bytes, source_snapshot}]}`. |
-| `POST /v1/fs` | `{"name", "id"?}` → 201 `{"id"}`. Idempotent with the same `id` and name. |
+| `GET /v1/fs` | `{"filesystems": [{id, name, inodes, bytes, source_snapshot, extent_bytes}]}`. |
+| `POST /v1/fs` | `{"name", "id"?, "extent_bytes"?}` → 201 `{"id"}`. Idempotent with the same `id` and name. `extent_bytes` (default 1 MiB, at most the cluster's `extent_bytes`) is the file extent grid; snapshots and clones keep it. |
 | `DELETE /v1/fs/{fs}` | 204. Snapshots and clones of it are unaffected. |
 | `GET /v1/fs/{fs}/statfs` | `{inodes, used_bytes, free_list_bytes}`. |
 | `POST /v1/fs/{fs}/rename` | `{parent, name, new_parent, new_name}` → 204. |
@@ -55,6 +56,10 @@ All routes need the API token (and client certificate where configured), like th
 | `POST /v1/fs/{fs}/inodes/{dir}/unlink`, `/rmdir` | `{name}` → 204. |
 | `POST /v1/fs/{fs}/inodes/{ino}/links` | `{parent, name}`: a hard link → attributes. |
 | `GET /v1/fs/{fs}/inodes/{ino}/target` | `{"target"}` of a symlink. |
+| `GET /v1/fs/{fs}/inodes/{ino}/xattrs` | `{"names": [...]}` of the extended attributes. |
+| `GET /v1/fs/{fs}/inodes/{ino}/xattrs/{name}` | Raw value (`name` percent-encoded); 404 `no_attr` if unset. |
+| `PUT /v1/fs/{fs}/inodes/{ino}/xattrs/{name}?mode=` | Raw body as the value → 204. `mode`: `set` (default), `create` (409 `exists` if set), `replace` (404 `no_attr` if unset). |
+| `DELETE /v1/fs/{fs}/inodes/{ino}/xattrs/{name}` | 204; 404 `no_attr` if unset. |
 | `GET /v1/fs/{fs}/inodes/{ino}/data?offset=N&len=M` | Raw bytes; short at end of file. |
 | `PUT /v1/fs/{fs}/inodes/{ino}/data?offset=N` | Raw body written at `offset` (extends the file) → attributes. |
 
@@ -62,8 +67,9 @@ All routes need the API token (and client certificate where configured), like th
 
 Errors are `{"error", "code", "leader"}`. `code` is stable and maps to an errno in the client:
 `not_found` (404, ENOENT), `exists` (EEXIST), `not_empty` (ENOTEMPTY), `not_dir` (ENOTDIR),
-`is_dir` (EISDIR), `invalid` (EINVAL), `read_only` (EROFS), `busy` (EBUSY) — all 409 except where
-noted — plus `not_leader` (421), `unavailable` (503) and `internal` (500).
+`is_dir` (EISDIR), `invalid` (EINVAL), `read_only` (EROFS), `busy` (EBUSY), `no_attr` (404,
+ENODATA), `too_big` (E2BIG), `unsupported` (EOPNOTSUPP) — all 409 except where noted — plus
+`not_leader` (421), `unavailable` (503) and `internal` (500).
 
 Reads are served by the leader once it has applied its log as of the request, so a client always
 sees its own writes; `?stale=1` on a `GET` reads whatever the receiving replica has applied.
@@ -108,7 +114,13 @@ default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default
   concurrent writers to the same file range see last-writer-wins at the extent level.
 - Unlink-while-open only protects handles in the same mount; a file removed by another client
   disappears for everyone.
-- Not implemented: POSIX ACLs, extended attributes, quotas, `flock`/`fcntl` locks, `O_DIRECT`.
+- **Extended attributes** in the `user.`, `trusted.` and `security.` namespaces are stored on the
+  inode (replicated, copied by snapshots and clones): at most 64 KiB per value and 256 KiB per
+  inode. `system.*` (POSIX ACLs) is refused with EOPNOTSUPP rather than stored unenforced.
+- **Locks**: `flock` and `fcntl` locks are enforced by the kernel within one mount (the client
+  does not take them over), so processes sharing a mount exclude each other; locks are not seen
+  by other mounts.
+- Not implemented: POSIX ACLs, cross-mount locks, quotas, `O_DIRECT`.
 
 ## Atlas gateway
 
@@ -170,9 +182,14 @@ Known limits:
 - One Raft group and one leader serve all metadata; there is no namespace sharding.
 - The catalog lives in memory (twice on the leader) and is written whole to disk at each log
   compaction.
-- A write that covers part of an extent reads, merges and rewrites the whole extent
-  (`extent_bytes`, 4 MiB by default), so small random writes are expensive.
-- The client opens a new connection per request; there is no pipelining or request batching.
+- A write that covers part of an extent reads, merges and rewrites the whole extent: up to the
+  filesystem's `extent_bytes` (1 MiB by default). With the cluster on its default 4 MiB grid,
+  random 4 KiB writes measured 24/s at a 4 MiB file grid, 28/s at 1 MiB, 35/s at 256 KiB and
+  42/s at 64 KiB (p50 40 → 22 ms); the remaining ~20 ms is the replicated commit. A smaller grid
+  means more extents in the in-memory catalog, so use 64–256 KiB only for random-write-heavy
+  filesystems.
+- The client reuses connections (one per concurrent request) but does not pipeline or batch
+  requests, so each metadata operation is one round trip to the leader.
 - Unlink-while-open works only within one mount (see Consistency).
 
 ## Verification

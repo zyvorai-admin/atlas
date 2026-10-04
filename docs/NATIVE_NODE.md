@@ -103,8 +103,11 @@ to a follower returns **421** with the leader's node id in `leader` (null while 
 invalid token, 404 unknown volume/snapshot/route (or no metadata role), 409 rejected by the state
 machine, 413 body too large, 503 retryable (not enough data nodes, leadership changed, timeout).
 
-The HTTP server is deliberately small: one request per connection, `Content-Length` bodies only
-(chunked requests get 411), 16 KiB of headers, 30 s socket timeouts, optional TLS (`http_tls`).
+The HTTP server is deliberately small: HTTP/1.1 persistent connections (closed on
+`Connection: close`, HTTP/1.0, a malformed request or 30 s idle — keep client pools below that),
+`Content-Length` bodies only (chunked requests get 411), 16 KiB of headers, 30 s socket timeouts,
+optional TLS (`http_tls`). A small request on a reused connection costs about 60 µs locally; a new
+connection per request costs about 7 ms.
 
 ## Operations
 
