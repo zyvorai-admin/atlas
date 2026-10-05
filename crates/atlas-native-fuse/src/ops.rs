@@ -86,6 +86,8 @@ pub struct DirectReads {
     /// Client identity for data nodes that require mutual TLS; plaintext otherwise.
     pub identity: Option<Arc<TlsIdentity>>,
     pub timeout: Duration,
+    /// Try full copies on this data-node host first (the host this client runs on).
+    pub prefer_host: Option<String>,
 }
 
 /// Extents a direct read fetches concurrently.
@@ -881,7 +883,11 @@ impl Ops {
             return Ok(out);
         }
         let mut last = format!("extent at {} has no reachable replica", ext.logical_offset);
-        for r in &ext.replicas {
+        let mut order: Vec<_> = ext.replicas.iter().collect();
+        if let Some(h) = &d.prefer_host {
+            order.sort_by_key(|r| r.host.as_ref() != Some(h));
+        }
+        for r in order {
             let Some(endpoint) = &r.endpoint else {
                 continue;
             };

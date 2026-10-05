@@ -36,6 +36,7 @@ mod export;
 mod files;
 mod inflight;
 mod leases;
+mod locality;
 mod rebuild;
 mod tier;
 pub use export::{check_export_name, ExportExtent, ExportInfo, ExportManifest, ExportStats};
@@ -44,6 +45,7 @@ pub use files::{
     LayoutReplica, NewNode,
 };
 pub use leases::{now_ms, LockRequest, LockTable};
+pub use locality::{HostLocality, Locality, NodeLocality, PinReport};
 pub use rebuild::Degraded;
 pub use tier::{TierPolicy, TierStats};
 

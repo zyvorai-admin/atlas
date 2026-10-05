@@ -79,6 +79,9 @@ pub struct LayoutReplica {
     #[serde(default)]
     pub device_index: usize,
     pub offset: u64,
+    /// The data node's host (failure domain), so a client can prefer replicas on its own host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -190,7 +193,7 @@ impl NativeEngine {
         self.commit(MetaCommand::Fs { op }, None)
     }
 
-    fn with_fs<R>(
+    pub(super) fn with_fs<R>(
         &self,
         fs: &str,
         f: impl FnOnce(&Catalog, &FsMeta) -> Result<R, NativeError>,
@@ -564,6 +567,10 @@ impl NativeEngine {
                             .and_then(|d| d.endpoint().map(str::to_string)),
                         device_index: r.device_index,
                         offset: r.offset,
+                        host: self
+                            .node(&r.node_id)
+                            .ok()
+                            .map(|n| n.spec.failure_domain.host.clone()),
                     })
                     .collect();
                 LayoutExtent {

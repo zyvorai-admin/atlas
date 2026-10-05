@@ -43,6 +43,8 @@ All routes need the API token (and client certificate where configured), like th
 | `POST /v1/fs` | `{"name", "id"?, "extent_bytes"?}` → 201 `{"id"}`. Idempotent with the same `id` and name. `extent_bytes` (default 1 MiB, at most the cluster's `extent_bytes`) is the file extent grid; snapshots and clones keep it. |
 | `DELETE /v1/fs/{fs}` | 204. Snapshots and clones of it are unaffected. |
 | `GET /v1/fs/{fs}/statfs` | `{inodes, used_bytes, free_list_bytes}`. |
+| `GET /v1/fs/{fs}/locality?path=&max_inodes=` | Where a file or directory tree's data lives (see "Dataset locality"). `path` defaults to `/`, `max_inodes` to 100000. |
+| `POST /v1/fs/{fs}/locality/pin` | `{"hosts": [...], "path"?, "after"?, "max_extents"?, "max_inodes"?}` → `{examined, local, moved, bytes_moved, tiered, erasure_coded, deferred, next, truncated}`. Leader only. |
 | `POST /v1/fs/{fs}/rename` | `{parent, name, new_parent, new_name}` → 204. |
 | `POST /v1/fs/{fs}/snapshots` | `{"name", "id"?}` → 201 `{"id"}`. |
 | `GET /v1/fs-snapshots` | `{"snapshots": [{id, fs_id, name, created_ns, inodes}]}`. |
@@ -109,7 +111,7 @@ the background, default 4; 0 sends them in the write call), `--readahead-bytes` 
 `--max-io-bytes` (largest request, default 8 MiB; keep at or below the nodes' `max_request_bytes`),
 `--retry-secs` (default 30), `--read-only`, `--allow-other`, `--fuse-threads` (kernel request
 workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the mount's
-session, default 15000), `--cache-leases` (see Consistency) and `--direct-reads` (below). It runs in the
+session, default 15000), `--cache-leases` (see Consistency), `--direct-reads` and `--prefer-host` (below). It runs in the
 foreground until `fusermount3 -u`; the mount uses `default_permissions`, so the kernel checks
 modes and ownership.
 
@@ -146,6 +148,39 @@ modes and ownership.
   An erasure-coded extent's layout lists its shards in shard order with each shard's checksum; the
   client reads and verifies the k data shards and joins them, and leaves decoding around a missing
   shard to the leader.
+  Each replica in the layout carries its data node's `host`; `--prefer-host <host>` tries full
+  copies on that host first (use the host the mount runs on, after pinning the dataset there).
+
+## Dataset locality
+
+A training job reads its dataset fastest from data nodes on its own host. Two calls let a
+scheduler find and make that placement:
+
+- `GET /v1/fs/{fs}/locality?path=/datasets/imagenet` walks the file or directory tree (hard
+  links visited once, symlinks not followed) and returns `files`, `dirs`, `extents` (distinct: an
+  extent shared by hard links, clones or snapshots counts once), `bytes`, `tiered_bytes` and
+  `erasure_coded_bytes`, then `nodes` (every data node with its `host`, `rack`, `zone`, `up`,
+  `bytes` of full copies and `shard_bytes` of erasure-coded shards) and `hosts` (every host with
+  the `bytes` it holds a full copy of and `local_fraction`, that over all replicated bytes), most
+  bytes first. A scheduler places the job on the host with the highest `local_fraction`.
+  `truncated: true` means the walk stopped at `max_inodes` and the figures cover only part of the
+  tree. The walk holds the group's catalog read lock while it runs, delaying commits to that
+  group, so keep `max_inodes` proportionate.
+- `POST /v1/fs/{fs}/locality/pin {"path": "/datasets/imagenet", "hosts": ["gpu-node-3"]}` gives
+  every replicated extent of the tree a full copy on one of `hosts`: an extent without one gets a
+  copy written to an eligible node on those hosts (most free space first), and one of its
+  replicas is released, preferring one on the new node's rack, so the replica count and host
+  spread stay the same. It examines `max_extents` (default 256) extents per call, in id order
+  after `after`; call it again with the returned `next` until `next` is null. Calls are
+  idempotent: extents already local count as `local`. Tiered and erasure-coded extents are
+  skipped and counted (a shard on a host is not a local copy). `deferred` counts extents left
+  for another call: no readable copy, no eligible node on the hosts, or a concurrent change.
+
+Pinning moves existing data only. New writes are placed as usual, and repair may move a pinned
+copy off a host that fails, so pin again after the dataset changes or a host is replaced.
+Mount on the pinned host with `--direct-reads --prefer-host <host>` to read the local copies; the
+CSI driver doesn't pass `--prefer-host` yet, since it needs the data nodes' `host` to match the
+Kubernetes node names, which the chart doesn't configure.
 
 ## Data path
 

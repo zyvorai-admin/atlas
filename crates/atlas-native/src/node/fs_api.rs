@@ -24,6 +24,11 @@ use crate::{
 
 type Routed = Result<Response, NativeError>;
 
+/// Inodes a locality query or pin walks unless the request says otherwise.
+const DEFAULT_MAX_INODES: usize = 100_000;
+/// Extents one pin request examines unless it says otherwise.
+const DEFAULT_PIN_EXTENTS: usize = 256;
+
 /// How current a request needs this replica's catalog of one group to be.
 fn gate(req: &Request, e: &NativeEngine) -> Result<(), NativeError> {
     // A follower's catalog can lag the leader, so a client could miss its own writes there.
@@ -148,6 +153,42 @@ fn fs_route(
             Ok(Response::text(204, ""))
         }
         ("GET", ["v1", "fs", fs, "statfs"]) => Ok(Response::json(200, &json!(e.fs_statfs(fs)?))),
+        ("GET", ["v1", "fs", fs, "locality"]) => {
+            let path = match req.query.get("path") {
+                Some(p) => pct_decode(p)?,
+                None => "/".into(),
+            };
+            let max_inodes = match req.query.get("max_inodes") {
+                Some(m) => m.parse().map_err(|_| {
+                    NativeError::Invalid("query parameter max_inodes must be an integer".into())
+                })?,
+                None => DEFAULT_MAX_INODES,
+            };
+            Ok(Response::json(
+                200,
+                &json!(e.fs_locality(fs, &path, max_inodes)?),
+            ))
+        }
+        ("POST", ["v1", "fs", fs, "locality", "pin"]) => {
+            let body = parse(req)?;
+            let hosts: Vec<String> = serde_json::from_value(body["hosts"].clone())
+                .map_err(|err| NativeError::Invalid(format!("body field \"hosts\": {err}")))?;
+            let opt_u64 = |key: &str, default: usize| match &body[key] {
+                serde_json::Value::Null => Ok(default),
+                v => v.as_u64().map(|n| n as usize).ok_or_else(|| {
+                    NativeError::Invalid(format!("body field {key:?} must be an integer"))
+                }),
+            };
+            let report = e.fs_pin(
+                fs,
+                body["path"].as_str().unwrap_or("/"),
+                &hosts,
+                body["after"].as_str(),
+                opt_u64("max_extents", DEFAULT_PIN_EXTENTS)?,
+                opt_u64("max_inodes", DEFAULT_MAX_INODES)?,
+            )?;
+            Ok(Response::json(200, &json!(report)))
+        }
         ("POST", ["v1", "fs", fs, "sessions"]) => {
             let body = parse(req)?;
             let id = str_field(&body, "session")?;
