@@ -314,6 +314,7 @@ mod tests {
                         target: None,
                         rdev: 0,
                         mode: 0o644,
+                        create_mode: None,
                         uid: 0,
                         gid: 0,
                         now_ns: 2,

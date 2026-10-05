@@ -82,7 +82,7 @@ impl NodeService {
 /// Mount flags a volume may carry (StorageClass `mountOptions`), as `atlas-native-mount`
 /// arguments. Anything else is refused, so a mount option can't redirect the connection.
 pub fn mount_flag_args(flags: &[String]) -> Result<Vec<String>, Status> {
-    const SWITCHES: &[&str] = &["direct-reads", "cache-leases"];
+    const SWITCHES: &[&str] = &["direct-reads", "cache-leases", "acl"];
     const VALUED: &[&str] = &[
         "ttl-ms",
         "writeback-bytes",
@@ -455,6 +455,7 @@ mod tests {
         assert!(f(&["writeback-parallel=-1"]).is_err());
         assert!(f(&["writeback-parallel="]).is_err());
         assert!(f(&["noatime"]).is_err());
+        assert_eq!(f(&["acl"]).unwrap(), vec!["--acl"]);
     }
 
     #[test]

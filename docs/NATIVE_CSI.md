@@ -58,7 +58,7 @@ spec:
 | `parameters.extentBytes` (`csi.storageClass.extentBytes`) | Extent grid of new filesystems in bytes (default: the cluster's `extent_bytes`) |
 | `parameters.enforceCapacity` (`csi.storageClass.enforceCapacity`) | `"true"` (default): the PVC's size is the filesystem's byte quota. `"false"`: the filesystem is thin and the size is only reported |
 | `allowVolumeExpansion` | `true` in the chart's StorageClass |
-| `mountOptions` (`csi.storageClass.mountOptions`) | `atlas-native-mount` flags: `ro`, `cache-leases`, `direct-reads`, and `<flag>=<n>` for `ttl-ms`, `writeback-bytes`, `writeback-parallel`, `readahead-bytes`, `max-io-bytes`, `fuse-threads`, `session-ttl-ms`, `retry-secs` |
+| `mountOptions` (`csi.storageClass.mountOptions`) | `atlas-native-mount` flags: `ro`, `acl` (enforce POSIX ACLs), `cache-leases`, `direct-reads`, and `<flag>=<n>` for `ttl-ms`, `writeback-bytes`, `writeback-parallel`, `readahead-bytes`, `max-io-bytes`, `fuse-threads`, `session-ttl-ms`, `retry-secs` |
 
 Any other parameter or mount option is refused (InvalidArgument), so a StorageClass can't point a
 mount at another endpoint or credential.

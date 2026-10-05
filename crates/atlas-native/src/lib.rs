@@ -11,6 +11,7 @@
 //! ([`tls`]). [`node::NativeNode`] (binary `atlas-native-node`) runs either or both roles with an
 //! HTTP ops/volume endpoint.
 
+pub mod acl;
 pub mod alloc;
 pub mod checksum;
 pub mod data_node;

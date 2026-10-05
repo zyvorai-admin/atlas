@@ -867,6 +867,10 @@ fn extended_attributes_round_trip_and_follow_snapshots() {
     assert_eq!(ops.getxattr(f.ino, "user.a").unwrap(), b"two");
     assert_eq!(
         ops.setxattr(f.ino, "system.posix_acl_access", b"x", false, false),
+        Err(libc::EINVAL)
+    );
+    assert_eq!(
+        ops.setxattr(f.ino, "system.other", b"x", false, false),
         Err(libc::EOPNOTSUPP)
     );
     assert_eq!(
