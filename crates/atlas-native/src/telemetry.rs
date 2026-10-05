@@ -14,6 +14,8 @@ pub struct NativeIoCounters {
     gc_reclaimed: AtomicU64,
     replica_write_failures: AtomicU64,
     replicas_repaired: AtomicU64,
+    extents_tiered: AtomicU64,
+    object_reads: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +29,8 @@ pub struct NativeIoSnapshot {
     pub gc_reclaimed: u64,
     pub replica_write_failures: u64,
     pub replicas_repaired: u64,
+    pub extents_tiered: u64,
+    pub object_reads: u64,
 }
 
 impl NativeIoCounters {
@@ -54,6 +58,12 @@ impl NativeIoCounters {
     pub fn replica_repaired(&self) {
         self.replicas_repaired.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn extent_tiered(&self) {
+        self.extents_tiered.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn object_read(&self) {
+        self.object_reads.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn snapshot(&self) -> NativeIoSnapshot {
         NativeIoSnapshot {
             reads: self.reads.load(Ordering::Relaxed),
@@ -65,6 +75,8 @@ impl NativeIoCounters {
             gc_reclaimed: self.gc_reclaimed.load(Ordering::Relaxed),
             replica_write_failures: self.replica_write_failures.load(Ordering::Relaxed),
             replicas_repaired: self.replicas_repaired.load(Ordering::Relaxed),
+            extents_tiered: self.extents_tiered.load(Ordering::Relaxed),
+            object_reads: self.object_reads.load(Ordering::Relaxed),
         }
     }
 }

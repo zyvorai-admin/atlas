@@ -78,6 +78,7 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `metadata.rebuild_bytes_per_sec` | 256 MiB | Rebuild traffic cap (bytes read plus written per second, per group); 0 is unlimited. |
 | `metadata.scrub_bytes_per_sec` | 64 MiB | Scrub traffic cap, likewise. |
 | `metadata.gc_interval_secs` | 60 | Leader-only GC loop; 0 disables. |
+| `metadata.tiering` | unset | Move cold extents to object storage; see [Tiering](#tiering). |
 | `metadata.groups` | 1 | Raft groups the namespace is sharded across (1–64), all on `metadata.listen`; see [Metadata groups](#metadata-groups). Every metadata node must use the same value. It can be raised later but never lowered. |
 | `data_nodes[].host` / `rack` / `zone` | `id` / `id` / empty | Failure domains for placement; replicas always land on distinct hosts. |
 | `data_nodes[].free_bytes` | 1 TiB | Placement capacity hint. |
@@ -139,6 +140,53 @@ different host), so a 4 MiB extent occupies 6 MiB instead of the 12 MiB three re
 
 Measured codec speed on one core (4 MiB extents, release build): about 1.5 GiB/s to encode
 (checksums included) and 2 GiB/s or more to rebuild two lost data shards, for both 4+2 and 8+3.
+
+### Tiering
+
+With `metadata.tiering` set, the leader of each group moves extents nobody has written or read
+for `cold_after_secs` to object storage, freeing their space on the data nodes:
+
+```json
+"tiering": {
+  "store": { "s3": {
+    "endpoint": "http://rook-ceph-rgw-store.rook-ceph.svc", "bucket": "atlas-native-tier",
+    "access_key_file": "/etc/atlas-native/s3/AWS_ACCESS_KEY_ID",
+    "secret_key_file": "/etc/atlas-native/s3/AWS_SECRET_ACCESS_KEY" } },
+  "cold_after_secs": 2592000
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `store` | required | `{"s3": {endpoint, bucket, access_key_file, secret_key_file, region?}}` for Ceph RGW (the default in the Helm chart, through an ObjectBucketClaim) or any S3-compatible store, through `atlas-driver-rgw::S3Target`; needs a build with the `s3` feature, which the image has. `{"dir": {"path"}}` uses a directory every metadata node mounts. |
+| `prefix` | `atlas-native/` | Each group's objects go under `<prefix>g<N>/extents/<extent id>`. Clusters sharing a bucket need different prefixes. |
+| `cold_after_secs` | 30 days | An extent is cold once this long has passed since it was written and since it was last read. Reads are tracked in the leader's memory: a new leader counts every extent as read when it took over. |
+| `interval_secs` | 3600 | Time between tiering passes; 0 tiers only on `POST /v1/tier`. |
+| `bytes_per_sec` | 64 MiB | Upload rate cap per group; 0 is unlimited. |
+| `min_extent_bytes` | 1 MiB | Smaller extents stay on the data nodes, since each object costs a request. |
+
+How it works:
+
+- **A pass.** Tiering an extent reads and verifies it, then uploads it whole. A Raft command then
+  records the object key on the extent and frees its replicas or shards. Each pass first deletes
+  objects under the group's prefix that no extent references, such as an upload whose commit
+  never happened.
+- **Reads and writes.** Reads of a tiered extent fetch its object and verify the extent's SHA-256.
+  Any metadata replica can serve them, with no data node involved. Writes to a tiered range
+  install new extents on the data nodes as usual, and a partial write reads the rest of the
+  extent from its object.
+- **Snapshots, GC and repair.** Snapshots and clones keep sharing tiered extents. GC deletes an
+  object once its extent is unreferenced, and a failed delete is retried by the next pass's sweep.
+  Rebuild and scrub skip tiered extents; the object store provides their redundancy.
+- **Direct reads.** FUSE clients reading data nodes directly fall back to the leader for tiered
+  extents.
+
+`POST /v1/tier` runs a pass on every group this node leads. `/v1/status` reports `last_tier`
+(`candidates`, `tiered`, `bytes`, `deferred`, `orphans_deleted`), and `/metrics` has
+`atlas_native_tiered_extents`, `atlas_native_tiered_bytes`, `atlas_native_extents_tiered_total`
+and `atlas_native_object_reads_total`. Verified against Ceph RGW on the Rook lab (an
+ObjectBucketClaim bucket): extents tiered, read back verified, and their objects deleted by GC
+(`tests/tiering_s3.rs`, run with `ATLAS_NATIVE_S3_*`).
 
 ## HTTP API
 

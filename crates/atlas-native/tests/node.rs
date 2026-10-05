@@ -12,6 +12,7 @@ use std::{
 
 use atlas_native::node::{
     DataNodeRole, DataNodeSpec, DeviceConfig, Listeners, MetadataRole, NativeNode, NodeConfig,
+    ObjectStoreConfig, TieringConfig,
 };
 use atlas_native::DeviceBackend;
 
@@ -81,6 +82,16 @@ impl Cluster {
         groups: u32,
         rebuild_delay_secs: u64,
     ) -> Self {
+        Self::start_with(meta, data, |m| {
+            m.repair_interval_secs = repair_interval_secs;
+            m.groups = groups;
+            m.rebuild_delay_secs = rebuild_delay_secs;
+        })
+    }
+
+    /// `meta` metadata nodes and `data` data nodes, with `tweak` applied to every metadata
+    /// node's config.
+    fn start_with(meta: usize, data: usize, tweak: impl Fn(&mut MetadataRole)) -> Self {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("token"), format!("{TOKEN}\n")).unwrap();
         let data_l: BTreeMap<String, TcpListener> =
@@ -144,7 +155,7 @@ impl Cluster {
         let mut meta_nodes = BTreeMap::new();
         for (id, l) in meta_l {
             let mut cfg = base(&id, td.path());
-            cfg.metadata = Some(MetadataRole {
+            let mut role = MetadataRole {
                 listen: l.local_addr().unwrap(),
                 // Every voter, this node included: the node ignores its own entry.
                 peers: raft_addrs.clone(),
@@ -153,16 +164,19 @@ impl Cluster {
                 replicas: 3,
                 erasure: None,
                 erasure_min_bytes: 64 << 10,
-                rebuild_delay_secs,
+                rebuild_delay_secs: 60,
                 rebuild_bytes_per_sec: 0,
                 scrub_bytes_per_sec: 0,
+                tiering: None,
                 extent_bytes: 4096,
                 tick_ms: 10,
                 proposal_timeout_ms: 3000,
-                repair_interval_secs,
+                repair_interval_secs: 0,
                 gc_interval_secs: 0,
-                groups,
-            });
+                groups: 1,
+            };
+            tweak(&mut role);
+            cfg.metadata = Some(role);
             let n = NativeNode::start_with(
                 cfg,
                 Listeners {
@@ -537,6 +551,50 @@ fn a_lost_data_node_is_rebuilt_without_waiting_for_a_scrub() {
 }
 
 #[test]
+fn tiered_extents_are_read_from_objects_with_every_data_node_gone() {
+    let bucket = tempfile::tempdir().unwrap();
+    let path = bucket.path().to_path_buf();
+    let mut c = Cluster::start_with(3, 3, |m| {
+        m.tiering = Some(TieringConfig {
+            store: ObjectStoreConfig::Dir { path: path.clone() },
+            prefix: "cluster-a/".into(),
+            cold_after_secs: 0,
+            interval_secs: 0,
+            bytes_per_sec: 0,
+            min_extent_bytes: 0,
+        });
+    });
+    let (_, body) = c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"name":"vol","size_bytes":16384}"#,
+        201,
+    );
+    let v = json(&body)["id"].as_str().unwrap().to_string();
+    let data: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+    c.on_leader("PUT", &format!("/v1/volumes/{v}/data?offset=0"), &data, 204);
+
+    let (leader, body) = c.on_leader("POST", "/v1/tier", b"", 200);
+    assert_eq!(
+        json(&body)["tiered"],
+        4,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let objects = std::fs::read_dir(bucket.path().join("cluster-a/g0/extents"))
+        .unwrap()
+        .count();
+    assert_eq!(objects, 4);
+
+    // Every replica of the metadata applied the move, so any new leader reads the objects.
+    for id in ["d1", "d2", "d3"] {
+        c.data.insert(id.into(), None);
+    }
+    c.meta.insert(leader, None);
+    c.wait_read(&format!("/v1/volumes/{v}/data?offset=0&len=16384"), &data);
+}
+
+#[test]
 fn config_validation_rejects_bad_files() {
     let td = tempfile::tempdir().unwrap();
     let write = |name: &str, body: &str| {
@@ -571,6 +629,13 @@ fn config_validation_rejects_bad_files() {
             r#"{"node_id":"m1","data_dir":"/tmp/x","http_listen":"127.0.0.1:0",
                 "metadata":{"listen":"127.0.0.1:0","peers":{"m2":"no-port"},"replicas":1,
                 "data_nodes":[{"id":"d1","addr":"d1.svc:7481"}]}}"#,
+        ),
+        (
+            "tierprefix.json",
+            r#"{"node_id":"m1","data_dir":"/tmp/x","http_listen":"127.0.0.1:0",
+                "metadata":{"listen":"127.0.0.1:0","peers":{},"replicas":1,
+                "data_nodes":[{"id":"d1","addr":"127.0.0.1:1"}],
+                "tiering":{"store":{"dir":{"path":"/tmp/b"}},"prefix":"../up/"}}}"#,
         ),
         (
             "unsetenv.json",

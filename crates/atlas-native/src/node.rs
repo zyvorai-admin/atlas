@@ -24,16 +24,20 @@ use crate::{
     data_node::{DataNodeServer, RemoteDevice},
     device::BlockStore,
     ec::EcScheme,
-    engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind, RepairStats},
+    engine::{
+        EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind, RepairStats, TierPolicy,
+        TierStats,
+    },
     gc::GcStats,
     http::{Handler, HttpServer, Request, Response},
     metadata::MetaError,
     metrics::{self, PromText},
+    object::{DirObjectStore, ObjectStore},
     placement::{FailureDomain, Node, PlacementPolicy},
     raft::{RaftConfig, RaftError, Role},
     raft_server::{RaftMux, RaftServer},
     raw::{open_store, DeviceBackend},
-    rebuild::{RebuildConfig, RebuildStatus, Rebuilder},
+    rebuild::{Pacer, RebuildConfig, RebuildStatus, Rebuilder},
     tls::TlsIdentity,
 };
 
@@ -151,6 +155,94 @@ pub struct MetadataRole {
     /// lowering it would strand the objects of the groups dropped.
     #[serde(default = "default_groups")]
     pub groups: u32,
+    /// Move cold extents to object storage (`docs/NATIVE_NODE.md`, "Tiering").
+    #[serde(default)]
+    pub tiering: Option<TieringConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TieringConfig {
+    pub store: ObjectStoreConfig,
+    /// Key prefix; each metadata group adds `g<N>/`. Ends with `/`.
+    #[serde(default = "default_tier_prefix")]
+    pub prefix: String,
+    /// How long an extent must go unwritten and unread before it is tiered.
+    #[serde(default = "default_cold_after_secs")]
+    pub cold_after_secs: u64,
+    /// Time between tiering passes; 0 tiers only on `POST /v1/tier` (reads of tiered extents
+    /// work either way).
+    #[serde(default = "default_tier_interval_secs")]
+    pub interval_secs: u64,
+    /// Upload rate cap per group; 0 is unlimited.
+    #[serde(default = "default_tier_bytes_per_sec")]
+    pub bytes_per_sec: u64,
+    /// Smaller extents stay on the data nodes.
+    #[serde(default = "default_tier_min_bytes")]
+    pub min_extent_bytes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectStoreConfig {
+    /// Files under a directory every metadata node mounts (or a single-node cluster's disk).
+    Dir { path: PathBuf },
+    /// An S3-compatible bucket: Ceph RGW (e.g. a Rook `ObjectBucketClaim`), MinIO, AWS, ...
+    /// Needs a build with the `s3` feature.
+    S3 {
+        endpoint: String,
+        #[serde(default)]
+        region: String,
+        bucket: String,
+        access_key_file: PathBuf,
+        secret_key_file: PathBuf,
+    },
+}
+
+impl ObjectStoreConfig {
+    fn open(&self) -> Result<Arc<dyn ObjectStore>, NativeError> {
+        match self {
+            Self::Dir { path } => Ok(Arc::new(DirObjectStore::new(path)?)),
+            #[cfg(feature = "s3")]
+            Self::S3 {
+                endpoint,
+                region,
+                bucket,
+                access_key_file,
+                secret_key_file,
+            } => {
+                let key = std::fs::read_to_string(access_key_file)?;
+                let secret = std::fs::read_to_string(secret_key_file)?;
+                Ok(Arc::new(crate::object::S3ObjectStore::new(
+                    endpoint,
+                    region,
+                    bucket,
+                    key.trim(),
+                    secret.trim(),
+                )?))
+            }
+            #[cfg(not(feature = "s3"))]
+            Self::S3 { .. } => Err(NativeError::Invalid(
+                "metadata.tiering.store.s3 needs a build with the atlas-native `s3` feature".into(),
+            )),
+        }
+    }
+}
+
+fn default_tier_prefix() -> String {
+    "atlas-native/".into()
+}
+fn default_cold_after_secs() -> u64 {
+    30 * 24 * 3600
+}
+fn default_tier_interval_secs() -> u64 {
+    3600
+}
+fn default_tier_bytes_per_sec() -> u64 {
+    64 << 20
+}
+fn default_tier_min_bytes() -> usize {
+    1 << 20
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,6 +396,19 @@ impl NodeConfig {
                     "metadata.groups must be between 1 and {MAX_GROUPS}"
                 ));
             }
+            if let Some(t) = &m.tiering {
+                let p = &t.prefix;
+                if p.is_empty()
+                    || !p.ends_with('/')
+                    || p.starts_with('/')
+                    || p.split('/').any(|s| s == "." || s == "..")
+                    || p.contains("//")
+                {
+                    return invalid(format!(
+                        "metadata.tiering.prefix {p:?} must be a relative path ending in /"
+                    ));
+                }
+            }
             let mut ids: Vec<&str> = m.data_nodes.iter().map(|d| d.id.as_str()).collect();
             ids.sort_unstable();
             if ids.windows(2).any(|w| w[0] == w[1]) {
@@ -353,6 +458,10 @@ struct NodeShared {
     last_repair: Mutex<Option<RepairStats>>,
     /// The rebuild controller's status for each group, once this node has led it.
     rebuild: Mutex<Vec<Option<RebuildStatus>>>,
+    /// Tiering policy and upload rate cap, when an object store is configured.
+    tiering: Option<(TierPolicy, u64)>,
+    tier: TaskStats,
+    last_tier: Mutex<Option<TierStats>>,
     /// Client sessions this node expired as a group leader.
     sessions_expired: AtomicU64,
 }
@@ -481,6 +590,7 @@ impl NativeNode {
                 refuse_fewer_groups(&cfg.data_dir, m.groups)?;
                 let mux = RaftMux::start(l, tls.as_ref())?;
                 raft_addr = Some(mux.local_addr());
+                let objects = m.tiering.as_ref().map(|t| t.store.open()).transpose()?;
                 let peers = cfg.raft_peers();
                 let io_timeout = Duration::from_millis(m.proposal_timeout_ms);
                 for g in 0..m.groups {
@@ -524,6 +634,10 @@ impl NativeNode {
                     ecfg.extent_bytes = m.extent_bytes;
                     ecfg.erasure = m.erasure;
                     ecfg.erasure_min_bytes = m.erasure_min_bytes;
+                    if let (Some(store), Some(t)) = (&objects, &m.tiering) {
+                        ecfg.objects = Some(store.clone());
+                        ecfg.object_prefix = format!("{}g{g}/", t.prefix);
+                    }
                     ecfg.placement = PlacementPolicy {
                         replicas: m.replicas,
                         ..PlacementPolicy::default()
@@ -548,7 +662,17 @@ impl NativeNode {
                     scrub_interval: Duration::from_secs(m.repair_interval_secs),
                     scrub_bytes_per_sec: m.scrub_bytes_per_sec,
                 });
-                Some((rebuild, m.gc_interval_secs))
+                let tier = m.tiering.as_ref().map(|t| {
+                    (
+                        TierPolicy {
+                            cold_after: Duration::from_secs(t.cold_after_secs),
+                            min_bytes: t.min_extent_bytes,
+                        },
+                        t.bytes_per_sec,
+                        t.interval_secs,
+                    )
+                });
+                Some((rebuild, m.gc_interval_secs, tier))
             }
             None => None,
         };
@@ -571,11 +695,28 @@ impl NativeNode {
             gc: TaskStats::default(),
             last_repair: Mutex::new(None),
             rebuild: Mutex::new(Vec::new()),
+            tiering: match &intervals {
+                Some((_, _, Some((policy, rate, _)))) => Some((*policy, *rate)),
+                _ => None,
+            },
+            tier: TaskStats::default(),
+            last_tier: Mutex::new(None),
             sessions_expired: AtomicU64::new(0),
         });
 
         let mut loops = Vec::new();
-        if let Some((rebuild, gc_secs)) = intervals {
+        if let Some((rebuild, gc_secs, tier)) = intervals {
+            if let Some((_, _, secs)) = tier.filter(|t| t.2 > 0) {
+                let sh = shared.clone();
+                loops.push(thread::spawn(move || {
+                    maintenance(
+                        &sh,
+                        Duration::from_secs(secs),
+                        |sh, e| tier_group(sh, e).map(|_| ()),
+                        |sh| &sh.tier,
+                    )
+                }));
+            }
             if let Some(cfg) = rebuild {
                 let sh = shared.clone();
                 loops.push(thread::spawn(move || rebuild_loop(&sh, cfg)));
@@ -1151,6 +1292,7 @@ fn volume_route(sh: &NodeShared, req: &Request, segs: &[&str]) -> Response {
         }
         ("POST", ["v1", "repair"]) => repair_all(sh).map(|st| Response::json(200, &json!(st))),
         ("POST", ["v1", "gc"]) => gc_all(sh).map(|st| Response::json(200, &json!(st))),
+        ("POST", ["v1", "tier"]) => tier_all(sh).map(|st| Response::json(200, &json!(st))),
         _ => return Response::text(404, "no such route"),
     };
     result.unwrap_or_else(error_response)
@@ -1181,6 +1323,40 @@ fn repair_all(sh: &NodeShared) -> Result<RepairStats, NativeError> {
         st.add(&g.engine.repair_once()?);
     }
     if let Ok(mut last) = sh.last_repair.lock() {
+        *last = Some(st);
+    }
+    Ok(st)
+}
+
+/// One paced tiering pass over `e`, recorded as the last pass.
+fn tier_group(sh: &NodeShared, e: &NativeEngine) -> Result<TierStats, NativeError> {
+    let (policy, rate) = sh
+        .tiering
+        .ok_or_else(|| NativeError::Invalid("metadata.tiering is not configured".into()))?;
+    let mut pacer = Pacer::new(rate);
+    let st = e.tier_once(
+        &policy,
+        |n| pacer.pace(n, &sh.stop),
+        || sh.stop.load(Ordering::SeqCst),
+    )?;
+    if let Ok(mut last) = sh.last_tier.lock() {
+        *last = Some(st);
+    }
+    Ok(st)
+}
+
+/// One tiering pass over each group this node leads.
+fn tier_all(sh: &NodeShared) -> Result<TierStats, NativeError> {
+    let mut st = TierStats::default();
+    for g in led_groups(sh)? {
+        let r = tier_group(sh, &g.engine)?;
+        st.candidates += r.candidates;
+        st.tiered += r.tiered;
+        st.bytes += r.bytes;
+        st.deferred += r.deferred;
+        st.orphans_deleted += r.orphans_deleted;
+    }
+    if let Ok(mut last) = sh.last_tier.lock() {
         *last = Some(st);
     }
     Ok(st)
@@ -1271,6 +1447,7 @@ fn status(sh: &NodeShared) -> Response {
             "layout": sh.layout.map(|(e, r)| json!({ "extent_bytes": e, "replicas": r })),
             "data_nodes": nodes,
             "last_repair": last_repair,
+            "last_tier": sh.last_tier.lock().ok().and_then(|l| *l),
             // The rebuild controller of each group this node leads.
             "rebuild": (!rebuild.is_empty()).then_some(&rebuild),
             "data_node": fence.map(|f| json!({ "fence": f })),
@@ -1298,7 +1475,7 @@ fn metrics(sh: &NodeShared) -> Response {
     if !sh.groups.is_empty() {
         let node = [("node", sh.id.as_str())];
         let mut p = PromText::new();
-        for (task, st) in [("repair", &sh.repair), ("gc", &sh.gc)] {
+        for (task, st) in [("repair", &sh.repair), ("gc", &sh.gc), ("tier", &sh.tier)] {
             for (suffix, help, v) in [
                 (
                     "runs",

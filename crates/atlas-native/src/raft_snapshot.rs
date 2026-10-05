@@ -333,6 +333,8 @@ mod tests {
                     offset: i * 4096,
                 }],
                 ec: None,
+                created_ms: 0,
+                object: None,
             });
         }
         // Paged on the leader's store, with some changes on top of it.

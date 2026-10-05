@@ -27,7 +27,7 @@ columns state only what has been measured or verified in this repository.
 | Measured performance | Ceph's; Atlas adds no data-path hop | Metadata engine ~9–12k creates/s on a 3-voter group; through FUSE ~270 creates/s, ~380 MiB/s write, up to ~540 MiB/s read, ~600 4 KiB random-read IOPS (one host, tmpfs, `docs/NATIVE_FS.md`); no NVMe numbers yet | Designed for very high IOPS and throughput at low latency |
 | Metadata | Ceph MDS (CephFS) | Raft groups sharded by volume/filesystem; inodes and directory entries paged from an embedded KV store | Distributed across the cluster |
 | Data protection | Ceph replication or erasure coding | 3 replicas or Reed-Solomon erasure coding (e.g. 4+2, 8+3), SHA-256 checksums per extent and per shard | Distributed erasure coding |
-| Tiering to object storage | Not managed by Atlas | Not yet | Yes |
+| Tiering to object storage | Not managed by Atlas | Cold extents to S3 (Ceph RGW by default, or any S3-compatible bucket), read back from their objects | Yes |
 | GPUDirect Storage | No | No | Yes |
 | Protocols | Block, CephFS, S3 (RGW) | Block over HTTP, POSIX via FUSE | POSIX, NFS, SMB, S3 |
 | Snapshots and clones | Yes (RBD, CephFS) | Yes, copy-on-write | Yes |
@@ -73,7 +73,8 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
    cache metadata without serving it stale. Filesystem snapshot trees are still held in memory.
 3. **Efficiency:** erasure coding with a rebuild controller; cold extents tiered to S3.
    Reed-Solomon k+m extents (4+2 stores 1.5× the data instead of 3×) and a prioritised, paced
-   rebuild controller with incremental scrub are done; S3 tiering is not.
+   rebuild controller with incremental scrub and tiering of cold extents to S3 are done;
+   snapshot-to-object is not.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;
    MLPerf Storage results.
 5. **Protocols:** NFS, SMB and S3 front ends over the same namespace; ACLs, quotas, `O_DIRECT`;

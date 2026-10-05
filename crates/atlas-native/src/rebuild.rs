@@ -71,13 +71,13 @@ pub struct ScrubStatus {
 
 /// Spaces out work so that, on average, at most `rate` bytes go by per second.
 #[derive(Debug)]
-struct Pacer {
+pub(crate) struct Pacer {
     rate: u64,
     ready_at: Instant,
 }
 
 impl Pacer {
-    fn new(rate: u64) -> Self {
+    pub(crate) fn new(rate: u64) -> Self {
         Self {
             rate,
             ready_at: Instant::now(),
@@ -85,7 +85,7 @@ impl Pacer {
     }
 
     /// Accounts for `bytes` just moved and sleeps until the budget allows more (or `stop`).
-    fn pace(&mut self, bytes: u64, stop: &AtomicBool) {
+    pub(crate) fn pace(&mut self, bytes: u64, stop: &AtomicBool) {
         if self.rate == 0 || bytes == 0 {
             return;
         }

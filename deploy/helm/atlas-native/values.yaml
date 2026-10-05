@@ -44,6 +44,27 @@ node:
   # Placement capacity hint per data node (bytes); defaults to the PVC size.
   freeBytes: 0
 
+# Move extents nobody has written or read for coldAfterSecs to object storage, freeing their
+# space on the data nodes (docs/NATIVE_NODE.md, "Tiering").
+tiering:
+  enabled: false
+  # Ceph RGW by default: the chart creates an ObjectBucketClaim of this StorageClass and reads
+  # the endpoint, bucket and credentials Rook publishes for it.
+  objectBucketClaim:
+    storageClassName: ""
+  # Any other S3-compatible store instead (all three set): endpoint URL, bucket, and a Secret
+  # with AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+  endpoint: ""
+  bucket: ""
+  existingSecret: ""
+  region: ""
+  prefix: "atlas-native/"
+  coldAfterSecs: 2592000
+  # 0: tier only on POST /v1/tier.
+  intervalSecs: 3600
+  bytesPerSec: 67108864
+  minExtentBytes: 1048576
+
 apiToken:
   # Secret with key `token`. Empty: the chart creates "<fullname>-api" with a random token that is
   # kept across upgrades.
