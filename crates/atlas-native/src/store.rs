@@ -749,6 +749,8 @@ mod tests {
                 offset,
             }],
             ec: None,
+            created_ms: 0,
+            object: None,
         }
     }
 

@@ -34,6 +34,17 @@ pub struct ExtentRef {
     pub replicas: Vec<ReplicaRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ec: Option<EcLayout>,
+    /// When the leader wrote it (ms since the Unix epoch; 0 for extents from before this was
+    /// recorded). Extents are never rewritten, so this is also when its data last changed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub created_ms: u64,
+    /// The object holding the whole extent once it is tiered; it then has no replicas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl ExtentRef {
@@ -45,6 +56,12 @@ impl ExtentRef {
     /// Checks an extent about to be installed: an erasure-coded one must match its layout, and
     /// no two of its replicas or shards may share a node.
     pub fn check(&self) -> Result<(), MetaError> {
+        if self.object.is_some() && (!self.replicas.is_empty() || self.ec.is_some()) {
+            return Err(MetaError::Invalid(format!(
+                "tiered extent {} also lists replicas or shards",
+                self.id
+            )));
+        }
         if let Some(ec) = &self.ec {
             ec.check(self.len, self.replicas.len())?;
             let mut nodes: Vec<&str> = self.replicas.iter().map(|r| r.node_id.as_str()).collect();
@@ -170,6 +187,14 @@ pub enum MetaCommand {
         extent_id: ExtentId,
         old: ReplicaRef,
         new: ReplicaRef,
+    },
+    /// Moves an extent's data to object `key` (already uploaded and verified by the leader) and
+    /// returns its replicas' ranges to the free list. Refused unless the extent still has exactly
+    /// `replicas`, so a concurrent repair can't have its new range freed or leaked.
+    TierExtent {
+        extent_id: ExtentId,
+        key: String,
+        replicas: Vec<ReplicaRef>,
     },
     /// Raft voter configuration change (joint consensus: a `Joint` entry, then the leader
     /// appends the `Stable` one once it commits). Takes effect in the Raft layer as soon as it
@@ -441,6 +466,35 @@ impl Catalog {
                 for r in &e.extent.replicas {
                     self.free
                         .release(&r.node_id, r.device_index, r.offset, e.extent.stored_len())
+                        .map_err(MetaError::Invalid)?;
+                }
+            }
+            MetaCommand::TierExtent {
+                extent_id,
+                key,
+                replicas,
+            } => {
+                let e = self
+                    .extents
+                    .get_mut(extent_id)
+                    .ok_or_else(|| MetaError::NotFound(extent_id.clone()))?;
+                if e.extent.object.is_some() {
+                    return Err(MetaError::Invalid(format!(
+                        "extent {extent_id} is already tiered"
+                    )));
+                }
+                if &e.extent.replicas != replicas || replicas.is_empty() {
+                    return Err(MetaError::Invalid(format!(
+                        "extent {extent_id} changed before it could be tiered"
+                    )));
+                }
+                let len = e.extent.stored_len();
+                let old = std::mem::take(&mut e.extent.replicas);
+                e.extent.ec = None;
+                e.extent.object = Some(key.clone());
+                for r in &old {
+                    self.free
+                        .release(&r.node_id, r.device_index, r.offset, len)
                         .map_err(MetaError::Invalid)?;
                 }
             }

@@ -365,6 +365,13 @@ excludes it permanently.
   (extents with parts on lost nodes, least spare redundancy first, from metadata alone) feed the
   rebuild controller (`crate::rebuild`, `docs/NATIVE_NODE.md`), which schedules, prioritises and
   paces repair; `tests/rebuild.rs` covers it.
+- **Tiered extents** (`ExtentRef.object`): `MetaCommand::TierExtent { extent_id, key, replicas }`
+  records the object holding the whole extent, clears its replicas and erasure layout and returns
+  their ranges to the free list. It is refused unless the extent still has exactly `replicas`, so
+  a concurrent repair can neither lose its new range nor have it freed. `ExtentRef.created_ms`,
+  which the leader stamps when it places an extent, dates it for the tiering policy (0 for older
+  extents). Reads that fail because the extent moved after they looked it up re-read it from
+  where it is now. `tests/tiering.rs` covers this.
 - **Erasure-coded extents** (`EngineConfig::erasure`, `ExtentRef.ec`) keep one `ReplicaRef` per
   shard, in shard order, plus each shard's length and SHA-256. Every install command checks that
   the layout is consistent and that no two shards share a node. The free list and GC count the

@@ -20,6 +20,8 @@ kubectl -n atlas-native get secret atlas-native-api -o jsonpath='{.data.token}' 
 | `node.replicationFactor` | 3 | Copies per extent, at most `replicas`. |
 | `node.erasure` | empty | Reed-Solomon scheme such as `4+2` for extents of at least `node.erasureMinBytes`; data + parity must not exceed `replicas`. Empty replicates every extent. |
 | `node.extentBytes`, `node.maxRequestBytes`, `node.tickMs`, `node.proposalTimeoutMs`, `node.erasureMinBytes`, `node.repairIntervalSecs`, `node.rebuildDelaySecs`, `node.rebuildBytesPerSec`, `node.scrubBytesPerSec`, `node.gcIntervalSecs` | see `values.yaml` | Map to the node config fields of the same name. |
+| `tiering.enabled` | false | Move cold extents to object storage. By default the chart creates an ObjectBucketClaim of `tiering.objectBucketClaim.storageClassName` (Ceph RGW through Rook) and the nodes read its endpoint, bucket and credentials. Set `tiering.endpoint`, `tiering.bucket` and `tiering.existingSecret` (keys `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) to use any other S3-compatible store instead. |
+| `tiering.coldAfterSecs`, `tiering.intervalSecs`, `tiering.bytesPerSec`, `tiering.minExtentBytes`, `tiering.prefix`, `tiering.region` | see `values.yaml` | Map to `metadata.tiering` in the node config. |
 | `apiToken.existingSecret` | empty | Secret with key `token`; otherwise the chart creates `<fullname>-api` with a random token kept across upgrades (and on uninstall). |
 | `tls.enabled` | false | Mutual TLS for Raft and data-node traffic. The certificate must carry every pod name as a DNS SAN. |
 | `tls.existingSecret` / `tls.certManager.*` | empty / off | `ca.crt`, `tls.crt`, `tls.key`; or let cert-manager issue `<fullname>-tls` from `issuerRef` with the right SANs. |

@@ -142,6 +142,7 @@ fn start_node(root: &Path, server: &(String, String), client_ca: &str) -> Native
             rebuild_delay_secs: 60,
             rebuild_bytes_per_sec: 0,
             scrub_bytes_per_sec: 0,
+            tiering: None,
             extent_bytes: 4096,
             tick_ms: 10,
             proposal_timeout_ms: 3000,

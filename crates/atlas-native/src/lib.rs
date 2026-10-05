@@ -26,6 +26,7 @@ pub mod membership;
 pub mod metadata;
 pub mod metrics;
 pub mod namespace;
+pub mod object;
 pub mod node;
 pub mod placement;
 pub mod raft;
@@ -46,7 +47,8 @@ pub use data_node::{DataNodeServer, RemoteDevice};
 pub use device::{BlockStore, DeviceId, FileDevice};
 pub use engine::{
     EngineConfig, FileLayout, LayoutExtent, LayoutReplica, MetaBackend, NativeEngine, NativeError,
-    NodeStatus, ObjectKind, RepairStats, VolumeInfo,
+    ExportInfo, ExportManifest, ExportStats, NodeStatus, ObjectKind, RepairStats, TierPolicy,
+    TierStats, VolumeInfo,
 };
 pub use gc::GcStats;
 pub use membership::Membership;

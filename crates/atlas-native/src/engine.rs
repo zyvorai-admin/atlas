@@ -22,6 +22,7 @@ use crate::{
     metadata::{Catalog, ExtentRef, MetaCommand, MetaError, ReplicaRef, SnapshotId, VolumeId},
     metrics::PromText,
     namespace::{FsOp, InodeKind},
+    object::ObjectStore,
     placement::{select_replicas, Node, PlacementPolicy},
     raft::RaftError,
     raft_server::RaftServer,
@@ -32,15 +33,19 @@ use crate::{
     wal::{Wal, WalError, WalRecord},
 };
 
+mod export;
 mod files;
 mod leases;
 mod rebuild;
+mod tier;
+pub use export::{check_export_name, ExportExtent, ExportInfo, ExportManifest, ExportStats};
 pub use files::{
     Attr, DirEntry, FileLayout, FsInfo, FsSnapshotInfo, FsStat, LayoutEc, LayoutExtent,
     LayoutReplica, NewNode,
 };
 pub use leases::{now_ms, LockRequest, LockTable};
 pub use rebuild::Degraded;
+pub use tier::{TierPolicy, TierStats};
 
 /// Extents fetched concurrently by one read.
 const READ_PARALLELISM: usize = 8;
@@ -149,6 +154,15 @@ pub struct EngineConfig {
     /// replicating them (`placement.replicas` still applies to smaller ones).
     pub erasure: Option<EcScheme>,
     pub erasure_min_bytes: usize,
+    /// Where tiered extents live ([`NativeEngine::tier_once`]); reads of tiered extents fail
+    /// without it.
+    pub objects: Option<Arc<dyn ObjectStore>>,
+    /// Key prefix of this engine's objects. Engines sharing a bucket need distinct prefixes:
+    /// each deletes objects under its own prefix that its catalog doesn't reference.
+    pub object_prefix: String,
+    /// Key prefix of snapshot exports ([`NativeEngine::export_snapshot`]), shared by every
+    /// group of a cluster.
+    pub export_prefix: String,
 }
 
 /// Extents smaller than this stay replicated by default: their shards would be tiny.
@@ -165,6 +179,9 @@ impl EngineConfig {
             catalog_cache_inodes: DEFAULT_CACHE_INODES,
             erasure: None,
             erasure_min_bytes: DEFAULT_ERASURE_MIN_BYTES,
+            objects: None,
+            object_prefix: "atlas-native/".into(),
+            export_prefix: "atlas-native/".into(),
         }
     }
 }
@@ -282,6 +299,11 @@ pub struct NativeEngine {
     write_lock: Mutex<()>,
     /// One repair at a time, so two never write replacements for the same part.
     repair_lock: Mutex<()>,
+    /// When each extent was last read (ms since the epoch), tracked only with an object store,
+    /// so recently read extents aren't tiered. Not replicated: a new leader treats everything
+    /// as read when it opened its engine.
+    reads: Mutex<std::collections::HashMap<String, u64>>,
+    opened_ms: u64,
     pub telemetry: NativeIoCounters,
 }
 
@@ -352,6 +374,8 @@ impl NativeEngine {
             meta,
             write_lock: Mutex::new(()),
             repair_lock: Mutex::new(()),
+            reads: Mutex::new(Default::default()),
+            opened_ms: now_ms(),
             telemetry: NativeIoCounters::default(),
         };
         if let Meta::Local { catalog, store, .. } = &engine.meta {
@@ -653,6 +677,8 @@ impl NativeEngine {
             checksum: checksum::sha256(chunk),
             replicas,
             ec: None,
+            created_ms: now_ms(),
+            object: None,
         })
     }
 
@@ -719,6 +745,8 @@ impl NativeEngine {
             checksum: checksum::sha256(chunk),
             replicas: slots.into_iter().flatten().collect(),
             ec: Some(enc.layout),
+            created_ms: now_ms(),
+            object: None,
         })
     }
 
@@ -844,8 +872,14 @@ impl NativeEngine {
             ..Default::default()
         };
         for eid in candidates {
+            let object =
+                self.with_catalog(|c| c.extents.get(&eid).and_then(|e| e.extent.object.clone()))?;
             self.commit(MetaCommand::MarkExtentReclaimed { extent_id: eid }, None)?;
             stats.reclaimed += 1;
+            // A failed delete leaves an orphan for the next tiering pass's sweep.
+            if let (Some(key), Some(store)) = (object, &self.cfg.objects) {
+                let _ = store.delete(&key);
+            }
         }
         stats.freed_bytes = self.free_bytes()?.saturating_sub(free_before);
         self.telemetry.gc_reclaimed(stats.reclaimed);
@@ -1106,6 +1140,12 @@ impl NativeEngine {
     /// Prometheus text exposition for I/O counters, metadata and free space.
     pub fn render_metrics(&self) -> Result<String, NativeError> {
         let t = self.telemetry.snapshot();
+        let (tiered, tiered_bytes) = self.with_catalog(|c| {
+            c.extents
+                .values()
+                .filter(|e| e.extent.object.is_some())
+                .fold((0u64, 0u64), |(n, b), e| (n + 1, b + e.extent.len as u64))
+        })?;
         let (applied, volumes, snapshots, extents, free_bytes, free_ranges, sessions, locks) = self
             .with_catalog(|c| {
                 (
@@ -1159,6 +1199,16 @@ impl NativeEngine {
                 "Replicas re-created by repair.",
                 t.replicas_repaired,
             ),
+            (
+                "atlas_native_extents_tiered_total",
+                "Extents moved to object storage.",
+                t.extents_tiered,
+            ),
+            (
+                "atlas_native_object_reads_total",
+                "Extent reads served from object storage.",
+                t.object_reads,
+            ),
         ] {
             p.single(name, "counter", help, v);
         }
@@ -1191,6 +1241,18 @@ impl NativeEngine {
             "gauge",
             "Live physical extents.",
             extents,
+        );
+        p.single(
+            "atlas_native_tiered_extents",
+            "gauge",
+            "Live extents held in object storage instead of on data nodes.",
+            tiered,
+        );
+        p.single(
+            "atlas_native_tiered_bytes",
+            "gauge",
+            "Bytes of the live extents held in object storage.",
+            tiered_bytes,
         );
         p.single(
             "atlas_native_client_sessions",
@@ -1519,10 +1581,51 @@ impl NativeEngine {
         Ok(())
     }
 
-    /// The whole extent from the first replica whose checksum verifies. Reads start at a
-    /// replica chosen from the extent id, so the read load of many extents spreads over all
-    /// their replicas instead of always landing on the first.
+    /// The whole extent, verified. If it fails because the extent moved since `ext` was looked
+    /// up (tiered or repaired, its old ranges reused), it is read again where it is now.
     fn read_extent(&self, ext: &ExtentRef) -> Result<Vec<u8>, NativeError> {
+        if self.cfg.objects.is_some() {
+            if let Ok(mut r) = self.reads.lock() {
+                r.insert(ext.id.clone(), now_ms());
+            }
+        }
+        match self.read_placed(ext) {
+            Err(NativeError::Checksum(id)) => {
+                let now = self.with_catalog(|c| c.extents.get(&id).map(|e| e.extent.clone()))?;
+                match now {
+                    Some(now) if now != *ext => self.read_placed(&now),
+                    _ => Err(NativeError::Checksum(id)),
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// A tiered extent from its object.
+    fn read_object(&self, ext: &ExtentRef, key: &str) -> Result<Vec<u8>, NativeError> {
+        let store = self.cfg.objects.as_ref().ok_or_else(|| {
+            NativeError::Invalid(format!(
+                "extent {} is tiered but no object store is configured",
+                ext.id
+            ))
+        })?;
+        let buf = store.get(key)?;
+        if buf.len() != ext.len || !checksum::verify(&buf, &ext.checksum) {
+            self.telemetry.checksum_failure();
+            return Err(NativeError::Checksum(ext.id.clone()));
+        }
+        self.telemetry.object_read();
+        self.telemetry.record_read(buf.len());
+        Ok(buf)
+    }
+
+    /// The whole extent from wherever `ext` says it is: its object, its shards, or the first
+    /// replica whose checksum verifies. Replica reads start at a replica chosen from the extent
+    /// id, so the read load of many extents spreads over all their replicas.
+    fn read_placed(&self, ext: &ExtentRef) -> Result<Vec<u8>, NativeError> {
+        if let Some(key) = &ext.object {
+            return self.read_object(ext, key);
+        }
         if let Some(ec) = &ext.ec {
             return self.read_shards(ext, ec);
         }
