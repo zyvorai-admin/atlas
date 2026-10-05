@@ -17,18 +17,20 @@ use atlas_native_csi::{
     proto::{
         controller_client::ControllerClient, identity_client::IdentityClient,
         node_client::NodeClient, volume_capability, volume_content_source, CapacityRange,
-        CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest, DeleteVolumeRequest,
-        GetPluginCapabilitiesRequest, GetPluginInfoRequest, NodeGetInfoRequest,
-        NodePublishVolumeRequest, ValidateVolumeCapabilitiesRequest, VolumeCapability,
-        VolumeContentSource,
+        ControllerExpandVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest,
+        DeleteSnapshotRequest, DeleteVolumeRequest, GetPluginCapabilitiesRequest,
+        GetPluginInfoRequest, NodeGetCapabilitiesRequest, NodeGetInfoRequest,
+        NodeGetVolumeStatsRequest, NodePublishVolumeRequest, ValidateVolumeCapabilitiesRequest,
+        VolumeCapability, VolumeContentSource,
     },
     serve, DRIVER_NAME,
 };
 use atlas_native_fuse::{
-    client::{Client, ClientConfig},
+    client::{Body, Client, ClientConfig, Retry},
     ops::{Ops, OpsConfig},
 };
 use hyper_util::rt::TokioIo;
+use reqwest::Method;
 use tonic::{
     transport::{Channel, Endpoint, Uri},
     Code,
@@ -128,6 +130,19 @@ impl Cluster {
         Client::new(cfg).unwrap()
     }
 
+    /// The filesystem's byte quota, if it has one.
+    fn max_bytes(&self, fs: &str) -> Option<u64> {
+        self.client()
+            .json(
+                Method::GET,
+                &format!("/v1/fs/{fs}/quota"),
+                Body::Empty,
+                Retry::Idempotent,
+            )
+            .unwrap()["max_bytes"]
+            .as_u64()
+    }
+
     fn ops(&self, fs: &str) -> Ops {
         Ops::new(
             self.client(),
@@ -175,6 +190,18 @@ fn create(name: &str, source: Option<volume_content_source::Type>) -> CreateVolu
         parameters: [("extentBytes".to_string(), "65536".to_string())].into(),
         secrets: Default::default(),
         volume_content_source: source.map(|t| VolumeContentSource { r#type: Some(t) }),
+    }
+}
+
+fn expand(volume_id: &str, required_bytes: i64) -> ControllerExpandVolumeRequest {
+    ControllerExpandVolumeRequest {
+        volume_id: volume_id.into(),
+        capacity_range: Some(CapacityRange {
+            required_bytes,
+            limit_bytes: 0,
+        }),
+        secrets: Default::default(),
+        volume_capability: Some(mount_cap()),
     }
 }
 
@@ -229,7 +256,7 @@ fn controller_lifecycle_over_the_socket() {
     let caps = rt
         .block_on(id.get_plugin_capabilities(GetPluginCapabilitiesRequest {}))
         .unwrap();
-    assert_eq!(caps.get_ref().capabilities.len(), 1);
+    assert_eq!(caps.get_ref().capabilities.len(), 2);
 
     // Create is idempotent: a retry returns the same volume.
     let pvc = "pvc-11111111-2222-3333-4444-555555555555";
@@ -238,6 +265,54 @@ fn controller_lifecycle_over_the_socket() {
     assert_eq!((v.volume_id.as_str(), v.capacity_bytes), (pvc, 1 << 30));
     let again = rt.block_on(ctl.create_volume(create(pvc, None))).unwrap();
     assert_eq!(again.into_inner().volume.unwrap().volume_id, pvc);
+    // The PVC's size is the filesystem's byte quota; expansion raises it and never lowers it.
+    assert_eq!(c.max_bytes(pvc), Some(1 << 30));
+    let grown = rt.block_on(ctl.controller_expand_volume(expand(pvc, 2 << 30)));
+    let grown = grown.unwrap().into_inner();
+    assert_eq!(
+        (grown.capacity_bytes, grown.node_expansion_required),
+        (2 << 30, false)
+    );
+    assert_eq!(c.max_bytes(pvc), Some(2 << 30));
+    let same = rt.block_on(ctl.controller_expand_volume(expand(pvc, 1 << 30)));
+    assert_eq!(same.unwrap().into_inner().capacity_bytes, 2 << 30);
+    assert_eq!(c.max_bytes(pvc), Some(2 << 30));
+    let err = rt
+        .block_on(ctl.controller_expand_volume(expand("pvc-missing", 1 << 30)))
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+
+    // enforceCapacity: "false" leaves the filesystem thin, and expansion keeps it so.
+    let mut thin = create("pvc-thin", None);
+    thin.parameters
+        .insert("enforceCapacity".into(), "false".into());
+    rt.block_on(ctl.create_volume(thin)).unwrap();
+    assert_eq!(c.max_bytes("pvc-thin"), None);
+    let t = rt.block_on(ctl.controller_expand_volume(expand("pvc-thin", 3 << 30)));
+    assert_eq!(t.unwrap().into_inner().capacity_bytes, 3 << 30);
+    assert_eq!(c.max_bytes("pvc-thin"), None);
+
+    // A small volume refuses writes past its size until it is expanded.
+    let mut small = create("pvc-small", None);
+    small.capacity_range = Some(CapacityRange {
+        required_bytes: 65536,
+        limit_bytes: 0,
+    });
+    rt.block_on(ctl.create_volume(small)).unwrap();
+    let ops = c.ops("pvc-small");
+    let f = ops
+        .mknode(ROOT_INO, "big", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    ops.write(f.ino, 0, &[1u8; 65536]).unwrap();
+    ops.flush(f.ino).unwrap();
+    let over = ops
+        .write(f.ino, 65536, &[2u8; 4096])
+        .and_then(|_| ops.flush(f.ino));
+    assert_eq!(over, Err(libc::EDQUOT));
+    rt.block_on(ctl.controller_expand_volume(expand("pvc-small", 1 << 20)))
+        .unwrap();
+    ops.write(f.ino, 65536, &[2u8; 4096]).unwrap();
+    ops.flush(f.ino).unwrap();
     // A name that isn't a valid id is hashed, consistently.
     let odd = rt
         .block_on(ctl.create_volume(create("Odd Name/with_chars", None)))
@@ -310,6 +385,8 @@ fn controller_lifecycle_over_the_socket() {
         .unwrap()
         .content_source
         .is_some());
+    // The clone carries its own size, not the source's quota at snapshot time.
+    assert_eq!(c.max_bytes("pvc-from-snap"), Some(1 << 30));
     let clone = c.ops("pvc-from-snap");
     assert_eq!(read_file(&clone, "model.bin"), b"weights-v1");
     assert_eq!(
@@ -421,6 +498,20 @@ fn node_service_validates_before_mounting() {
         .block_on(node.node_get_info(NodeGetInfoRequest {}))
         .unwrap();
     assert_eq!(info.get_ref().node_id, "worker-1");
+    let ncaps = rt
+        .block_on(node.node_get_capabilities(NodeGetCapabilitiesRequest {}))
+        .unwrap();
+    assert_eq!(ncaps.get_ref().capabilities.len(), 2);
+    let stats = |path: &std::path::Path| NodeGetVolumeStatsRequest {
+        volume_id: "pvc-1".into(),
+        volume_path: path.to_string_lossy().into_owned(),
+        staging_target_path: String::new(),
+    };
+    // A directory that isn't a mount is not a published volume.
+    let err = rt
+        .block_on(node.node_get_volume_stats(stats(td.path())))
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
 
     let target = td.path().join("target").to_string_lossy().into_owned();
     let publish = |cap: VolumeCapability| NodePublishVolumeRequest {

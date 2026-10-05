@@ -137,6 +137,7 @@ csi:
   sidecars:
     provisioner: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
     snapshotter: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
+    resizer: registry.k8s.io/sig-storage/csi-resizer:v1.13.2
     registrar: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
     resources:
       requests: { cpu: 10m, memory: 32Mi }
@@ -163,6 +164,9 @@ csi:
     reclaimPolicy: Delete
     # Extent grid of new filesystems in bytes; 0 uses node.extentBytes.
     extentBytes: 0
+    # A PVC's size is its filesystem's byte quota (writes past it fail with EDQUOT; expanding
+    # the PVC raises it). false keeps filesystems thin: the size is reported, not enforced.
+    enforceCapacity: true
     # atlas-native-mount options: ro, cache-leases, direct-reads, writeback-parallel=<n>, ...
     mountOptions: []
   snapshots:

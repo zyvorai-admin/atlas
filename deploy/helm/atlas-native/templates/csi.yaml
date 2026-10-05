@@ -1,8 +1,8 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
 # SPDX-License-Identifier: Apache-2.0
 # CSI driver for atlas-native filesystems (docs/NATIVE_CSI.md): a controller Deployment with the
-# external-provisioner (and optionally external-snapshotter) sidecar, and a node DaemonSet that
-# publishes volumes through FUSE.
+# external-provisioner and external-resizer (and optionally external-snapshotter) sidecars, and a
+# node DaemonSet that publishes volumes through FUSE.
 {{- if .Values.csi.enabled }}
 {{- if .Values.httpTls.requireClientCert }}
 {{- fail "csi.enabled does not support httpTls.requireClientCert yet" }}
@@ -49,6 +49,12 @@ rules:
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
     verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims/status]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [events]
     verbs: [list, watch, create, update, patch]
@@ -142,6 +148,11 @@ spec:
         - name: csi-provisioner
           image: {{ .Values.csi.sidecars.provisioner }}
           args: [--csi-address=/csi/csi.sock, --leader-election, --timeout=30s, --extra-create-metadata]
+          volumeMounts: [{ name: socket-dir, mountPath: /csi }]
+          resources: {{- toYaml .Values.csi.sidecars.resources | nindent 12 }}
+        - name: csi-resizer
+          image: {{ .Values.csi.sidecars.resizer }}
+          args: [--csi-address=/csi/csi.sock, --leader-election, --timeout=30s]
           volumeMounts: [{ name: socket-dir, mountPath: /csi }]
           resources: {{- toYaml .Values.csi.sidecars.resources | nindent 12 }}
         {{- if .Values.csi.snapshots.enabled }}
@@ -274,10 +285,17 @@ metadata:
 provisioner: {{ $driver }}
 reclaimPolicy: {{ .Values.csi.storageClass.reclaimPolicy }}
 volumeBindingMode: Immediate
-allowVolumeExpansion: false
-{{- with .Values.csi.storageClass.extentBytes }}
+allowVolumeExpansion: true
+{{- /* StorageClass parameters are immutable: render only non-defaults, so upgrades still apply. */}}
+{{- $enforce := .Values.csi.storageClass.enforceCapacity }}
+{{- if or .Values.csi.storageClass.extentBytes (not $enforce) }}
 parameters:
+  {{- with .Values.csi.storageClass.extentBytes }}
   extentBytes: {{ . | int64 | quote }}
+  {{- end }}
+  {{- if not $enforce }}
+  enforceCapacity: "false"
+  {{- end }}
 {{- end }}
 {{- with .Values.csi.storageClass.mountOptions }}
 mountOptions: {{- toYaml . | nindent 2 }}

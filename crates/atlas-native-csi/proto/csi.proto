@@ -36,11 +36,14 @@ service Controller {
       returns (ControllerGetCapabilitiesResponse) {}
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
+  rpc ControllerExpandVolume(ControllerExpandVolumeRequest)
+      returns (ControllerExpandVolumeResponse) {}
 }
 
 service Node {
   rpc NodePublishVolume(NodePublishVolumeRequest) returns (NodePublishVolumeResponse) {}
   rpc NodeUnpublishVolume(NodeUnpublishVolumeRequest) returns (NodeUnpublishVolumeResponse) {}
+  rpc NodeGetVolumeStats(NodeGetVolumeStatsRequest) returns (NodeGetVolumeStatsResponse) {}
   rpc NodeGetCapabilities(NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
   rpc NodeGetInfo(NodeGetInfoRequest) returns (NodeGetInfoResponse) {}
 }
@@ -232,6 +235,18 @@ message DeleteSnapshotRequest {
 
 message DeleteSnapshotResponse {}
 
+message ControllerExpandVolumeRequest {
+  string volume_id = 1;
+  CapacityRange capacity_range = 2;
+  map<string, string> secrets = 3;
+  VolumeCapability volume_capability = 4;
+}
+
+message ControllerExpandVolumeResponse {
+  int64 capacity_bytes = 1;
+  bool node_expansion_required = 2;
+}
+
 message NodePublishVolumeRequest {
   string volume_id = 1;
   map<string, string> publish_context = 2;
@@ -252,6 +267,34 @@ message NodeUnpublishVolumeRequest {
 
 message NodeUnpublishVolumeResponse {}
 
+message NodeGetVolumeStatsRequest {
+  string volume_id = 1;
+  string volume_path = 2;
+  string staging_target_path = 3;
+}
+
+message NodeGetVolumeStatsResponse {
+  repeated VolumeUsage usage = 1;
+  VolumeCondition volume_condition = 2;
+}
+
+message VolumeUsage {
+  enum Unit {
+    UNKNOWN = 0;
+    BYTES = 1;
+    INODES = 2;
+  }
+  int64 available = 1;
+  int64 total = 2;
+  int64 used = 3;
+  Unit unit = 4;
+}
+
+message VolumeCondition {
+  bool abnormal = 1;
+  string message = 2;
+}
+
 message NodeGetCapabilitiesRequest {}
 
 message NodeGetCapabilitiesResponse {
@@ -265,6 +308,7 @@ message NodeServiceCapability {
       STAGE_UNSTAGE_VOLUME = 1;
       GET_VOLUME_STATS = 2;
       EXPAND_VOLUME = 3;
+      VOLUME_CONDITION = 4;
     }
     Type type = 1;
   }
