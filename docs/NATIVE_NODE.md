@@ -104,7 +104,7 @@ device it is on, so device order must not change once data is written.
 
 | `backend` | Access | Notes |
 | --- | --- | --- |
-| `file` (default) | Buffered I/O on a regular file, `fsync` per write | What every data node used before devices were configurable. |
+| `file` (default) | Buffered I/O on a regular file, `fsync` per write | What every data node used before devices were configurable. Appends only reserve their offset under a lock, so concurrent writes and their syncs overlap. |
 | `aligned` | `pread`/`pwrite` with `O_DSYNC` on 4 KiB-aligned buffers | Regular file or block device. Appends start on a 4 KiB boundary; unaligned overwrites read-modify-write the edge blocks. |
 | `io_uring` | `O_DIRECT` + `O_DSYNC` through `io_uring`, bypassing the page cache | Linux only, and only in builds with the `atlas-native/io-uring` feature (otherwise the node refuses to start). Same layout as `aligned`. |
 

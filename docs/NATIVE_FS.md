@@ -104,7 +104,8 @@ atlas-native-mount ... --fs <id> --snapshot <snapshot-id> /mnt/data-at-snap   # 
 ```
 
 Options: `--identity-file` (client certificate + key PEM), `--ttl-ms` (attribute and name cache,
-default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default 4 MiB, 0 disables),
+default 1000), `--writeback-bytes` (default 4 MiB), `--writeback-parallel` (full runs sent at once in
+the background, default 4; 0 sends them in the write call), `--readahead-bytes` (default 4 MiB, 0 disables),
 `--max-io-bytes` (largest request, default 8 MiB; keep at or below the nodes' `max_request_bytes`),
 `--retry-secs` (default 30), `--read-only`, `--allow-other`, `--fuse-threads` (kernel request
 workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the mount's
@@ -118,7 +119,12 @@ modes and ownership.
   entry already gone after such a failure counts as done.
 - **Write-back**: sequential writes to an open file are buffered per inode and sent when the buffer
   fills, on `fsync`/`flush`/close, and before a read, truncate or unlink of that file; `getattr`
-  already reports the buffered size. A failed send surfaces as an error from `fsync`/close.
+  already reports the buffered and in-flight size. Full runs go out in the background,
+  `--writeback-parallel` at a time, so a writer keeps filling the next run while earlier ones are
+  on the wire; runs of one file that overlap are sent in order. A full run is cut at a multiple
+  of `--writeback-bytes`, so a stream that started mid-extent is sent in aligned runs from then
+  on. A failed send fails the next write to that file and is reported once by
+  `fsync`/`flush`/close, as with NFS.
 - **Read-ahead**: a read that continues where the previous one ended fetches `--readahead-bytes`
   and serves following reads from it; random reads fetch only what was asked.
 - **Unlink while open**: removing a file another handle in the same mount still has open renames it
@@ -276,6 +282,35 @@ extent (1 MiB by default). On the lab hosts' shared disks the same runs are boun
 and other tenants' I/O (pressure 50–80%), so they are not a fair measure of either build.
 `crates/atlas-native/tests/datapath_bench.rs` (`--ignored`) measures the engine alone over
 localhost data nodes.
+
+Checkpoint fast path (large sequential writes, e.g. a training checkpoint):
+
+- A write covering whole extents of the file's grid (`--writeback-bytes` a multiple of the
+  filesystem's `extent_bytes`, which the defaults are) reads nothing back to merge, so the
+  leader places its data on the data nodes without the engine's write lock; only the commit is
+  serialized. Partial-extent writes still read, merge and rewrite under the lock.
+- Every placement draws free space from one shared view (the applied free list minus the ranges
+  of placements not yet committed), so concurrent writers never share space; a commit whose
+  outcome is unknown (a timeout, a lost leadership) keeps its ranges out of use for 5 minutes.
+- File-backed data-node devices reserve append space under a lock, then write and sync outside
+  it, so concurrent appends share the device instead of queueing behind each other's fsync.
+
+Measured 2026-10-05 (release builds; the engine benchmark is `checkpoint_throughput` in
+`tests/datapath_bench.rs`, 1 MiB extents, 3 replicas, 8 MiB writes; the client one is
+`checkpoint_bench` in `atlas-native-fuse/tests/ops.rs`, one file in 128 KiB writes):
+
+| | Before | After |
+| --- | --- | --- |
+| Engine, 8 writers, laptop SSD (macOS) | 76 MiB/s | 150 MiB/s |
+| One file through the client, laptop SSD | 11 MiB/s | 17 MiB/s |
+| Engine, 8 writers, lab host, data on tmpfs | 820 MiB/s | 746 MiB/s |
+| One file through the client, lab host, tmpfs | 226 MiB/s | 233 MiB/s |
+| Engine, 8 writers, lab host's shared HDD | 6 MiB/s | 4 MiB/s |
+
+The gain shows where per-write latency (fsync, network) dominates and the device takes
+concurrent writes. On the lab host's tmpfs the runs are CPU-bound on a shared 12-core host and
+on its HDD (other tenants at 20–40% I/O pressure) the differences are within run-to-run noise;
+neither is a measure of the NVMe target, which still needs the benchmark lab.
 
 Known limits:
 

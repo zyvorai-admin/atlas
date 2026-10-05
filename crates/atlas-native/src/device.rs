@@ -3,7 +3,6 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -53,13 +52,14 @@ impl BlockStore for FileDevice {
     }
 }
 
-/// Appends are serialized (they extend the file); reads and in-place writes use positional I/O
-/// on a second handle and run concurrently.
+/// Positional I/O on one file. An append only reserves its offset under a lock, then writes and
+/// syncs like an in-place write, so concurrent appends (and their syncs) overlap.
 #[derive(Debug)]
 pub struct FileDevice {
     id: DeviceId,
     path: PathBuf,
-    file: Mutex<File>,
+    /// End of the space handed out to appends, including ones still being written.
+    end: Mutex<u64>,
     positional: File,
 }
 
@@ -75,12 +75,12 @@ impl FileDevice {
             .read(true)
             .write(true)
             .open(&path)?;
-        let positional = file.try_clone()?;
+        let end = file.metadata()?.len();
         Ok(Self {
             id: DeviceId(Uuid::new_v4().to_string()),
             path,
-            file: Mutex::new(file),
-            positional,
+            end: Mutex::new(end),
+            positional: file,
         })
     }
 
@@ -92,13 +92,29 @@ impl FileDevice {
     }
 
     pub fn append(&self, data: &[u8]) -> Result<u64, NativeError> {
-        let mut f = self
-            .file
-            .lock()
-            .map_err(|_| NativeError::Poisoned("device"))?;
-        let off = f.seek(SeekFrom::End(0))?;
-        f.write_all(data)?;
-        f.sync_data()?;
+        let off = {
+            let mut end = self
+                .end
+                .lock()
+                .map_err(|_| NativeError::Poisoned("device"))?;
+            let off = *end;
+            *end += data.len() as u64;
+            off
+        };
+        let written = self
+            .positional
+            .write_all_at(data, off)
+            .and_then(|()| self.positional.sync_data());
+        if let Err(e) = written {
+            // Give the space back unless a later append already took the space after it; an
+            // unacknowledged append is referenced by nothing either way.
+            if let Ok(mut end) = self.end.lock() {
+                if *end == off + data.len() as u64 {
+                    *end = off;
+                }
+            }
+            return Err(e.into());
+        }
         Ok(off)
     }
 
@@ -128,5 +144,37 @@ impl FileDevice {
         let mut buf = vec![0u8; len];
         self.positional.read_exact_at(&mut buf, offset)?;
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_appends_get_disjoint_space() {
+        let td = tempfile::tempdir().unwrap();
+        let d = FileDevice::open(td.path().join("dev")).unwrap();
+        d.append(b"existing").unwrap();
+        let offsets: Vec<(u8, u64)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8u8)
+                .map(|i| {
+                    let d = &d;
+                    s.spawn(move || (i, d.append(&vec![i; 1000 + i as usize]).unwrap()))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (i, off) in &offsets {
+            assert!(*off >= 8);
+            let got = d.read_exact_at(*off, 1000 + *i as usize).unwrap();
+            assert!(got.iter().all(|b| b == i), "append {i} was overwritten");
+        }
+        let total: u64 = (0..8).map(|i| 1000 + i).sum::<u64>() + 8;
+        assert_eq!(d.len().unwrap(), total);
+        // A reopened device appends after everything.
+        drop(d);
+        let d = FileDevice::open(td.path().join("dev")).unwrap();
+        assert_eq!(d.append(b"x").unwrap(), total);
     }
 }

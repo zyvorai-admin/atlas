@@ -47,6 +47,10 @@ struct Args {
     /// Buffer up to this many bytes of sequential writes per file before sending them.
     #[arg(long, default_value_t = 4 << 20)]
     writeback_bytes: usize,
+    /// Full write-back runs sent at once in the background (0 sends them in the write call). A
+    /// failed one is reported by the next write to the file, fsync or close.
+    #[arg(long, default_value_t = 4)]
+    writeback_parallel: usize,
     /// Fetch at least this much per read and serve following reads from it (0 disables).
     #[arg(long, default_value_t = 4 << 20)]
     readahead_bytes: usize,
@@ -119,6 +123,7 @@ fn ops(args: &Args) -> Result<Ops, String> {
         OpsConfig {
             ttl: Duration::from_millis(args.ttl_ms),
             writeback_bytes: args.writeback_bytes,
+            writeback_parallel: args.writeback_parallel,
             readahead_bytes: args.readahead_bytes,
             max_io_bytes: args.max_io_bytes,
             direct_reads,

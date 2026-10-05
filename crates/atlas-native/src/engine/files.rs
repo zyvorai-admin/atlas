@@ -475,7 +475,9 @@ impl NativeEngine {
         let target = Target::File { fs, ino };
         if data.is_empty() {
             self.with_catalog(|c| target.extent_at(c, 0))??;
-        } else {
+        } else if !self.write_aligned(&target, offset, data, |c| {
+            target.extent_at(c, 0).map(|_| ())
+        })? {
             let _write = self
                 .write_lock
                 .lock()

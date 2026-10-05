@@ -17,20 +17,13 @@ use atlas_native::{
 
 const MIB: usize = 1 << 20;
 
-#[test]
-#[ignore]
-fn datapath_throughput() {
-    let total_mib: usize = std::env::var("BENCH_MIB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
-    let io = 8 * MIB;
-    let td = tempfile::tempdir().unwrap();
+/// An engine over three data nodes on localhost, with 1 MiB extents.
+fn engine(td: &std::path::Path) -> (Vec<DataNodeServer>, NativeEngine) {
     let servers: Vec<DataNodeServer> = (1..=3)
         .map(|i| {
             DataNodeServer::start(
                 format!("n{i}"),
-                td.path().join(format!("dn{i}")),
+                td.join(format!("dn{i}")),
                 TcpListener::bind("127.0.0.1:0").unwrap(),
             )
             .unwrap()
@@ -56,9 +49,26 @@ fn datapath_throughput() {
             )
         })
         .collect();
-    let mut cfg = EngineConfig::new(td.path().join("meta"));
+    let mut cfg = EngineConfig::new(td.join("meta"));
     cfg.extent_bytes = MIB;
     let e = NativeEngine::open_with(cfg, stores, MetaBackend::Local).unwrap();
+    (servers, e)
+}
+
+fn env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+#[test]
+#[ignore]
+fn datapath_throughput() {
+    let total_mib = env("BENCH_MIB", 256);
+    let io = 8 * MIB;
+    let td = tempfile::tempdir().unwrap();
+    let (_servers, e) = engine(td.path());
     let size = (total_mib * MIB) as u64;
     let v = e.create_volume("bench", size).unwrap();
     let buf: Vec<u8> = (0..io).map(|i| (i * 13 % 251) as u8).collect();
@@ -87,4 +97,45 @@ fn datapath_throughput() {
         mb / w.as_secs_f64(),
         mb / r.as_secs_f64()
     );
+}
+
+/// A checkpoint: `BENCH_WRITERS` ranks each stream their own shard in aligned 8 MiB writes.
+/// Aligned whole-extent writes place their data concurrently, so the total should scale with
+/// writers until the devices or the network saturate.
+/// `BENCH_WRITERS=8 cargo test --release -p atlas-native --test datapath_bench checkpoint -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn checkpoint_throughput() {
+    let shard_mib = env("BENCH_MIB", 128);
+    let io = 8 * MIB;
+    let td = tempfile::tempdir().unwrap();
+    let (_servers, e) = engine(td.path());
+    let buf: Vec<u8> = (0..io).map(|i| (i * 13 % 251) as u8).collect();
+    for writers in [1, env("BENCH_WRITERS", 8)] {
+        let vols: Vec<String> = (0..writers)
+            .map(|w| {
+                e.create_volume(format!("ckpt-{writers}-{w}"), (shard_mib * MIB) as u64)
+                    .unwrap()
+            })
+            .collect();
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            for v in &vols {
+                let (e, buf) = (&e, &buf);
+                s.spawn(move || {
+                    let mut off = 0u64;
+                    while off < (shard_mib * MIB) as u64 {
+                        e.write(v, off, buf).unwrap();
+                        off += io as u64;
+                    }
+                });
+            }
+        });
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "checkpoint: {writers} writer(s) x {shard_mib} MiB, 8 MiB I/Os, 1 MiB extents, \
+             3 replicas: {:.0} MiB/s",
+            (writers * shard_mib) as f64 / secs
+        );
+    }
 }

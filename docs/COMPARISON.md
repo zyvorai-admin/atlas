@@ -76,7 +76,8 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
    rebuild controller with incremental scrub, tiering of cold extents to S3, and snapshot
    export to (and import from) S3 are done.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;
-   MLPerf Storage results.
+   MLPerf Storage results. The checkpoint fast path (unserialized whole-extent writes,
+   background parallel write-back) is done; the rest is not.
 5. **Protocols:** NFS, SMB and S3 front ends over the same namespace; ACLs, quotas, `O_DIRECT`;
    an IO500 submission.
 
