@@ -20,10 +20,11 @@ use tonic::{Request, Response, Status};
 use crate::{
     mountinfo::is_mount_point,
     proto::{
-        node_server::Node, volume_capability, NodeGetCapabilitiesRequest,
-        NodeGetCapabilitiesResponse, NodeGetInfoRequest, NodeGetInfoResponse,
-        NodePublishVolumeRequest, NodePublishVolumeResponse, NodeUnpublishVolumeRequest,
-        NodeUnpublishVolumeResponse,
+        node_server::Node, node_service_capability, volume_capability, volume_usage,
+        NodeGetCapabilitiesRequest, NodeGetCapabilitiesResponse, NodeGetInfoRequest,
+        NodeGetInfoResponse, NodeGetVolumeStatsRequest, NodeGetVolumeStatsResponse,
+        NodePublishVolumeRequest, NodePublishVolumeResponse, NodeServiceCapability,
+        NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse, VolumeCondition, VolumeUsage,
     },
 };
 
@@ -265,6 +266,58 @@ fn unpublish(
     }
 }
 
+/// How long a stats request waits on a mount's `statfs` before reporting the volume abnormal.
+const STATS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bytes and inodes of the filesystem mounted at `path` (the FUSE client reports a quota as the
+/// size, so a capacity-enforced volume shows its PVC size).
+fn usage(path: &Path) -> std::io::Result<Vec<VolumeUsage>> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c` is NUL-terminated and outlives the call; `st` is written by statvfs.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let frsize = st.f_frsize as u64;
+    let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let (blocks, bfree, bavail) = (st.f_blocks as u64, st.f_bfree as u64, st.f_bavail as u64);
+    let (files, ffree, favail) = (st.f_files as u64, st.f_ffree as u64, st.f_favail as u64);
+    Ok(vec![
+        VolumeUsage {
+            available: n(bavail.saturating_mul(frsize)),
+            total: n(blocks.saturating_mul(frsize)),
+            used: n(blocks.saturating_sub(bfree).saturating_mul(frsize)),
+            unit: volume_usage::Unit::Bytes as i32,
+        },
+        VolumeUsage {
+            available: n(favail),
+            total: n(files),
+            used: n(files.saturating_sub(ffree)),
+            unit: volume_usage::Unit::Inodes as i32,
+        },
+    ])
+}
+
+fn node_rpc(t: node_service_capability::rpc::Type) -> NodeServiceCapability {
+    NodeServiceCapability {
+        r#type: Some(node_service_capability::Type::Rpc(
+            node_service_capability::Rpc { r#type: t as i32 },
+        )),
+    }
+}
+
+fn abnormal(message: String) -> NodeGetVolumeStatsResponse {
+    NodeGetVolumeStatsResponse {
+        usage: Vec::new(),
+        volume_condition: Some(VolumeCondition {
+            abnormal: true,
+            message,
+        }),
+    }
+}
+
 #[tonic::async_trait]
 impl Node for NodeService {
     async fn node_publish_volume(
@@ -321,9 +374,58 @@ impl Node for NodeService {
         &self,
         _: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
+        use node_service_capability::rpc::Type;
         Ok(Response::new(NodeGetCapabilitiesResponse {
-            capabilities: Vec::new(),
+            capabilities: vec![
+                node_rpc(Type::GetVolumeStats),
+                node_rpc(Type::VolumeCondition),
+            ],
         }))
+    }
+
+    async fn node_get_volume_stats(
+        &self,
+        req: Request<NodeGetVolumeStatsRequest>,
+    ) -> Result<Response<NodeGetVolumeStatsResponse>, Status> {
+        let r = req.into_inner();
+        if r.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id is required"));
+        }
+        if r.volume_path.is_empty() {
+            return Err(Status::invalid_argument("volume_path is required"));
+        }
+        let (id, path) = (r.volume_id, PathBuf::from(r.volume_path));
+        // Even finding out whether it is mounted touches the mount, which can hang.
+        let probe = tokio::task::spawn_blocking(move || {
+            match state(&path)? {
+            State::Absent => Err(Status::not_found(format!(
+                "volume {id} is not mounted at {}",
+                path.display()
+            ))),
+            State::Broken => Ok(Err(
+                "the volume's FUSE client is gone (plugin restarted?); restart the pod to remount it"
+                    .to_string(),
+            )),
+            State::Healthy => Ok(usage(&path).map_err(|e| format!("statfs: {e}"))),
+        }
+        });
+        let resp = match tokio::time::timeout(STATS_TIMEOUT, probe).await {
+            Err(_) => abnormal(format!(
+                "the mount did not answer within {STATS_TIMEOUT:?}; the cluster may be unreachable"
+            )),
+            Ok(Err(e)) => return Err(Status::internal(format!("stats task: {e}"))),
+            Ok(Ok(probed)) => match probed? {
+                Ok(usage) => NodeGetVolumeStatsResponse {
+                    usage,
+                    volume_condition: Some(VolumeCondition {
+                        abnormal: false,
+                        message: String::new(),
+                    }),
+                },
+                Err(message) => abnormal(message),
+            },
+        };
+        Ok(Response::new(resp))
     }
 
     async fn node_get_info(
@@ -353,5 +455,16 @@ mod tests {
         assert!(f(&["writeback-parallel=-1"]).is_err());
         assert!(f(&["writeback-parallel="]).is_err());
         assert!(f(&["noatime"]).is_err());
+    }
+
+    #[test]
+    fn usage_reads_bytes_and_inodes_of_a_mount() {
+        let td = tempfile::tempdir().unwrap();
+        let u = usage(td.path()).unwrap();
+        assert_eq!(u.len(), 2);
+        assert_eq!(u[0].unit, volume_usage::Unit::Bytes as i32);
+        assert!(u[0].total > 0 && u[0].used <= u[0].total && u[0].available <= u[0].total);
+        assert_eq!(u[1].unit, volume_usage::Unit::Inodes as i32);
+        assert!(usage(&td.path().join("missing")).is_err());
     }
 }

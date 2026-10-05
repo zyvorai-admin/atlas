@@ -13,13 +13,12 @@ name: `native.atlas.zyvor.ai`.
 | PVC with a VolumeSnapshot `dataSource` | clone of the snapshot (`POST /v1/fs-snapshots/{id}/clone`) |
 | PVC with a PVC `dataSource` | clone of a transient snapshot of the source, deleted once the clone exists |
 | Pod mount | one `atlas-native-mount` FUSE process on the pod's volume path |
+| PVC size | the filesystem's byte quota (`PUT /v1/fs/{fs}/quota`); expanding the PVC raises it |
 
 Every access mode works (ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod): each
 pod's mount is its own client of a shared filesystem, and cross-mount consistency is the
-filesystem's (`NATIVE_FS.md`, "Consistency"). Not supported: block volumes, volume expansion,
-capacity limits (the PVC's requested size is reported back unchanged and nothing enforces it;
-filesystems support quotas, `NATIVE_FS.md` "Quotas", but the driver doesn't set one yet),
-topology, and volume stats.
+filesystem's (`NATIVE_FS.md`, "Consistency"). Not supported: block volumes, shrinking a volume,
+inode limits from the CSI side, and topology.
 
 ## Install
 
@@ -32,8 +31,8 @@ helm upgrade --install native deploy/helm/atlas-native \
 ```
 
 This adds the `CSIDriver` object (`attachRequired: false`, `fsGroupPolicy: File`), a controller
-Deployment (atlas-native-csi with the external-provisioner and, with snapshots enabled, the
-external-snapshotter sidecar, leader-elected), a node DaemonSet (atlas-native-csi plus the
+Deployment (atlas-native-csi with the external-provisioner, external-resizer and, with snapshots
+enabled, external-snapshotter sidecars, leader-elected), a node DaemonSet (atlas-native-csi plus the
 node-driver-registrar), the StorageClass `atlas-native-fs`, and the VolumeSnapshotClass
 `atlas-native-fs`. Both plugins reach the storage nodes through their per-pod DNS names with the
 release's API token Secret; with `httpTls.enabled` they trust the Secret's `ca.crt` (only that key
@@ -57,12 +56,29 @@ spec:
 | Field | Effect |
 |---|---|
 | `parameters.extentBytes` (`csi.storageClass.extentBytes`) | Extent grid of new filesystems in bytes (default: the cluster's `extent_bytes`) |
+| `parameters.enforceCapacity` (`csi.storageClass.enforceCapacity`) | `"true"` (default): the PVC's size is the filesystem's byte quota. `"false"`: the filesystem is thin and the size is only reported |
+| `allowVolumeExpansion` | `true` in the chart's StorageClass |
 | `mountOptions` (`csi.storageClass.mountOptions`) | `atlas-native-mount` flags: `ro`, `cache-leases`, `direct-reads`, and `<flag>=<n>` for `ttl-ms`, `writeback-bytes`, `writeback-parallel`, `readahead-bytes`, `max-io-bytes`, `fuse-threads`, `session-ttl-ms`, `retry-secs` |
 
 Any other parameter or mount option is refused (InvalidArgument), so a StorageClass can't point a
 mount at another endpoint or credential.
 
 ## Behaviour
+
+- **Capacity.** With `enforceCapacity` on, CreateVolume sets the filesystem's byte quota to the
+  requested size (`required_bytes`, else `limit_bytes`; no request, no quota). Writes past it fail
+  with `EDQUOT` in the pod (`NATIVE_FS.md`, "Quotas", including how write-back delays the error
+  to `fsync`/`close`), and `df` in the pod shows the PVC's size. A clone made from a snapshot or a
+  PVC gets the byte limit of its own request, not the source's.
+- **Expansion** (ControllerExpandVolume, `ONLINE`): raises the byte quota to the new size and
+  never lowers it. No node step is needed: mounted pods see the new size at once. A volume without
+  a byte quota (`enforceCapacity: "false"`, or created before this driver set quotas) stays thin;
+  expansion only reports the new size, so enforcing an existing volume means setting its quota
+  through the API.
+- **Volume stats** (NodeGetVolumeStats, with volume condition): bytes and inodes from `statfs` on
+  the pod's mount, so kubelet's `kubelet_volume_stats_*` show the quota as capacity. A mount whose
+  FUSE process is gone, or that doesn't answer within 10 s, is reported abnormal instead of
+  failing the call.
 
 - **Idempotent creates.** The volume id is the CSI name when it is a valid atlas-native id of at
   most 48 characters (the provisioner's `pvc-<uuid>` and `snapshot-<uuid>`), else `csi-` plus 40
@@ -92,7 +108,10 @@ mount at another endpoint or credential.
 cluster (idempotent create, hashed names, block refused, snapshot create retry with a stable
 creation time, AlreadyExists across volumes, snapshot and volume clones checked through the FUSE
 operations layer, NotFound sources, validate, idempotent deletes, clones outliving their sources),
-the node service's validation, mount-option whitelisting, and mountinfo parsing.
+the node service's validation, mount-option whitelisting, and mountinfo parsing. Capacity: the
+PVC size becoming the quota, expansion raising it and never lowering it, `enforceCapacity: "false"`
+staying thin, a snapshot clone getting its own size, NotFound on a missing volume, and `EDQUOT`
+on a 64 KiB volume until it is expanded. `statvfs` mapping and node capabilities.
 
 Live on the lab's single-node k3s (v1.36, Ubuntu 26.04, chart with `replicas=1`, local-path
 state PVC), 2026-10-05:
@@ -110,6 +129,15 @@ state PVC), 2026-10-05:
   volume.
 - Deleting the pods left no FUSE mounts or mount processes on the host; deleting the
   VolumeSnapshot and PVCs left `GET /v1/fs` and `GET /v1/fs-snapshots` empty.
+
+Capacity and expansion, same lab, 2026-10-05 (StorageClass with `extentBytes: 65536`):
+
+- A 1Mi PVC: `df` in the pod showed 1024 KiB. 768 KiB written with `dd conv=fsync` succeeded; a
+  further 512 KiB failed with `Disk quota exceeded`, and usage stayed at 768 KiB.
+- Patching the PVC to 4Mi: the external-resizer reported `VolumeResizeSuccessful`, the PVC and PV
+  showed 4Mi, and `df` in the same running pod showed 4096 KiB; the 512 KiB write then succeeded.
+- The kubelet stats summary showed the volume's `capacityBytes` as 4194304 with its used bytes
+  and inodes from NodeGetVolumeStats.
 
 Not yet verified: multi-node clusters (pods on different nodes sharing an RWX volume), HTTPS
 endpoints, and throughput through the CSI mount (it is the same `atlas-native-mount` measured in

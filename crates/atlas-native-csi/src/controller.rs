@@ -4,6 +4,8 @@
 //! The CSI controller service: a volume is an atlas-native filesystem, a snapshot a filesystem
 //! snapshot. Ids are derived from the CSI names, so a retried create lands on the object the
 //! first attempt made (the cluster treats a create with an existing id and the same name as done).
+//! A volume's capacity is its filesystem's byte quota (unless the StorageClass sets
+//! `enforceCapacity: "false"`), so expanding a PVC raises the quota and needs no node step.
 
 use std::sync::Arc;
 
@@ -14,7 +16,8 @@ use tonic::{Request, Response, Status};
 
 use crate::proto::{
     controller_server::Controller, controller_service_capability,
-    validate_volume_capabilities_response, volume_capability, volume_content_source,
+    validate_volume_capabilities_response, volume_capability, volume_content_source, CapacityRange,
+    ControllerExpandVolumeRequest, ControllerExpandVolumeResponse,
     ControllerGetCapabilitiesRequest, ControllerGetCapabilitiesResponse,
     ControllerServiceCapability, CreateSnapshotRequest, CreateSnapshotResponse,
     CreateVolumeRequest, CreateVolumeResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
@@ -25,6 +28,9 @@ use crate::proto::{
 
 /// StorageClass parameter: the filesystem's extent grid in bytes.
 pub const PARAM_EXTENT_BYTES: &str = "extentBytes";
+/// StorageClass parameter: `"false"` leaves the filesystem without a byte quota (thin, as
+/// before quotas existed); the default enforces the PVC's size.
+pub const PARAM_ENFORCE_CAPACITY: &str = "enforceCapacity";
 
 pub struct ControllerService {
     client: Arc<Client>,
@@ -56,6 +62,38 @@ impl ControllerService {
         self.call(Method::POST, path, Some(body), Retry::Idempotent)
             .await
             .map(drop)
+    }
+
+    /// Sets the byte limit of filesystem `id`'s quota, keeping any inode limit; `None` clears it.
+    async fn set_max_bytes(&self, id: &str, max_bytes: Option<u64>) -> Result<(), ClientError> {
+        let path = format!("/v1/fs/{}/quota", encode(id));
+        let mut quota = self.quota(id).await?;
+        if quota["max_bytes"].as_u64() == max_bytes {
+            return Ok(());
+        }
+        match max_bytes {
+            Some(n) => quota["max_bytes"] = n.into(),
+            None => {
+                quota.as_object_mut().map(|o| o.remove("max_bytes"));
+            }
+        }
+        self.call(Method::PUT, path, Some(quota), Retry::Idempotent)
+            .await
+            .map(drop)
+    }
+
+    /// Filesystem `id`'s quota as the cluster returns it (`{}` without one).
+    async fn quota(&self, id: &str) -> Result<Value, ClientError> {
+        let body = self
+            .call(
+                Method::GET,
+                format!("/v1/fs/{}/quota", encode(id)),
+                None,
+                Retry::Idempotent,
+            )
+            .await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| ClientError::Transport(format!("quota response: {e}")))
     }
 
     /// Deletes `path`; a missing object counts as deleted.
@@ -120,14 +158,54 @@ fn unsupported(caps: &[VolumeCapability]) -> Option<String> {
     })
 }
 
-fn extent_bytes(params: &std::collections::HashMap<String, String>) -> Result<Option<u64>, Status> {
+type Params = std::collections::HashMap<String, String>;
+
+fn check_params(params: &Params) -> Result<(), Status> {
     for k in params.keys() {
-        if k != PARAM_EXTENT_BYTES && !k.starts_with("csi.storage.k8s.io/") {
+        if k != PARAM_EXTENT_BYTES
+            && k != PARAM_ENFORCE_CAPACITY
+            && !k.starts_with("csi.storage.k8s.io/")
+        {
             return Err(Status::invalid_argument(format!(
-                "unknown parameter {k:?} (supported: {PARAM_EXTENT_BYTES})"
+                "unknown parameter {k:?} (supported: {PARAM_EXTENT_BYTES}, {PARAM_ENFORCE_CAPACITY})"
             )));
         }
     }
+    Ok(())
+}
+
+fn enforce_capacity(params: &Params) -> Result<bool, Status> {
+    match params.get(PARAM_ENFORCE_CAPACITY).map(String::as_str) {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(v) => Err(Status::invalid_argument(format!(
+            "{PARAM_ENFORCE_CAPACITY} must be \"true\" or \"false\", got {v:?}"
+        ))),
+    }
+}
+
+/// The capacity a range asks for: `required_bytes`, else `limit_bytes`, else 0 (unspecified).
+fn requested(range: Option<&CapacityRange>) -> Result<u64, Status> {
+    let Some(r) = range else { return Ok(0) };
+    if r.required_bytes < 0 || r.limit_bytes < 0 {
+        return Err(Status::invalid_argument(
+            "capacity_range must not be negative",
+        ));
+    }
+    if r.limit_bytes > 0 && r.required_bytes > r.limit_bytes {
+        return Err(Status::out_of_range(format!(
+            "required_bytes {} exceeds limit_bytes {}",
+            r.required_bytes, r.limit_bytes
+        )));
+    }
+    Ok(if r.required_bytes > 0 {
+        r.required_bytes
+    } else {
+        r.limit_bytes
+    } as u64)
+}
+
+fn extent_bytes(params: &Params) -> Result<Option<u64>, Status> {
     params
         .get(PARAM_EXTENT_BYTES)
         .map(|v| match v.parse::<u64>() {
@@ -163,7 +241,10 @@ impl Controller for ControllerService {
         if let Some(why) = unsupported(&r.volume_capabilities) {
             return Err(Status::invalid_argument(why));
         }
+        check_params(&r.parameters)?;
         let extent = extent_bytes(&r.parameters)?;
+        let enforce = enforce_capacity(&r.parameters)?;
+        let capacity = requested(r.capacity_range.as_ref())?;
         let id = object_id(&r.name);
         let source = r
             .volume_content_source
@@ -213,17 +294,12 @@ impl Controller for ControllerService {
                     .map_err(status)?;
             }
         }
-        // Filesystems are thin and unquotaed: the requested capacity is reported back as is.
-        let capacity_bytes = r.capacity_range.map_or(0, |c| {
-            if c.required_bytes > 0 {
-                c.required_bytes
-            } else {
-                c.limit_bytes.max(0)
-            }
-        });
+        // A clone inherits its source's quota; replace the byte limit with this volume's own.
+        let max_bytes = (enforce && capacity > 0).then_some(capacity);
+        self.set_max_bytes(&id, max_bytes).await.map_err(status)?;
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
-                capacity_bytes,
+                capacity_bytes: capacity as i64,
                 volume_id: id,
                 volume_context: Default::default(),
                 content_source: r.volume_content_source,
@@ -294,6 +370,7 @@ impl Controller for ControllerService {
                 rpc(Type::CreateDeleteVolume),
                 rpc(Type::CreateDeleteSnapshot),
                 rpc(Type::CloneVolume),
+                rpc(Type::ExpandVolume),
             ],
         }))
     }
@@ -366,6 +443,47 @@ impl Controller for ControllerService {
         }
         Ok(Response::new(DeleteSnapshotResponse {}))
     }
+
+    /// Raises the byte quota to the new size; never lowers it. A volume without a byte quota
+    /// (`enforceCapacity: "false"`, or made before quotas) stays thin and reports the new size.
+    async fn controller_expand_volume(
+        &self,
+        req: Request<ControllerExpandVolumeRequest>,
+    ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
+        let r = req.into_inner();
+        if r.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id is required"));
+        }
+        if !valid_id(&r.volume_id) {
+            return Err(Status::not_found(format!("volume {}", r.volume_id)));
+        }
+        let want = requested(r.capacity_range.as_ref())?;
+        if want == 0 {
+            return Err(Status::invalid_argument("capacity_range is required"));
+        }
+        if let Some(why) = r
+            .volume_capability
+            .as_ref()
+            .and_then(|c| unsupported(std::slice::from_ref(c)))
+        {
+            return Err(Status::invalid_argument(why));
+        }
+        let quota = self.quota(&r.volume_id).await.map_err(status)?;
+        let capacity = match quota["max_bytes"].as_u64() {
+            None => want,
+            Some(cur) if cur >= want => cur,
+            Some(_) => {
+                self.set_max_bytes(&r.volume_id, Some(want))
+                    .await
+                    .map_err(status)?;
+                want
+            }
+        };
+        Ok(Response::new(ControllerExpandVolumeResponse {
+            capacity_bytes: capacity as i64,
+            node_expansion_required: false,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +520,29 @@ mod tests {
         assert!(extent_bytes(&p).is_err());
         p.remove(PARAM_EXTENT_BYTES);
         p.insert("replicas".into(), "3".into());
-        assert!(extent_bytes(&p).is_err());
+        assert!(check_params(&p).is_err());
+        p.remove("replicas");
+        p.insert(PARAM_ENFORCE_CAPACITY.into(), "false".into());
+        assert!(check_params(&p).is_ok());
+        assert!(!enforce_capacity(&p).unwrap());
+        p.insert(PARAM_ENFORCE_CAPACITY.into(), "no".into());
+        assert!(enforce_capacity(&p).is_err());
+        assert!(enforce_capacity(&Params::new()).unwrap());
+    }
+
+    #[test]
+    fn capacity_ranges() {
+        let r = |required_bytes, limit_bytes| {
+            requested(Some(&CapacityRange {
+                required_bytes,
+                limit_bytes,
+            }))
+        };
+        assert_eq!(requested(None).unwrap(), 0);
+        assert_eq!(r(10, 0).unwrap(), 10);
+        assert_eq!(r(0, 20).unwrap(), 20);
+        assert_eq!(r(10, 20).unwrap(), 10);
+        assert_eq!(r(30, 20).unwrap_err().code(), tonic::Code::OutOfRange);
+        assert_eq!(r(-1, 0).unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 }

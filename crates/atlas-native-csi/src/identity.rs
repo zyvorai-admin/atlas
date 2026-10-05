@@ -37,13 +37,23 @@ impl Identity for IdentityService {
         _: Request<GetPluginCapabilitiesRequest>,
     ) -> Result<Response<GetPluginCapabilitiesResponse>, Status> {
         let capabilities = if self.controller {
-            vec![PluginCapability {
-                r#type: Some(plugin_capability::Type::Service(
-                    plugin_capability::Service {
-                        r#type: plugin_capability::service::Type::ControllerService as i32,
-                    },
-                )),
-            }]
+            vec![
+                PluginCapability {
+                    r#type: Some(plugin_capability::Type::Service(
+                        plugin_capability::Service {
+                            r#type: plugin_capability::service::Type::ControllerService as i32,
+                        },
+                    )),
+                },
+                // Expansion raises the filesystem's quota, which mounted pods see at once.
+                PluginCapability {
+                    r#type: Some(plugin_capability::Type::VolumeExpansion(
+                        plugin_capability::VolumeExpansion {
+                            r#type: plugin_capability::volume_expansion::Type::Online as i32,
+                        },
+                    )),
+                },
+            ]
         } else {
             Vec::new()
         };
