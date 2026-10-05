@@ -34,11 +34,13 @@ use crate::{
 
 mod files;
 mod leases;
+mod rebuild;
 pub use files::{
     Attr, DirEntry, FileLayout, FsInfo, FsSnapshotInfo, FsStat, LayoutEc, LayoutExtent,
     LayoutReplica, NewNode,
 };
 pub use leases::{now_ms, LockRequest, LockTable};
+pub use rebuild::Degraded;
 
 /// Extents fetched concurrently by one read.
 const READ_PARALLELISM: usize = 8;
@@ -206,6 +208,8 @@ impl std::fmt::Debug for Meta {
 struct NodeHealth {
     failures: AtomicU64,
     down_until: Mutex<Option<Instant>>,
+    /// First failure since the node last answered; what the rebuild controller ages.
+    down_since: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug)]
@@ -251,6 +255,21 @@ pub struct RepairStats {
     pub unrecoverable: u64,
     /// Bad replicas left for a later pass: no eligible target, or the extent changed meanwhile.
     pub deferred: u64,
+    /// Bytes read from data nodes to check and rebuild extents.
+    pub bytes_read: u64,
+    /// Bytes written to data nodes as replacement replicas or shards.
+    pub bytes_written: u64,
+}
+
+impl RepairStats {
+    pub fn add(&mut self, o: &RepairStats) {
+        self.extents_checked += o.extents_checked;
+        self.replicas_repaired += o.replicas_repaired;
+        self.unrecoverable += o.unrecoverable;
+        self.deferred += o.deferred;
+        self.bytes_read += o.bytes_read;
+        self.bytes_written += o.bytes_written;
+    }
 }
 
 #[derive(Debug)]
@@ -261,6 +280,8 @@ pub struct NativeEngine {
     /// Serializes free-list allocation through data write and `InstallExtent` commit, so two
     /// writers can never be handed the same free range.
     write_lock: Mutex<()>,
+    /// One repair at a time, so two never write replacements for the same part.
+    repair_lock: Mutex<()>,
     pub telemetry: NativeIoCounters,
 }
 
@@ -330,6 +351,7 @@ impl NativeEngine {
             nodes: runtimes,
             meta,
             write_lock: Mutex::new(()),
+            repair_lock: Mutex::new(()),
             telemetry: NativeIoCounters::default(),
         };
         if let Meta::Local { catalog, store, .. } = &engine.meta {
@@ -832,82 +854,102 @@ impl NativeEngine {
 
     /// Scrubs every extent (reads each replica and verifies its checksum) and re-replicates
     /// replicas that are unreachable or corrupt onto healthy nodes, preserving host diversity.
-    /// Under Raft only the leader's engine can repair.
+    /// Under Raft only the leader's engine can repair. Writers are held off only while a
+    /// replacement is placed and committed, not for the whole scan.
     pub fn repair_once(&self) -> Result<RepairStats, NativeError> {
-        let _write = self
-            .write_lock
+        let fence = self.write_fence()?;
+        let _repair = self
+            .repair_lock
             .lock()
-            .map_err(|_| NativeError::Poisoned("write"))?;
-        let fence = match &self.meta {
-            Meta::Local { .. } => 0,
-            Meta::Raft { server, timeout } => server.leader_ready(*timeout)?,
-        };
-        let extents: Vec<ExtentRef> =
-            self.with_catalog(|c| c.extents.values().map(|e| e.extent.clone()).collect())?;
+            .map_err(|_| NativeError::Poisoned("repair"))?;
+        let ids: Vec<String> = self.with_catalog(|c| c.extents.keys().cloned().collect())?;
         let mut st = RepairStats::default();
-        for ext in extents {
-            st.extents_checked += 1;
-            if let Some(ec) = &ext.ec {
-                let shards: Vec<Option<Vec<u8>>> = (0..ec.shards())
-                    .map(|i| self.read_shard(&ext, ec, i))
-                    .collect();
-                let bad: Vec<usize> = (0..shards.len()).filter(|i| shards[*i].is_none()).collect();
-                if bad.is_empty() {
-                    continue;
-                }
-                let Ok(all) = ec.rebuild(shards) else {
-                    st.unrecoverable += 1;
-                    continue;
-                };
-                let bad = bad
-                    .into_iter()
-                    .map(|i| (ext.replicas[i].clone(), all[i].as_slice()))
-                    .collect();
-                self.replace_replicas(&ext, bad, fence, &mut st)?;
-                continue;
-            }
-            let mut good: Option<Vec<u8>> = None;
-            let mut bad = Vec::new();
-            for r in &ext.replicas {
-                let Some((node, device)) = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.spec.id == r.node_id && n.spec.healthy)
-                    .and_then(|n| n.devices.get(r.device_index).map(|d| (n, d)))
-                else {
-                    bad.push(r.clone());
-                    continue;
-                };
-                match device.read_exact_at(r.offset, ext.len) {
-                    Ok(buf) if checksum::verify(&buf, &ext.checksum) => {
-                        self.mark_up(node);
-                        good.get_or_insert(buf);
-                    }
-                    Ok(_) => {
-                        self.telemetry.checksum_failure();
-                        bad.push(r.clone());
-                    }
-                    Err(_) => {
-                        self.mark_down(node);
-                        bad.push(r.clone());
-                    }
-                }
-            }
-            if bad.is_empty() {
-                continue;
-            }
-            let Some(data) = good else {
-                st.unrecoverable += 1;
-                continue;
-            };
-            let bad = bad.into_iter().map(|r| (r, data.as_slice())).collect();
-            self.replace_replicas(&ext, bad, fence, &mut st)?;
+        for id in ids {
+            self.repair_extent_with(&id, &BTreeSet::new(), fence, &mut st)?;
         }
         Ok(st)
     }
 
+    /// Checks one extent and rebuilds its bad parts. Parts on `lost` nodes count as bad without
+    /// being read. An extent that no longer exists is skipped.
+    fn repair_extent_with(
+        &self,
+        id: &str,
+        lost: &BTreeSet<String>,
+        fence: u64,
+        st: &mut RepairStats,
+    ) -> Result<(), NativeError> {
+        let Some(ext) = self.with_catalog(|c| c.extents.get(id).map(|e| e.extent.clone()))? else {
+            return Ok(());
+        };
+        st.extents_checked += 1;
+        if let Some(ec) = &ext.ec {
+            let shards: Vec<Option<Vec<u8>>> = (0..ec.shards())
+                .map(|i| {
+                    if lost.contains(&ext.replicas[i].node_id) {
+                        return None;
+                    }
+                    let shard = self.read_shard(&ext, ec, i);
+                    st.bytes_read += shard.as_ref().map_or(0, |b| b.len() as u64);
+                    shard
+                })
+                .collect();
+            let bad: Vec<usize> = (0..shards.len()).filter(|i| shards[*i].is_none()).collect();
+            if bad.is_empty() {
+                return Ok(());
+            }
+            let Ok(all) = ec.rebuild(shards) else {
+                st.unrecoverable += 1;
+                return Ok(());
+            };
+            let bad = bad
+                .into_iter()
+                .map(|i| (ext.replicas[i].clone(), all[i].as_slice()))
+                .collect();
+            return self.replace_replicas(&ext, bad, fence, st);
+        }
+        let mut good: Option<Vec<u8>> = None;
+        let mut bad = Vec::new();
+        for r in &ext.replicas {
+            let Some((node, device)) = self
+                .nodes
+                .iter()
+                .find(|n| n.spec.id == r.node_id && n.spec.healthy && !lost.contains(&n.spec.id))
+                .and_then(|n| n.devices.get(r.device_index).map(|d| (n, d)))
+            else {
+                bad.push(r.clone());
+                continue;
+            };
+            match device.read_exact_at(r.offset, ext.len) {
+                Ok(buf) if checksum::verify(&buf, &ext.checksum) => {
+                    st.bytes_read += buf.len() as u64;
+                    self.mark_up(node);
+                    good.get_or_insert(buf);
+                }
+                Ok(_) => {
+                    self.telemetry.checksum_failure();
+                    bad.push(r.clone());
+                }
+                Err(_) => {
+                    self.mark_down(node);
+                    bad.push(r.clone());
+                }
+            }
+        }
+        if bad.is_empty() {
+            return Ok(());
+        }
+        let Some(data) = good else {
+            st.unrecoverable += 1;
+            return Ok(());
+        };
+        let bad = bad.into_iter().map(|r| (r, data.as_slice())).collect();
+        self.replace_replicas(&ext, bad, fence, st)
+    }
+
     /// Writes each bad replica's (or shard's) bytes to a new node that holds no other part of
     /// the extent, then commits the move. Stops at the first commit the extent's state rejects.
+    /// Holds `write_lock`, and does nothing if the extent changed since it was read.
     fn replace_replicas(
         &self,
         ext: &ExtentRef,
@@ -915,6 +957,19 @@ impl NativeEngine {
         fence: u64,
         st: &mut RepairStats,
     ) -> Result<(), NativeError> {
+        let _write = self
+            .write_lock
+            .lock()
+            .map_err(|_| NativeError::Poisoned("write"))?;
+        let unchanged = self.with_catalog(|c| {
+            c.extents
+                .get(&ext.id)
+                .is_some_and(|e| e.extent.replicas == ext.replicas)
+        })?;
+        if !unchanged {
+            st.deferred += 1;
+            return Ok(());
+        }
         let mut current = ext.replicas.clone();
         for (old, data) in bad {
             let others: Vec<&ReplicaRef> = current.iter().filter(|r| **r != old).collect();
@@ -949,6 +1004,7 @@ impl NativeEngine {
             match self.commit(cmd, Some(fence)) {
                 Ok(()) => {
                     st.replicas_repaired += 1;
+                    st.bytes_written += data.len() as u64;
                     self.telemetry.replica_repaired();
                     if let Some(slot) = current.iter_mut().find(|r| **r == old) {
                         *slot = new;
@@ -1234,13 +1290,20 @@ impl NativeEngine {
 
     fn mark_down(&self, n: &NodeRuntime) {
         n.health.failures.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
         if let Ok(mut d) = n.health.down_until.lock() {
-            *d = Some(Instant::now() + self.cfg.node_retry_after);
+            *d = Some(now + self.cfg.node_retry_after);
+        }
+        if let Ok(mut d) = n.health.down_since.lock() {
+            d.get_or_insert(now);
         }
     }
 
     fn mark_up(&self, n: &NodeRuntime) {
         if let Ok(mut d) = n.health.down_until.lock() {
+            *d = None;
+        }
+        if let Ok(mut d) = n.health.down_since.lock() {
             *d = None;
         }
     }

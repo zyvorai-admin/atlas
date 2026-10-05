@@ -72,8 +72,8 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
    across Raft groups, client sessions hold cross-mount file locks, and cache leases let mounts
    cache metadata without serving it stale. Filesystem snapshot trees are still held in memory.
 3. **Efficiency:** erasure coding with a rebuild controller; cold extents tiered to S3.
-   Reed-Solomon k+m extents are done (4+2 stores 1.5× the data instead of 3×); the rebuild
-   controller and S3 tiering are not.
+   Reed-Solomon k+m extents (4+2 stores 1.5× the data instead of 3×) and a prioritised, paced
+   rebuild controller with incremental scrub are done; S3 tiering is not.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;
    MLPerf Storage results.
 5. **Protocols:** NFS, SMB and S3 front ends over the same namespace; ACLs, quotas, `O_DIRECT`;

@@ -18,7 +18,8 @@ kubectl -n atlas-native get secret atlas-native-api -o jsonpath='{.data.token}' 
 | `replicas` | 3 | Pods = data nodes = Raft members. Scale with the procedure below. |
 | `membership.bootstrapReplicas` | 0 | Initial voters (pods `0..N-1`). 0: kept from the existing release, else `replicas` on first install. |
 | `node.replicationFactor` | 3 | Copies per extent, at most `replicas`. |
-| `node.extentBytes`, `node.maxRequestBytes`, `node.tickMs`, `node.proposalTimeoutMs`, `node.repairIntervalSecs`, `node.gcIntervalSecs` | see `values.yaml` | Map to the node config fields of the same name. |
+| `node.erasure` | empty | Reed-Solomon scheme such as `4+2` for extents of at least `node.erasureMinBytes`; data + parity must not exceed `replicas`. Empty replicates every extent. |
+| `node.extentBytes`, `node.maxRequestBytes`, `node.tickMs`, `node.proposalTimeoutMs`, `node.erasureMinBytes`, `node.repairIntervalSecs`, `node.rebuildDelaySecs`, `node.rebuildBytesPerSec`, `node.scrubBytesPerSec`, `node.gcIntervalSecs` | see `values.yaml` | Map to the node config fields of the same name. |
 | `apiToken.existingSecret` | empty | Secret with key `token`; otherwise the chart creates `<fullname>-api` with a random token kept across upgrades (and on uninstall). |
 | `tls.enabled` | false | Mutual TLS for Raft and data-node traffic. The certificate must carry every pod name as a DNS SAN. |
 | `tls.existingSecret` / `tls.certManager.*` | empty / off | `ca.crt`, `tls.crt`, `tls.key`; or let cert-manager issue `<fullname>-tls` from `issuerRef` with the right SANs. |

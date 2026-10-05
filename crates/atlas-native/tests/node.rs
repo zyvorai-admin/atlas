@@ -70,6 +70,17 @@ impl Cluster {
 
     /// [`Self::start`] with the namespace sharded across `groups` Raft groups.
     fn start_groups(meta: usize, data: usize, repair_interval_secs: u64, groups: u32) -> Self {
+        Self::start_full(meta, data, repair_interval_secs, groups, 60)
+    }
+
+    /// [`Self::start_groups`] with the rebuild controller's delay.
+    fn start_full(
+        meta: usize,
+        data: usize,
+        repair_interval_secs: u64,
+        groups: u32,
+        rebuild_delay_secs: u64,
+    ) -> Self {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("token"), format!("{TOKEN}\n")).unwrap();
         let data_l: BTreeMap<String, TcpListener> =
@@ -142,6 +153,9 @@ impl Cluster {
                 replicas: 3,
                 erasure: None,
                 erasure_min_bytes: 64 << 10,
+                rebuild_delay_secs,
+                rebuild_bytes_per_sec: 0,
+                scrub_bytes_per_sec: 0,
                 extent_bytes: 4096,
                 tick_ms: 10,
                 proposal_timeout_ms: 3000,
@@ -472,6 +486,53 @@ fn background_repair_restores_replicas_after_losing_a_data_node() {
     c.wait_read(
         &format!("/v1/volumes/{v}/data?offset=0&len=4096"),
         &[5u8; 4096],
+    );
+}
+
+#[test]
+fn a_lost_data_node_is_rebuilt_without_waiting_for_a_scrub() {
+    // A scrub would take an hour to come round; only the rebuild path can restore replicas.
+    let mut c = Cluster::start_full(3, 4, 3600, 1, 1);
+    let (_, body) = c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"name":"vol","size_bytes":16384}"#,
+        201,
+    );
+    let v = json(&body)["id"].as_str().unwrap().to_string();
+    c.on_leader(
+        "PUT",
+        &format!("/v1/volumes/{v}/data?offset=0"),
+        &[6u8; 16384],
+        204,
+    );
+
+    c.data.insert("d2".into(), None);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let rebuilt = c.meta_addrs().into_iter().find_map(|(_, addr)| {
+            let (_, b) = api(addr, "GET", "/v1/status", b"");
+            let r = json(&b)["rebuild"][0].clone();
+            // The same node's metrics, before leadership can move on a loaded host.
+            let (_, m) = api(addr, "GET", "/metrics", b"");
+            (r["lost_nodes"] == serde_json::json!(["d2"])
+                && r["degraded_extents"] == 0
+                && r["rebuilt"]["replicas_repaired"].as_u64() >= Some(1))
+            .then(|| (r, String::from_utf8_lossy(&m).into_owned()))
+        });
+        if let Some((r, m)) = rebuilt {
+            assert_eq!(r["unrecoverable_extents"], 0, "{r}");
+            assert!(m.contains("atlas_native_lost_nodes{node="), "{m}");
+            assert!(m.contains("atlas_native_degraded_extents{node="), "{m}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the lost node was never rebuilt");
+        thread::sleep(Duration::from_millis(100));
+    }
+    c.data.insert("d1".into(), None);
+    c.wait_read(
+        &format!("/v1/volumes/{v}/data?offset=0&len=16384"),
+        &[6u8; 16384],
     );
 }
 

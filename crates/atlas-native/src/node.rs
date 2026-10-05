@@ -33,6 +33,7 @@ use crate::{
     raft::{RaftConfig, RaftError, Role},
     raft_server::{RaftMux, RaftServer},
     raw::{open_store, DeviceBackend},
+    rebuild::{RebuildConfig, RebuildStatus, Rebuilder},
     tls::TlsIdentity,
 };
 
@@ -128,9 +129,20 @@ pub struct MetadataRole {
     pub tick_ms: u64,
     #[serde(default = "default_proposal_timeout_ms")]
     pub proposal_timeout_ms: u64,
-    /// 0 disables the background scrub/repair loop.
+    /// Time between the starts of two scrub passes of the rebuild controller; 0 disables the
+    /// controller (scrub and rebuild).
     #[serde(default = "default_repair_interval_secs")]
     pub repair_interval_secs: u64,
+    /// How long a data node must fail every request before its replicas and shards are
+    /// rebuilt on other nodes.
+    #[serde(default = "default_rebuild_delay_secs")]
+    pub rebuild_delay_secs: u64,
+    /// Cap on rebuild traffic (bytes read plus written per second, per group); 0 is unlimited.
+    #[serde(default = "default_rebuild_bytes_per_sec")]
+    pub rebuild_bytes_per_sec: u64,
+    /// Cap on scrub traffic (bytes per second, per group); 0 is unlimited.
+    #[serde(default = "default_scrub_bytes_per_sec")]
+    pub scrub_bytes_per_sec: u64,
     /// 0 disables the background GC loop.
     #[serde(default = "default_gc_interval_secs")]
     pub gc_interval_secs: u64,
@@ -192,6 +204,15 @@ fn default_proposal_timeout_ms() -> u64 {
 }
 fn default_repair_interval_secs() -> u64 {
     300
+}
+fn default_rebuild_delay_secs() -> u64 {
+    60
+}
+fn default_rebuild_bytes_per_sec() -> u64 {
+    256 << 20
+}
+fn default_scrub_bytes_per_sec() -> u64 {
+    64 << 20
 }
 fn default_gc_interval_secs() -> u64 {
     60
@@ -330,6 +351,8 @@ struct NodeShared {
     repair: TaskStats,
     gc: TaskStats,
     last_repair: Mutex<Option<RepairStats>>,
+    /// The rebuild controller's status for each group, once this node has led it.
+    rebuild: Mutex<Vec<Option<RebuildStatus>>>,
     /// Client sessions this node expired as a group leader.
     sessions_expired: AtomicU64,
 }
@@ -519,7 +542,13 @@ impl NativeNode {
                         leases: Default::default(),
                     });
                 }
-                Some((m.repair_interval_secs, m.gc_interval_secs))
+                let rebuild = (m.repair_interval_secs > 0).then(|| RebuildConfig {
+                    delay: Duration::from_secs(m.rebuild_delay_secs),
+                    rebuild_bytes_per_sec: m.rebuild_bytes_per_sec,
+                    scrub_interval: Duration::from_secs(m.repair_interval_secs),
+                    scrub_bytes_per_sec: m.scrub_bytes_per_sec,
+                });
+                Some((rebuild, m.gc_interval_secs))
             }
             None => None,
         };
@@ -541,27 +570,15 @@ impl NativeNode {
             repair: TaskStats::default(),
             gc: TaskStats::default(),
             last_repair: Mutex::new(None),
+            rebuild: Mutex::new(Vec::new()),
             sessions_expired: AtomicU64::new(0),
         });
 
         let mut loops = Vec::new();
-        if let Some((repair_secs, gc_secs)) = intervals {
-            if repair_secs > 0 {
+        if let Some((rebuild, gc_secs)) = intervals {
+            if let Some(cfg) = rebuild {
                 let sh = shared.clone();
-                loops.push(thread::spawn(move || {
-                    maintenance(
-                        &sh,
-                        Duration::from_secs(repair_secs),
-                        |sh, e| {
-                            let st = e.repair_once()?;
-                            if let Ok(mut last) = sh.last_repair.lock() {
-                                *last = Some(st);
-                            }
-                            Ok(())
-                        },
-                        |sh| &sh.repair,
-                    )
-                }));
+                loops.push(thread::spawn(move || rebuild_loop(&sh, cfg)));
             }
             {
                 let sh = shared.clone();
@@ -665,6 +682,64 @@ fn maintenance(
                 Err(_) => {
                     st.errors.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+        }
+    }
+}
+
+/// How long the rebuild controller idles when no group it leads has work waiting.
+const REBUILD_IDLE: Duration = Duration::from_secs(1);
+
+/// Runs a [`Rebuilder`] for each group this node leads, one step per group in turn, idling
+/// only when none has work waiting. A group's controller starts afresh each time this node
+/// becomes its leader.
+fn rebuild_loop(sh: &NodeShared, cfg: RebuildConfig) {
+    let mut ctl: Vec<Option<(u64, Rebuilder)>> = sh.groups.iter().map(|_| None).collect();
+    while !sh.stop.load(Ordering::SeqCst) {
+        let mut busy = false;
+        for (i, g) in sh.groups.iter().enumerate() {
+            let term = match g.raft.status() {
+                Ok(s) if s.role == Role::Leader => s.term,
+                _ => {
+                    if ctl[i].take().is_some() {
+                        if let Ok(mut st) = sh.rebuild.lock() {
+                            if let Some(s) = st.get_mut(i) {
+                                *s = None;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            if ctl[i].as_ref().is_none_or(|(t, _)| *t != term) {
+                ctl[i] = Some((term, Rebuilder::new(cfg)));
+            }
+            let Some((_, r)) = ctl[i].as_mut() else {
+                continue;
+            };
+            let passes = r.status().scrub.passes;
+            sh.repair.runs.fetch_add(1, Ordering::Relaxed);
+            match r.step(&g.engine, &sh.stop) {
+                Ok(more) => busy |= more,
+                Err(NativeError::Raft(RaftError::NotLeader { .. })) => {}
+                Err(_) => {
+                    sh.repair.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if r.status().scrub.passes != passes {
+                if let (Ok(mut last), Some(pass)) = (sh.last_repair.lock(), r.last_pass()) {
+                    *last = Some(pass);
+                }
+            }
+            if let Ok(mut st) = sh.rebuild.lock() {
+                st.resize(sh.groups.len(), None);
+                st[i] = Some(r.status().clone());
+            }
+        }
+        if !busy {
+            let until = Instant::now() + REBUILD_IDLE;
+            while Instant::now() < until && !sh.stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -1103,11 +1178,7 @@ fn led_groups(sh: &NodeShared) -> Result<Vec<&MetaGroup>, NativeError> {
 fn repair_all(sh: &NodeShared) -> Result<RepairStats, NativeError> {
     let mut st = RepairStats::default();
     for g in led_groups(sh)? {
-        let r = g.engine.repair_once()?;
-        st.extents_checked += r.extents_checked;
-        st.replicas_repaired += r.replicas_repaired;
-        st.unrecoverable += r.unrecoverable;
-        st.deferred += r.deferred;
+        st.add(&g.engine.repair_once()?);
     }
     if let Ok(mut last) = sh.last_repair.lock() {
         *last = Some(st);
@@ -1165,6 +1236,26 @@ fn status(sh: &NodeShared) -> Response {
         .collect();
     let nodes = sh.groups.first().map(|g| g.engine.node_status());
     let last_repair = sh.last_repair.lock().ok().and_then(|l| *l);
+    let rebuild: Vec<serde_json::Value> = sh
+        .rebuild
+        .lock()
+        .map(|st| {
+            st.iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    sh.groups[*i]
+                        .raft
+                        .status()
+                        .is_ok_and(|s| s.role == Role::Leader)
+                })
+                .filter_map(|(i, s)| {
+                    let mut v = serde_json::to_value(s.as_ref()?).ok()?;
+                    v["group"] = json!(sh.groups[i].raft.group());
+                    Some(v)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let fence = sh
         .data
         .lock()
@@ -1180,6 +1271,8 @@ fn status(sh: &NodeShared) -> Response {
             "layout": sh.layout.map(|(e, r)| json!({ "extent_bytes": e, "replicas": r })),
             "data_nodes": nodes,
             "last_repair": last_repair,
+            // The rebuild controller of each group this node leads.
+            "rebuild": (!rebuild.is_empty()).then_some(&rebuild),
             "data_node": fence.map(|f| json!({ "fence": f })),
         }),
     )
@@ -1244,6 +1337,73 @@ fn metrics(sh: &NodeShared) -> Response {
             "Client sessions expired for not renewing their lease.",
         )
         .sample(name, &node, sh.sessions_expired.load(Ordering::Relaxed));
+        let rebuild: Vec<(String, RebuildStatus)> = sh
+            .rebuild
+            .lock()
+            .map(|st| {
+                st.iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| Some((sh.groups[i].raft.group().to_string(), s.clone()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        type Pick = fn(&RebuildStatus) -> u64;
+        let families: [(&str, &str, &str, Pick); 7] = [
+            (
+                "atlas_native_lost_nodes",
+                "gauge",
+                "Data nodes the rebuild controller treats as lost.",
+                |s| s.lost_nodes.len() as u64,
+            ),
+            (
+                "atlas_native_degraded_extents",
+                "gauge",
+                "Extents with replicas or shards on lost nodes.",
+                |s| s.degraded_extents,
+            ),
+            (
+                "atlas_native_at_risk_extents",
+                "gauge",
+                "Degraded extents one more lost part would make unreadable.",
+                |s| s.at_risk_extents,
+            ),
+            (
+                "atlas_native_unrebuildable_extents",
+                "gauge",
+                "Degraded extents with too few parts left to rebuild.",
+                |s| s.unrecoverable_extents,
+            ),
+            (
+                "atlas_native_rebuild_bytes_total",
+                "counter",
+                "Bytes read and written by rebuilds since this node became leader.",
+                |s| s.rebuilt.bytes_read + s.rebuilt.bytes_written,
+            ),
+            (
+                "atlas_native_scrub_passes_total",
+                "counter",
+                "Completed scrub passes since this node became leader.",
+                |s| s.scrub.passes,
+            ),
+            (
+                "atlas_native_scrub_bytes_total",
+                "counter",
+                "Bytes read and written by scrubbing since this node became leader.",
+                |s| s.scrub.total.bytes_read + s.scrub.total.bytes_written,
+            ),
+        ];
+        if !rebuild.is_empty() {
+            for (name, kind, help, pick) in families {
+                let fam = p.family(name, kind, help);
+                for (group, s) in &rebuild {
+                    fam.sample(
+                        name,
+                        &[("node", sh.id.as_str()), ("group", group.as_str())],
+                        pick(s),
+                    );
+                }
+            }
+        }
         parts.push(p.finish());
     }
     if let Ok(d) = sh.data.lock() {

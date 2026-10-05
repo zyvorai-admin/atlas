@@ -32,6 +32,7 @@ pub mod raft;
 pub mod raft_server;
 pub mod raft_snapshot;
 pub mod raw;
+pub mod rebuild;
 pub mod store;
 pub mod telemetry;
 pub mod tls;

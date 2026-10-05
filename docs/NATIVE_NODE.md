@@ -73,7 +73,10 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `metadata.extent_bytes` | 4 MiB | Writes are split into extents of this size. |
 | `metadata.tick_ms` | 50 | Raft tick; elections take 10–20 ticks. |
 | `metadata.proposal_timeout_ms` | 5000 | Bounds leader readiness, each proposal and each data-node I/O. |
-| `metadata.repair_interval_secs` | 300 | Leader-only scrub/repair loop; 0 disables. |
+| `metadata.repair_interval_secs` | 300 | Time between the starts of two scrub passes of the leader's rebuild controller; 0 disables the controller (scrub and rebuild). See [Rebuild and scrub](#rebuild-and-scrub). |
+| `metadata.rebuild_delay_secs` | 60 | How long a data node must fail every request before its replicas and shards are rebuilt on other nodes. |
+| `metadata.rebuild_bytes_per_sec` | 256 MiB | Rebuild traffic cap (bytes read plus written per second, per group); 0 is unlimited. |
+| `metadata.scrub_bytes_per_sec` | 64 MiB | Scrub traffic cap, likewise. |
 | `metadata.gc_interval_secs` | 60 | Leader-only GC loop; 0 disables. |
 | `metadata.groups` | 1 | Raft groups the namespace is sharded across (1–64), all on `metadata.listen`; see [Metadata groups](#metadata-groups). Every metadata node must use the same value. It can be raised later but never lowered. |
 | `data_nodes[].host` / `rack` / `zone` | `id` / `id` / empty | Failure domains for placement; replicas always land on distinct hosts. |
@@ -125,8 +128,8 @@ different host), so a 4 MiB extent occupies 6 MiB instead of the 12 MiB three re
 
 - **Reads** fetch the data shards, preferring nodes that are up. A shard that fails its checksum or
   can't be read is replaced by a parity shard and the missing data is decoded.
-- **Repair** (the scrub loop) reads every shard, rebuilds the missing or corrupt ones and writes
-  each to a node holding no other shard of that extent. With more than m shards gone the extent is
+- **Repair** (rebuild and scrub, below) reads every shard, rebuilds the missing or corrupt ones and
+  writes each to a node holding no other shard of that extent. With more than m shards gone the extent is
   reported unrecoverable, as with replicas.
 - **Writes** need a node per shard; a node that fails is swapped for a spare. With fewer than k+m
   nodes up, the write fails rather than storing a weaker layout.
@@ -174,9 +177,9 @@ connection per request costs about 7 ms.
 
 ## Operations
 
-- **Maintenance**: the leader runs `repair_once` (scrub every replica, re-replicate missing or
-  corrupt ones) and `gc_once` (reclaim unreferenced extents) on their intervals. Each pass is a full
-  scan; size the repair interval to the data volume.
+- **Maintenance**: the leader runs the rebuild controller (below) continuously and `gc_once`
+  (reclaim unreferenced extents) every `gc_interval_secs`. `POST /v1/repair` still runs one
+  full, unpaced repair pass on demand.
 - **Dead connections**: a peer that vanishes without closing its sockets (a deleted pod, a
   powered-off host) is detected by its Raft senders: a connection is replaced when the peer has
   answered none of our requests for `max(40 ticks, 1 s)` or has reconnected to us since (it
@@ -201,6 +204,34 @@ connection per request costs about 7 ms.
   the process exit non-zero so its supervisor restarts it from disk.
 - **Logging**: startup prints the bound addresses to stderr; everything else is in `/metrics` and
   `/v1/status`.
+
+### Rebuild and scrub
+
+The leader of each metadata group runs a rebuild controller:
+
+- **Finding lost nodes.** Every 5 s it probes each data node that isn't backed off. A node that
+  has failed every request (probes, client I/O, repair) for `rebuild_delay_secs` counts as lost.
+  A node that answers again within the delay, such as one that restarted, costs no rebuild.
+- **Rebuild.** Extents with replicas or shards on lost nodes are found from metadata alone, and
+  rebuilt onto other nodes with the least spare redundancy first. A 4+2 extent that lost two
+  shards goes before one that lost one, and a 3-replica extent down to one copy goes before one
+  down to two. Parts on lost nodes are rebuilt without trying to read them. Extents that have
+  lost more parts than their layout tolerates are counted and left alone until a node returns.
+  An extent with no eligible target is retried after 30 s.
+- **Scrub.** When nothing needs rebuilding, it reads back and verifies the next 64 extents in id
+  order, resuming where it stopped. Missing and corrupt parts are rebuilt, so bit rot is caught.
+  A pass over every extent starts every `repair_interval_secs`, and the finished pass is reported
+  as `last_repair`.
+- **Pacing.** Rebuild and scrub traffic are capped separately (`rebuild_bytes_per_sec`,
+  `scrub_bytes_per_sec`). Client writes are held off only while a replacement is placed and
+  committed, never for a whole pass.
+
+`/v1/status` reports `rebuild` for each group the node leads: `lost_nodes`, `degraded_extents`,
+`at_risk_extents` (one more lost part from unreadable), `unrecoverable_extents`, `rebuilt` and
+`scrub` totals. `/metrics` has `atlas_native_lost_nodes`, `atlas_native_degraded_extents`,
+`atlas_native_at_risk_extents`, `atlas_native_unrebuildable_extents`,
+`atlas_native_rebuild_bytes_total`, `atlas_native_scrub_passes_total` and
+`atlas_native_scrub_bytes_total`, labelled by node and group.
 
 ## Membership changes
 
