@@ -122,6 +122,23 @@ fn name(n: &OsStr) -> Result<&str, Errno> {
     n.to_str().ok_or(Errno::EINVAL)
 }
 
+/// File handle bit: opened with `O_DIRECT`.
+const FH_DIRECT: u64 = 1;
+
+/// The handle and open flags for a file opened with `flags`: `O_DIRECT` bypasses the kernel's
+/// page cache (`FOPEN_DIRECT_IO`, with parallel writes to one file allowed) and this client's
+/// write-back and read-ahead.
+fn handle(flags: i32) -> (FileHandle, FopenFlags) {
+    if flags & libc::O_DIRECT != 0 {
+        (
+            FileHandle(FH_DIRECT),
+            FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES,
+        )
+    } else {
+        (FileHandle(0), FopenFlags::empty())
+    }
+}
+
 /// A node to create with the umask applied, and the mode before it for a parent with a default
 /// ACL (with `--acl` the kernel leaves masking to us: `FUSE_DONT_MASK`).
 fn new_node(req: &Request, n: &str, kind: NodeType, mode: u32, umask: u32) -> NewNode {
@@ -498,7 +515,8 @@ impl Filesystem for AtlasFs {
             return reply.error(Errno::EROFS);
         }
         self.ops.opened(ino.0);
-        reply.opened(FileHandle(0), FopenFlags::empty());
+        let (fh, open_flags) = handle(flags.0);
+        reply.opened(fh, open_flags);
     }
 
     fn create(
@@ -508,7 +526,7 @@ impl Filesystem for AtlasFs {
         n: &OsStr,
         mode: u32,
         umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         tri!(reply, self.mutate());
@@ -519,13 +537,8 @@ impl Filesystem for AtlasFs {
         {
             Ok(a) => {
                 self.ops.opened(a.ino);
-                reply.created(
-                    &self.ttl(),
-                    &file_attr(&a),
-                    Generation(0),
-                    FileHandle(0),
-                    FopenFlags::empty(),
-                )
+                let (fh, open_flags) = handle(flags);
+                reply.created(&self.ttl(), &file_attr(&a), Generation(0), fh, open_flags)
             }
             Err(e) => reply.error(err(e)),
         }
@@ -535,14 +548,19 @@ impl Filesystem for AtlasFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.ops.read(ino.0, offset, size as usize) {
+        let r = if fh.0 & FH_DIRECT != 0 {
+            self.ops.read_direct(ino.0, offset, size as usize)
+        } else {
+            self.ops.read(ino.0, offset, size as usize)
+        };
+        match r {
             Ok(b) => reply.data(&b),
             Err(e) => reply.error(err(e)),
         }
@@ -552,7 +570,7 @@ impl Filesystem for AtlasFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: WriteFlags,
@@ -560,7 +578,12 @@ impl Filesystem for AtlasFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.ops.write(ino.0, offset, data) {
+        let r = if fh.0 & FH_DIRECT != 0 {
+            self.ops.write_through(ino.0, offset, data)
+        } else {
+            self.ops.write(ino.0, offset, data)
+        };
+        match r {
             Ok(n) => reply.written(n as u32),
             Err(e) => reply.error(err(e)),
         }
@@ -720,5 +743,19 @@ mod statfs_tests {
         // Over a lowered quota: nothing free, never an underflow.
         let c = statfs_counts(&stat(200 * 4096, 9, q));
         assert_eq!((c.bfree, c.ffree), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    #[test]
+    fn o_direct_opens_bypass_the_page_cache() {
+        let (fh, f) = handle(libc::O_RDWR | libc::O_DIRECT);
+        assert_eq!(fh.0 & FH_DIRECT, FH_DIRECT);
+        assert!(f.contains(FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES));
+        let (fh, f) = handle(libc::O_RDWR | libc::O_SYNC);
+        assert_eq!((fh.0, f), (0, FopenFlags::empty()));
     }
 }
