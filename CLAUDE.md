@@ -162,6 +162,11 @@ integrations beyond the gRPC surface.
   `nfs.enabled`): NFS gateway supervisor running NFS-Ganesha ≥ 9.14 (`FSAL_VFS`, separate LGPL
   process) over `atlas-native-mount` FUSE mounts; NFSv4.1/4.2 + optional v3/NLM. Verified on the
   lab k3s; see `docs/NATIVE_NFS.md`.
+- `crates/atlas-native-s3` — S3 gateway (bin `atlas-native-s3`, `Dockerfile.native-s3`, chart
+  `s3.enabled`) on s3s over the native cluster API (no FUSE, unprivileged): bucket = filesystem or
+  snapshot, object = file, temp-file + rename PUTs, ETag/headers in xattr `user.atlas.s3`, multipart
+  state under `.atlas_s3_uploads/` so replicas scale out. S3 keys bypass POSIX permissions. Verified
+  with aws-cli on the lab k3s; see `docs/NATIVE_S3.md`.
 - `crates/atlas-native-csi` — CSI driver `native.atlas.zyvor.ai` (bin `atlas-native-csi`,
   `Dockerfile.native-csi`, chart `csi.enabled`): PVCs → filesystems, VolumeSnapshots, clones, per-pod
   `atlas-native-mount` FUSE mounts. `proto/csi.proto` is a wire-compatible subset of the CSI spec
