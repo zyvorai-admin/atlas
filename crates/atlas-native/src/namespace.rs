@@ -871,6 +871,7 @@ impl Catalog {
                 size: at_least,
                 now_ns,
             } => {
+                extent.check()?;
                 let i = self.fs_mut(fs)?.inode_mut(*ino)?;
                 let InodeKind::File { size, extents } = &mut i.kind else {
                     return Err(MetaError::IsDir(format!(
@@ -899,6 +900,9 @@ impl Catalog {
                 size: at_least,
                 now_ns,
             } => {
+                for e in new {
+                    e.check()?;
+                }
                 let i = self.fs_mut(fs)?.inode_mut(*ino)?;
                 let InodeKind::File { size, extents } = &mut i.kind else {
                     return Err(MetaError::IsDir(format!(
@@ -1067,6 +1071,9 @@ mod tests {
                         device_index: 0,
                         offset: off,
                     }],
+                    ec: None,
+                    created_ms: 0,
+                    object: None,
                 },
                 size: off + len as u64,
                 now_ns: 5,

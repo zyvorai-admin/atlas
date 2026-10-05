@@ -26,13 +26,44 @@ node:
   maxRequestBytes: 16777216
   tickMs: 50
   proposalTimeoutMs: 5000
+  # Reed-Solomon scheme for extents of at least erasureMinBytes, e.g. "4+2" (needs at least 6
+  # pods). Empty: replicate every extent. Applies to extents written from then on.
+  erasure: ""
+  erasureMinBytes: 65536
+  # Time between the starts of two scrub passes; 0 disables scrub and rebuild.
   repairIntervalSecs: 300
+  # How long a pod must fail every request before its extents are rebuilt on other pods.
+  rebuildDelaySecs: 60
+  # Rebuild and scrub traffic caps per metadata group (bytes/s); 0 is unlimited.
+  rebuildBytesPerSec: 268435456
+  scrubBytesPerSec: 67108864
   gcIntervalSecs: 60
   # Raft groups the metadata namespace is sharded across (1-64). May be raised on an existing
   # cluster (objects stay in their group), never lowered.
   metadataGroups: 1
   # Placement capacity hint per data node (bytes); defaults to the PVC size.
   freeBytes: 0
+
+# Move extents nobody has written or read for coldAfterSecs to object storage, freeing their
+# space on the data nodes (docs/NATIVE_NODE.md, "Tiering").
+tiering:
+  enabled: false
+  # Ceph RGW by default: the chart creates an ObjectBucketClaim of this StorageClass and reads
+  # the endpoint, bucket and credentials Rook publishes for it.
+  objectBucketClaim:
+    storageClassName: ""
+  # Any other S3-compatible store instead (all three set): endpoint URL, bucket, and a Secret
+  # with AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+  endpoint: ""
+  bucket: ""
+  existingSecret: ""
+  region: ""
+  prefix: "atlas-native/"
+  coldAfterSecs: 2592000
+  # 0: tier only on POST /v1/tier.
+  intervalSecs: 3600
+  bytesPerSec: 67108864
+  minExtentBytes: 1048576
 
 apiToken:
   # Secret with key `token`. Empty: the chart creates "<fullname>-api" with a random token that is

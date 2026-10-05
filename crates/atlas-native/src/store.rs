@@ -748,6 +748,9 @@ mod tests {
                 device_index: 0,
                 offset,
             }],
+            ec: None,
+            created_ms: 0,
+            object: None,
         }
     }
 

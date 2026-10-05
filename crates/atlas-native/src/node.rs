@@ -23,21 +23,28 @@ use serde_json::json;
 use crate::{
     data_node::{DataNodeServer, RemoteDevice},
     device::BlockStore,
-    engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind, RepairStats},
+    ec::EcScheme,
+    engine::{
+        check_export_name, EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind,
+        RepairStats, TierPolicy, TierStats,
+    },
     gc::GcStats,
     http::{Handler, HttpServer, Request, Response},
     metadata::MetaError,
     metrics::{self, PromText},
+    object::{DirObjectStore, ObjectStore},
     placement::{FailureDomain, Node, PlacementPolicy},
     raft::{RaftConfig, RaftError, Role},
     raft_server::{RaftMux, RaftServer},
     raw::{open_store, DeviceBackend},
+    rebuild::{Pacer, RebuildConfig, RebuildStatus, Rebuilder},
     tls::TlsIdentity,
 };
 
 mod cache_leases;
 mod fs_api;
 mod shards;
+mod transfers;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,15 +121,33 @@ pub struct MetadataRole {
     pub data_nodes: Vec<DataNodeSpec>,
     #[serde(default = "default_replicas")]
     pub replicas: usize,
+    /// Erasure-code extents of at least `erasure_min_bytes` (default 64 KiB) as `"<data>+<parity>"`
+    /// shards (e.g. `"4+2"`, `"8+3"`), each on its own data node; smaller extents keep
+    /// `replicas` copies. Applies to extents written from then on.
+    #[serde(default)]
+    pub erasure: Option<EcScheme>,
+    #[serde(default = "default_erasure_min_bytes")]
+    pub erasure_min_bytes: usize,
     #[serde(default = "default_extent_bytes")]
     pub extent_bytes: usize,
     #[serde(default = "default_tick_ms")]
     pub tick_ms: u64,
     #[serde(default = "default_proposal_timeout_ms")]
     pub proposal_timeout_ms: u64,
-    /// 0 disables the background scrub/repair loop.
+    /// Time between the starts of two scrub passes of the rebuild controller; 0 disables the
+    /// controller (scrub and rebuild).
     #[serde(default = "default_repair_interval_secs")]
     pub repair_interval_secs: u64,
+    /// How long a data node must fail every request before its replicas and shards are
+    /// rebuilt on other nodes.
+    #[serde(default = "default_rebuild_delay_secs")]
+    pub rebuild_delay_secs: u64,
+    /// Cap on rebuild traffic (bytes read plus written per second, per group); 0 is unlimited.
+    #[serde(default = "default_rebuild_bytes_per_sec")]
+    pub rebuild_bytes_per_sec: u64,
+    /// Cap on scrub traffic (bytes per second, per group); 0 is unlimited.
+    #[serde(default = "default_scrub_bytes_per_sec")]
+    pub scrub_bytes_per_sec: u64,
     /// 0 disables the background GC loop.
     #[serde(default = "default_gc_interval_secs")]
     pub gc_interval_secs: u64,
@@ -131,6 +156,94 @@ pub struct MetadataRole {
     /// lowering it would strand the objects of the groups dropped.
     #[serde(default = "default_groups")]
     pub groups: u32,
+    /// Move cold extents to object storage (`docs/NATIVE_NODE.md`, "Tiering").
+    #[serde(default)]
+    pub tiering: Option<TieringConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TieringConfig {
+    pub store: ObjectStoreConfig,
+    /// Key prefix; each metadata group adds `g<N>/`. Ends with `/`.
+    #[serde(default = "default_tier_prefix")]
+    pub prefix: String,
+    /// How long an extent must go unwritten and unread before it is tiered.
+    #[serde(default = "default_cold_after_secs")]
+    pub cold_after_secs: u64,
+    /// Time between tiering passes; 0 tiers only on `POST /v1/tier` (reads of tiered extents
+    /// work either way).
+    #[serde(default = "default_tier_interval_secs")]
+    pub interval_secs: u64,
+    /// Upload rate cap per group; 0 is unlimited.
+    #[serde(default = "default_tier_bytes_per_sec")]
+    pub bytes_per_sec: u64,
+    /// Smaller extents stay on the data nodes.
+    #[serde(default = "default_tier_min_bytes")]
+    pub min_extent_bytes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectStoreConfig {
+    /// Files under a directory every metadata node mounts (or a single-node cluster's disk).
+    Dir { path: PathBuf },
+    /// An S3-compatible bucket: Ceph RGW (e.g. a Rook `ObjectBucketClaim`), MinIO, AWS, ...
+    /// Needs a build with the `s3` feature.
+    S3 {
+        endpoint: String,
+        #[serde(default)]
+        region: String,
+        bucket: String,
+        access_key_file: PathBuf,
+        secret_key_file: PathBuf,
+    },
+}
+
+impl ObjectStoreConfig {
+    fn open(&self) -> Result<Arc<dyn ObjectStore>, NativeError> {
+        match self {
+            Self::Dir { path } => Ok(Arc::new(DirObjectStore::new(path)?)),
+            #[cfg(feature = "s3")]
+            Self::S3 {
+                endpoint,
+                region,
+                bucket,
+                access_key_file,
+                secret_key_file,
+            } => {
+                let key = std::fs::read_to_string(access_key_file)?;
+                let secret = std::fs::read_to_string(secret_key_file)?;
+                Ok(Arc::new(crate::object::S3ObjectStore::new(
+                    endpoint,
+                    region,
+                    bucket,
+                    key.trim(),
+                    secret.trim(),
+                )?))
+            }
+            #[cfg(not(feature = "s3"))]
+            Self::S3 { .. } => Err(NativeError::Invalid(
+                "metadata.tiering.store.s3 needs a build with the atlas-native `s3` feature".into(),
+            )),
+        }
+    }
+}
+
+fn default_tier_prefix() -> String {
+    "atlas-native/".into()
+}
+fn default_cold_after_secs() -> u64 {
+    30 * 24 * 3600
+}
+fn default_tier_interval_secs() -> u64 {
+    3600
+}
+fn default_tier_bytes_per_sec() -> u64 {
+    64 << 20
+}
+fn default_tier_min_bytes() -> usize {
+    1 << 20
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +283,9 @@ fn default_max_request_bytes() -> usize {
 fn default_replicas() -> usize {
     3
 }
+fn default_erasure_min_bytes() -> usize {
+    crate::engine::DEFAULT_ERASURE_MIN_BYTES
+}
 fn default_extent_bytes() -> usize {
     4 << 20
 }
@@ -181,6 +297,15 @@ fn default_proposal_timeout_ms() -> u64 {
 }
 fn default_repair_interval_secs() -> u64 {
     300
+}
+fn default_rebuild_delay_secs() -> u64 {
+    60
+}
+fn default_rebuild_bytes_per_sec() -> u64 {
+    256 << 20
+}
+fn default_scrub_bytes_per_sec() -> u64 {
+    64 << 20
 }
 fn default_gc_interval_secs() -> u64 {
     60
@@ -252,6 +377,15 @@ impl NodeConfig {
                     m.data_nodes.len()
                 ));
             }
+            if let Some(e) = m.erasure {
+                if e.shards() > m.data_nodes.len() {
+                    return invalid(format!(
+                        "metadata.erasure {e} needs {} data_nodes, {} configured",
+                        e.shards(),
+                        m.data_nodes.len()
+                    ));
+                }
+            }
             if m.extent_bytes == 0 || m.extent_bytes as u64 > crate::data_node::MAX_PAYLOAD {
                 return invalid("metadata.extent_bytes out of range".into());
             }
@@ -262,6 +396,19 @@ impl NodeConfig {
                 return invalid(format!(
                     "metadata.groups must be between 1 and {MAX_GROUPS}"
                 ));
+            }
+            if let Some(t) = &m.tiering {
+                let p = &t.prefix;
+                if p.is_empty()
+                    || !p.ends_with('/')
+                    || p.starts_with('/')
+                    || p.split('/').any(|s| s == "." || s == "..")
+                    || p.contains("//")
+                {
+                    return invalid(format!(
+                        "metadata.tiering.prefix {p:?} must be a relative path ending in /"
+                    ));
+                }
             }
             let mut ids: Vec<&str> = m.data_nodes.iter().map(|d| d.id.as_str()).collect();
             ids.sort_unstable();
@@ -310,6 +457,14 @@ struct NodeShared {
     repair: TaskStats,
     gc: TaskStats,
     last_repair: Mutex<Option<RepairStats>>,
+    /// The rebuild controller's status for each group, once this node has led it.
+    rebuild: Mutex<Vec<Option<RebuildStatus>>>,
+    /// Tiering policy and upload rate cap, when an object store is configured.
+    tiering: Option<(TierPolicy, u64)>,
+    tier: TaskStats,
+    last_tier: Mutex<Option<TierStats>>,
+    /// Snapshot exports and imports (with an object store configured).
+    transfers: transfers::Transfers,
     /// Client sessions this node expired as a group leader.
     sessions_expired: AtomicU64,
 }
@@ -438,6 +593,7 @@ impl NativeNode {
                 refuse_fewer_groups(&cfg.data_dir, m.groups)?;
                 let mux = RaftMux::start(l, tls.as_ref())?;
                 raft_addr = Some(mux.local_addr());
+                let objects = m.tiering.as_ref().map(|t| t.store.open()).transpose()?;
                 let peers = cfg.raft_peers();
                 let io_timeout = Duration::from_millis(m.proposal_timeout_ms);
                 for g in 0..m.groups {
@@ -479,6 +635,13 @@ impl NativeNode {
                     }
                     let mut ecfg = EngineConfig::new(group_dir(&cfg.data_dir, "engine", g));
                     ecfg.extent_bytes = m.extent_bytes;
+                    ecfg.erasure = m.erasure;
+                    ecfg.erasure_min_bytes = m.erasure_min_bytes;
+                    if let (Some(store), Some(t)) = (&objects, &m.tiering) {
+                        ecfg.objects = Some(store.clone());
+                        ecfg.object_prefix = format!("{}g{g}/", t.prefix);
+                        ecfg.export_prefix = t.prefix.clone();
+                    }
                     ecfg.placement = PlacementPolicy {
                         replicas: m.replicas,
                         ..PlacementPolicy::default()
@@ -497,7 +660,23 @@ impl NativeNode {
                         leases: Default::default(),
                     });
                 }
-                Some((m.repair_interval_secs, m.gc_interval_secs))
+                let rebuild = (m.repair_interval_secs > 0).then(|| RebuildConfig {
+                    delay: Duration::from_secs(m.rebuild_delay_secs),
+                    rebuild_bytes_per_sec: m.rebuild_bytes_per_sec,
+                    scrub_interval: Duration::from_secs(m.repair_interval_secs),
+                    scrub_bytes_per_sec: m.scrub_bytes_per_sec,
+                });
+                let tier = m.tiering.as_ref().map(|t| {
+                    (
+                        TierPolicy {
+                            cold_after: Duration::from_secs(t.cold_after_secs),
+                            min_bytes: t.min_extent_bytes,
+                        },
+                        t.bytes_per_sec,
+                        t.interval_secs,
+                    )
+                });
+                Some((rebuild, m.gc_interval_secs, tier))
             }
             None => None,
         };
@@ -519,27 +698,37 @@ impl NativeNode {
             repair: TaskStats::default(),
             gc: TaskStats::default(),
             last_repair: Mutex::new(None),
+            rebuild: Mutex::new(Vec::new()),
+            tiering: match &intervals {
+                Some((_, _, Some((policy, rate, _)))) => Some((*policy, *rate)),
+                _ => None,
+            },
+            tier: TaskStats::default(),
+            last_tier: Mutex::new(None),
+            transfers: Default::default(),
             sessions_expired: AtomicU64::new(0),
         });
 
         let mut loops = Vec::new();
-        if let Some((repair_secs, gc_secs)) = intervals {
-            if repair_secs > 0 {
+        if let Some((rebuild, gc_secs, tier)) = intervals {
+            if let Some((_, _, secs)) = tier.filter(|t| t.2 > 0) {
                 let sh = shared.clone();
                 loops.push(thread::spawn(move || {
                     maintenance(
                         &sh,
-                        Duration::from_secs(repair_secs),
-                        |sh, e| {
-                            let st = e.repair_once()?;
-                            if let Ok(mut last) = sh.last_repair.lock() {
-                                *last = Some(st);
-                            }
-                            Ok(())
-                        },
-                        |sh| &sh.repair,
+                        Duration::from_secs(secs),
+                        |sh, e| tier_group(sh, e).map(|_| ()),
+                        |sh| &sh.tier,
                     )
                 }));
+            }
+            if shared.tiering.is_some() {
+                let sh = shared.clone();
+                loops.push(thread::spawn(move || transfers::run(&sh)));
+            }
+            if let Some(cfg) = rebuild {
+                let sh = shared.clone();
+                loops.push(thread::spawn(move || rebuild_loop(&sh, cfg)));
             }
             {
                 let sh = shared.clone();
@@ -643,6 +832,64 @@ fn maintenance(
                 Err(_) => {
                     st.errors.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+        }
+    }
+}
+
+/// How long the rebuild controller idles when no group it leads has work waiting.
+const REBUILD_IDLE: Duration = Duration::from_secs(1);
+
+/// Runs a [`Rebuilder`] for each group this node leads, one step per group in turn, idling
+/// only when none has work waiting. A group's controller starts afresh each time this node
+/// becomes its leader.
+fn rebuild_loop(sh: &NodeShared, cfg: RebuildConfig) {
+    let mut ctl: Vec<Option<(u64, Rebuilder)>> = sh.groups.iter().map(|_| None).collect();
+    while !sh.stop.load(Ordering::SeqCst) {
+        let mut busy = false;
+        for (i, g) in sh.groups.iter().enumerate() {
+            let term = match g.raft.status() {
+                Ok(s) if s.role == Role::Leader => s.term,
+                _ => {
+                    if ctl[i].take().is_some() {
+                        if let Ok(mut st) = sh.rebuild.lock() {
+                            if let Some(s) = st.get_mut(i) {
+                                *s = None;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            if ctl[i].as_ref().is_none_or(|(t, _)| *t != term) {
+                ctl[i] = Some((term, Rebuilder::new(cfg)));
+            }
+            let Some((_, r)) = ctl[i].as_mut() else {
+                continue;
+            };
+            let passes = r.status().scrub.passes;
+            sh.repair.runs.fetch_add(1, Ordering::Relaxed);
+            match r.step(&g.engine, &sh.stop) {
+                Ok(more) => busy |= more,
+                Err(NativeError::Raft(RaftError::NotLeader { .. })) => {}
+                Err(_) => {
+                    sh.repair.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if r.status().scrub.passes != passes {
+                if let (Ok(mut last), Some(pass)) = (sh.last_repair.lock(), r.last_pass()) {
+                    *last = Some(pass);
+                }
+            }
+            if let Ok(mut st) = sh.rebuild.lock() {
+                st.resize(sh.groups.len(), None);
+                st[i] = Some(r.status().clone());
+            }
+        }
+        if !busy {
+            let until = Instant::now() + REBUILD_IDLE;
+            while Instant::now() < until && !sh.stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -1054,9 +1301,94 @@ fn volume_route(sh: &NodeShared, req: &Request, segs: &[&str]) -> Response {
         }
         ("POST", ["v1", "repair"]) => repair_all(sh).map(|st| Response::json(200, &json!(st))),
         ("POST", ["v1", "gc"]) => gc_all(sh).map(|st| Response::json(200, &json!(st))),
+        ("POST", ["v1", "tier"]) => tier_all(sh).map(|st| Response::json(200, &json!(st))),
+        ("POST", ["v1", "snapshots", id, "export"]) => {
+            let body = match body_json(req) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let Some(name) = body["name"].as_str() else {
+                return Response::text(400, "body must be {\"name\": string}");
+            };
+            transfers_enabled(sh)
+                .and_then(|()| check_export_name(name))
+                .and_then(|()| sh.route(ObjectKind::Snapshot, id))
+                .and_then(|(g, group)| {
+                    lead(group)?;
+                    if !group.engine.holds(ObjectKind::Snapshot, id)? {
+                        return Err(NativeError::NotFound(format!("snapshot {id}")));
+                    }
+                    Ok(sh.transfers.export(g, id, name))
+                })
+                .map(|t| Response::json(202, &json!({ "transfer": t })))
+        }
+        ("POST", ["v1", "volumes", "import"]) => {
+            let body = match body_json(req) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let (Some(export), Some(name)) = (body["export"].as_str(), body["name"].as_str())
+            else {
+                return Response::text(
+                    400,
+                    "body must be {\"export\": string, \"name\": string, \"id\"?: string}",
+                );
+            };
+            let vid = match client_id(&body) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            transfers_enabled(sh)
+                .and_then(|()| sh.route(ObjectKind::Volume, &vid))
+                .and_then(|(g, group)| {
+                    lead(group)?;
+                    let m = group.engine.read_export(export)?;
+                    group
+                        .engine
+                        .create_volume_as(vid.clone(), name, m.size_bytes)?;
+                    Ok(sh.transfers.import(g, export, &vid))
+                })
+                .map(|t| Response::json(202, &json!({ "transfer": t, "id": vid })))
+        }
+        ("GET", ["v1", "exports"]) => transfers_enabled(sh)
+            .and_then(|()| sh.groups[0].engine.list_exports())
+            .map(|e| Response::json(200, &json!({ "exports": e }))),
+        ("GET", ["v1", "exports", name]) => transfers_enabled(sh)
+            .and_then(|()| sh.groups[0].engine.read_export(name))
+            .map(|m| Response::json(200, &json!(m))),
+        ("DELETE", ["v1", "exports", name]) => transfers_enabled(sh)
+            .and_then(|()| sh.groups[0].engine.delete_export(name))
+            .map(|n| Response::json(200, &json!({ "blobs_deleted": n }))),
+        ("GET", ["v1", "transfers"]) => Ok(Response::json(
+            200,
+            &json!({ "transfers": sh.transfers.list() }),
+        )),
+        ("GET", ["v1", "transfers", id]) => match sh.transfers.get(id) {
+            Some(t) => Ok(Response::json(200, &json!(t))),
+            None => Err(NativeError::NotFound(format!("transfer {id}"))),
+        },
         _ => return Response::text(404, "no such route"),
     };
     result.unwrap_or_else(error_response)
+}
+
+fn transfers_enabled(sh: &NodeShared) -> Result<(), NativeError> {
+    if sh.tiering.is_none() {
+        return Err(NativeError::Invalid(
+            "exports need metadata.tiering (an object store)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `NotLeader` (naming the leader) unless this node leads `group`.
+fn lead(group: &MetaGroup) -> Result<(), NativeError> {
+    let s = group.raft.status()?;
+    if s.role == Role::Leader {
+        Ok(())
+    } else {
+        Err(RaftError::NotLeader { leader: s.leader }.into())
+    }
 }
 
 /// The groups this node leads, or `NotLeader` (pointing at group 0's leader) if none.
@@ -1081,13 +1413,43 @@ fn led_groups(sh: &NodeShared) -> Result<Vec<&MetaGroup>, NativeError> {
 fn repair_all(sh: &NodeShared) -> Result<RepairStats, NativeError> {
     let mut st = RepairStats::default();
     for g in led_groups(sh)? {
-        let r = g.engine.repair_once()?;
-        st.extents_checked += r.extents_checked;
-        st.replicas_repaired += r.replicas_repaired;
-        st.unrecoverable += r.unrecoverable;
-        st.deferred += r.deferred;
+        st.add(&g.engine.repair_once()?);
     }
     if let Ok(mut last) = sh.last_repair.lock() {
+        *last = Some(st);
+    }
+    Ok(st)
+}
+
+/// One paced tiering pass over `e`, recorded as the last pass.
+fn tier_group(sh: &NodeShared, e: &NativeEngine) -> Result<TierStats, NativeError> {
+    let (policy, rate) = sh
+        .tiering
+        .ok_or_else(|| NativeError::Invalid("metadata.tiering is not configured".into()))?;
+    let mut pacer = Pacer::new(rate);
+    let st = e.tier_once(
+        &policy,
+        |n| pacer.pace(n, &sh.stop),
+        || sh.stop.load(Ordering::SeqCst),
+    )?;
+    if let Ok(mut last) = sh.last_tier.lock() {
+        *last = Some(st);
+    }
+    Ok(st)
+}
+
+/// One tiering pass over each group this node leads.
+fn tier_all(sh: &NodeShared) -> Result<TierStats, NativeError> {
+    let mut st = TierStats::default();
+    for g in led_groups(sh)? {
+        let r = tier_group(sh, &g.engine)?;
+        st.candidates += r.candidates;
+        st.tiered += r.tiered;
+        st.bytes += r.bytes;
+        st.deferred += r.deferred;
+        st.orphans_deleted += r.orphans_deleted;
+    }
+    if let Ok(mut last) = sh.last_tier.lock() {
         *last = Some(st);
     }
     Ok(st)
@@ -1143,6 +1505,26 @@ fn status(sh: &NodeShared) -> Response {
         .collect();
     let nodes = sh.groups.first().map(|g| g.engine.node_status());
     let last_repair = sh.last_repair.lock().ok().and_then(|l| *l);
+    let rebuild: Vec<serde_json::Value> = sh
+        .rebuild
+        .lock()
+        .map(|st| {
+            st.iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    sh.groups[*i]
+                        .raft
+                        .status()
+                        .is_ok_and(|s| s.role == Role::Leader)
+                })
+                .filter_map(|(i, s)| {
+                    let mut v = serde_json::to_value(s.as_ref()?).ok()?;
+                    v["group"] = json!(sh.groups[i].raft.group());
+                    Some(v)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let fence = sh
         .data
         .lock()
@@ -1158,6 +1540,9 @@ fn status(sh: &NodeShared) -> Response {
             "layout": sh.layout.map(|(e, r)| json!({ "extent_bytes": e, "replicas": r })),
             "data_nodes": nodes,
             "last_repair": last_repair,
+            "last_tier": sh.last_tier.lock().ok().and_then(|l| *l),
+            // The rebuild controller of each group this node leads.
+            "rebuild": (!rebuild.is_empty()).then_some(&rebuild),
             "data_node": fence.map(|f| json!({ "fence": f })),
         }),
     )
@@ -1183,7 +1568,7 @@ fn metrics(sh: &NodeShared) -> Response {
     if !sh.groups.is_empty() {
         let node = [("node", sh.id.as_str())];
         let mut p = PromText::new();
-        for (task, st) in [("repair", &sh.repair), ("gc", &sh.gc)] {
+        for (task, st) in [("repair", &sh.repair), ("gc", &sh.gc), ("tier", &sh.tier)] {
             for (suffix, help, v) in [
                 (
                     "runs",
@@ -1222,6 +1607,73 @@ fn metrics(sh: &NodeShared) -> Response {
             "Client sessions expired for not renewing their lease.",
         )
         .sample(name, &node, sh.sessions_expired.load(Ordering::Relaxed));
+        let rebuild: Vec<(String, RebuildStatus)> = sh
+            .rebuild
+            .lock()
+            .map(|st| {
+                st.iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| Some((sh.groups[i].raft.group().to_string(), s.clone()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        type Pick = fn(&RebuildStatus) -> u64;
+        let families: [(&str, &str, &str, Pick); 7] = [
+            (
+                "atlas_native_lost_nodes",
+                "gauge",
+                "Data nodes the rebuild controller treats as lost.",
+                |s| s.lost_nodes.len() as u64,
+            ),
+            (
+                "atlas_native_degraded_extents",
+                "gauge",
+                "Extents with replicas or shards on lost nodes.",
+                |s| s.degraded_extents,
+            ),
+            (
+                "atlas_native_at_risk_extents",
+                "gauge",
+                "Degraded extents one more lost part would make unreadable.",
+                |s| s.at_risk_extents,
+            ),
+            (
+                "atlas_native_unrebuildable_extents",
+                "gauge",
+                "Degraded extents with too few parts left to rebuild.",
+                |s| s.unrecoverable_extents,
+            ),
+            (
+                "atlas_native_rebuild_bytes_total",
+                "counter",
+                "Bytes read and written by rebuilds since this node became leader.",
+                |s| s.rebuilt.bytes_read + s.rebuilt.bytes_written,
+            ),
+            (
+                "atlas_native_scrub_passes_total",
+                "counter",
+                "Completed scrub passes since this node became leader.",
+                |s| s.scrub.passes,
+            ),
+            (
+                "atlas_native_scrub_bytes_total",
+                "counter",
+                "Bytes read and written by scrubbing since this node became leader.",
+                |s| s.scrub.total.bytes_read + s.scrub.total.bytes_written,
+            ),
+        ];
+        if !rebuild.is_empty() {
+            for (name, kind, help, pick) in families {
+                let fam = p.family(name, kind, help);
+                for (group, s) in &rebuild {
+                    fam.sample(
+                        name,
+                        &[("node", sh.id.as_str()), ("group", group.as_str())],
+                        pick(s),
+                    );
+                }
+            }
+        }
         parts.push(p.finish());
     }
     if let Ok(d) = sh.data.lock() {
@@ -1249,5 +1701,29 @@ mod tests {
         );
         assert!(expand_env("${MISSING}", env).is_err());
         assert!(expand_env("${POD_NAME", env).is_err());
+    }
+
+    #[test]
+    fn an_erasure_scheme_needs_a_data_node_per_shard() {
+        let cfg = |erasure: &str| {
+            let nodes: Vec<_> = (1..=5)
+                .map(|i| serde_json::json!({ "id": format!("d{i}"), "addr": format!("d{i}:7000") }))
+                .collect();
+            serde_json::from_value::<super::NodeConfig>(serde_json::json!({
+                "node_id": "m1",
+                "data_dir": "/tmp/x",
+                "http_listen": "127.0.0.1:0",
+                "metadata": {
+                    "listen": "127.0.0.1:0",
+                    "peers": {},
+                    "data_nodes": nodes,
+                    "erasure": erasure,
+                },
+            }))
+        };
+        cfg("4+1").unwrap().validate().unwrap();
+        let e = cfg("4+2").unwrap().validate().unwrap_err().to_string();
+        assert!(e.contains("needs 6 data_nodes, 5 configured"), "{e}");
+        assert!(cfg("4-2").is_err());
     }
 }

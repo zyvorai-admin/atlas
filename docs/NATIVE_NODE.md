@@ -68,11 +68,17 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `max_request_bytes` | 64 MiB | Larger HTTP bodies and read lengths get 413. |
 | `metadata.bootstrap` | every `peers` entry | Initial Raft voters, used until the first membership change commits. A node not listed starts as a non-voter (it never campaigns) and waits to be added through `POST /v1/members`. Every id needs a `peers` entry. |
 | `metadata.replicas` | 3 | Between 1 and the number of `data_nodes`. |
+| `metadata.erasure` | unset | Reed-Solomon scheme `k+m` (e.g. `4+2`, `8+3`; k up to 32, m up to 8) for new extents; unset keeps replicating. Needs at least k+m data nodes; see [Erasure coding](#erasure-coding). |
+| `metadata.erasure_min_bytes` | 64 KiB | Smaller extents (file tails, small files) are still replicated. |
 | `metadata.extent_bytes` | 4 MiB | Writes are split into extents of this size. |
 | `metadata.tick_ms` | 50 | Raft tick; elections take 10–20 ticks. |
 | `metadata.proposal_timeout_ms` | 5000 | Bounds leader readiness, each proposal and each data-node I/O. |
-| `metadata.repair_interval_secs` | 300 | Leader-only scrub/repair loop; 0 disables. |
+| `metadata.repair_interval_secs` | 300 | Time between the starts of two scrub passes of the leader's rebuild controller; 0 disables the controller (scrub and rebuild). See [Rebuild and scrub](#rebuild-and-scrub). |
+| `metadata.rebuild_delay_secs` | 60 | How long a data node must fail every request before its replicas and shards are rebuilt on other nodes. |
+| `metadata.rebuild_bytes_per_sec` | 256 MiB | Rebuild traffic cap (bytes read plus written per second, per group); 0 is unlimited. |
+| `metadata.scrub_bytes_per_sec` | 64 MiB | Scrub traffic cap, likewise. |
 | `metadata.gc_interval_secs` | 60 | Leader-only GC loop; 0 disables. |
+| `metadata.tiering` | unset | Move cold extents to object storage; see [Tiering](#tiering). |
 | `metadata.groups` | 1 | Raft groups the namespace is sharded across (1–64), all on `metadata.listen`; see [Metadata groups](#metadata-groups). Every metadata node must use the same value. It can be raised later but never lowered. |
 | `data_nodes[].host` / `rack` / `zone` | `id` / `id` / empty | Failure domains for placement; replicas always land on distinct hosts. |
 | `data_nodes[].free_bytes` | 1 TiB | Placement capacity hint. |
@@ -114,6 +120,100 @@ replicas. A client asking for device 1 or above first asks the data node how man
 serves; an older data node doesn't understand the question, so the request fails instead of
 silently landing on device 0. Requests for device 0 are unchanged on the wire.
 
+### Erasure coding
+
+With `"erasure": "4+2"` in the `metadata` section, each extent of at least `erasure_min_bytes` is
+split into 4 data shards and 2 Reed-Solomon parity shards, each on a different data node (and so a
+different host), so a 4 MiB extent occupies 6 MiB instead of the 12 MiB three replicas take. Any
+2 shards can be lost. Each shard carries its own SHA-256 next to the extent's.
+
+- **Reads** fetch the data shards, preferring nodes that are up. A shard that fails its checksum or
+  can't be read is replaced by a parity shard and the missing data is decoded.
+- **Repair** (rebuild and scrub, below) reads every shard, rebuilds the missing or corrupt ones and
+  writes each to a node holding no other shard of that extent. With more than m shards gone the extent is
+  reported unrecoverable, as with replicas.
+- **Writes** need a node per shard; a node that fails is swapped for a spare. With fewer than k+m
+  nodes up, the write fails rather than storing a weaker layout.
+- **Existing data** stays as written: changing or removing `erasure` affects new extents only, and
+  coded and replicated extents can be mixed in one file. Clients that read data nodes directly
+  (`docs/NATIVE_FS.md`) read the data shards and fall back to the leader when any is missing.
+
+Measured codec speed on one core (4 MiB extents, release build): about 1.5 GiB/s to encode
+(checksums included) and 2 GiB/s or more to rebuild two lost data shards, for both 4+2 and 8+3.
+
+### Tiering
+
+With `metadata.tiering` set, the leader of each group moves extents nobody has written or read
+for `cold_after_secs` to object storage, freeing their space on the data nodes:
+
+```json
+"tiering": {
+  "store": { "s3": {
+    "endpoint": "http://rook-ceph-rgw-store.rook-ceph.svc", "bucket": "atlas-native-tier",
+    "access_key_file": "/etc/atlas-native/s3/AWS_ACCESS_KEY_ID",
+    "secret_key_file": "/etc/atlas-native/s3/AWS_SECRET_ACCESS_KEY" } },
+  "cold_after_secs": 2592000
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `store` | required | `{"s3": {endpoint, bucket, access_key_file, secret_key_file, region?}}` for Ceph RGW (the default in the Helm chart, through an ObjectBucketClaim) or any S3-compatible store, through `atlas-driver-rgw::S3Target`; needs a build with the `s3` feature, which the image has. `{"dir": {"path"}}` uses a directory every metadata node mounts. |
+| `prefix` | `atlas-native/` | Each group's objects go under `<prefix>g<N>/extents/<extent id>`. Clusters sharing a bucket need different prefixes. |
+| `cold_after_secs` | 30 days | An extent is cold once this long has passed since it was written and since it was last read. Reads are tracked in the leader's memory: a new leader counts every extent as read when it took over. |
+| `interval_secs` | 3600 | Time between tiering passes; 0 tiers only on `POST /v1/tier`. |
+| `bytes_per_sec` | 64 MiB | Upload rate cap per group; 0 is unlimited. |
+| `min_extent_bytes` | 1 MiB | Smaller extents stay on the data nodes, since each object costs a request. |
+
+How it works:
+
+- **A pass.** Tiering an extent reads and verifies it, then uploads it whole. A Raft command then
+  records the object key on the extent and frees its replicas or shards. Each pass first deletes
+  objects under the group's prefix that no extent references, such as an upload whose commit
+  never happened.
+- **Reads and writes.** Reads of a tiered extent fetch its object and verify the extent's SHA-256.
+  Any metadata replica can serve them, with no data node involved. Writes to a tiered range
+  install new extents on the data nodes as usual, and a partial write reads the rest of the
+  extent from its object.
+- **Snapshots, GC and repair.** Snapshots and clones keep sharing tiered extents. GC deletes an
+  object once its extent is unreferenced, and a failed delete is retried by the next pass's sweep.
+  Rebuild and scrub skip tiered extents; the object store provides their redundancy.
+- **Direct reads.** FUSE clients reading data nodes directly fall back to the leader for tiered
+  extents.
+
+`POST /v1/tier` runs a pass on every group this node leads. `/v1/status` reports `last_tier`
+(`candidates`, `tiered`, `bytes`, `deferred`, `orphans_deleted`), and `/metrics` has
+`atlas_native_tiered_extents`, `atlas_native_tiered_bytes`, `atlas_native_extents_tiered_total`
+and `atlas_native_object_reads_total`. Verified against Ceph RGW on the Rook lab (an
+ObjectBucketClaim bucket): extents tiered, read back verified, and their objects deleted by GC
+(`tests/tiering_s3.rs`, run with `ATLAS_NATIVE_S3_*`).
+
+### Snapshot export and import
+
+The same bucket holds snapshot exports, which outlive the cluster: any cluster configured with
+the bucket and `prefix` can import them.
+
+- **Layout.** An export is a manifest (`<prefix>exports/<name>/manifest.json`, listing each
+  extent's offset, length and SHA-256) plus one blob per extent, named by its checksum
+  (`<prefix>blobs/<sha256>`). Blobs are shared, so exporting a later snapshot of the same volume
+  uploads only the extents that changed. Tiered extents are exported from their objects.
+- **Export.** `POST /v1/snapshots/{id}/export` runs on the leader of the snapshot's group. The
+  manifest is written last, so a failed or stopped export leaves no export behind; its uploaded
+  blobs are reused by the next attempt.
+- **Import.** `POST /v1/volumes/import` creates a volume of the export's size and writes every
+  blob into it, refusing a blob whose length or SHA-256 doesn't match the manifest. A failed
+  import leaves a partly written volume; delete it and import again.
+- **Delete.** `DELETE /v1/exports/{name}` deletes the manifest, then every blob no other export
+  references. While an export is uploading it keeps a marker (`<prefix>pending/<name>`)
+  refreshed every minute, and a delete frees no blob while a marker newer than 10 minutes
+  exists (the rest are freed by a later delete), so a delete never frees a blob an unfinished
+  export reuses.
+
+Exports and imports run one at a time per node, in the background, and fail if the node stops
+leading the group; resubmit them to the new leader. `GET /v1/transfers/{id}` reports `state`
+(`queued`, `running`, `done` or `failed`), `done`/`total` extents, `error`, and `result`
+(`extents`, `uploaded`, `reused`, `bytes_uploaded` for an export; `bytes` for an import).
+
 ## HTTP API
 
 | Method and path | Auth | Description |
@@ -135,6 +235,12 @@ silently landing on device 0. Requests for device 0 are unchanged on the wire.
 | `GET /v1/members` | yes | `{"membership": {"type": "stable", "voters": [...]}, "addrs": {id: "host:port"}}` (`type` is `joint` with `old`/`new` mid-change); `addrs` are the Raft addresses learned from membership changes; `groups` lists `{group, membership}` for every metadata group. |
 | `POST /v1/members` | yes | `{"voters": {"<id>": "<host:port>", ...}}`: move to exactly this voter set (leader only) and return once the final configuration has committed. 409 while another change is in flight. With several groups each node changes the groups it leads and answers 421 until every group has the new set, so repeat it across the metadata nodes until it returns 200. |
 | `POST /v1/repair`, `POST /v1/gc` | yes | Run one pass now over the groups this node leads (421 if it leads none) and return the summed stats. |
+| `POST /v1/tier` | yes | One tiering pass now over the groups this node leads (needs `metadata.tiering`). |
+| `POST /v1/snapshots/{id}/export` | yes | `{"name": "..."}` (1-128 of `A-Za-z0-9._-`, not starting with `.`) → 202 `{"transfer": "t1"}`; on the leader of the snapshot's group (421 elsewhere). 409 if the export exists or is in progress. Needs `metadata.tiering`. |
+| `POST /v1/volumes/import` | yes | `{"export": "...", "name": "...", "id"?: "..."}` → 202 `{"transfer": "t2", "id": "<volume>"}`: creates the volume at the export's size and fills it in the background. |
+| `GET /v1/exports`, `GET /v1/exports/{name}` | yes | Complete exports (`name`, `snapshot_id`, `snapshot_name`, `size_bytes`, `extents`, `created_ms`), or one export's manifest. |
+| `DELETE /v1/exports/{name}` | yes | 200 `{"blobs_deleted": N}`. |
+| `GET /v1/transfers`, `GET /v1/transfers/{id}` | yes | This node's exports and imports (the last 100 finished are kept); see [Snapshot export and import](#snapshot-export-and-import). |
 | `/v1/fs/...`, `/v1/fs-snapshots/...` | yes | Filesystems, inodes, file data and filesystem snapshots/clones: see `docs/NATIVE_FS.md`. |
 
 Errors are JSON `{"error": "...", "code": "...", "leader": ...}`; `code` is a stable machine-readable
@@ -151,9 +257,9 @@ connection per request costs about 7 ms.
 
 ## Operations
 
-- **Maintenance**: the leader runs `repair_once` (scrub every replica, re-replicate missing or
-  corrupt ones) and `gc_once` (reclaim unreferenced extents) on their intervals. Each pass is a full
-  scan; size the repair interval to the data volume.
+- **Maintenance**: the leader runs the rebuild controller (below) continuously and `gc_once`
+  (reclaim unreferenced extents) every `gc_interval_secs`. `POST /v1/repair` still runs one
+  full, unpaced repair pass on demand.
 - **Dead connections**: a peer that vanishes without closing its sockets (a deleted pod, a
   powered-off host) is detected by its Raft senders: a connection is replaced when the peer has
   answered none of our requests for `max(40 ticks, 1 s)` or has reconnected to us since (it
@@ -178,6 +284,34 @@ connection per request costs about 7 ms.
   the process exit non-zero so its supervisor restarts it from disk.
 - **Logging**: startup prints the bound addresses to stderr; everything else is in `/metrics` and
   `/v1/status`.
+
+### Rebuild and scrub
+
+The leader of each metadata group runs a rebuild controller:
+
+- **Finding lost nodes.** Every 5 s it probes each data node that isn't backed off. A node that
+  has failed every request (probes, client I/O, repair) for `rebuild_delay_secs` counts as lost.
+  A node that answers again within the delay, such as one that restarted, costs no rebuild.
+- **Rebuild.** Extents with replicas or shards on lost nodes are found from metadata alone, and
+  rebuilt onto other nodes with the least spare redundancy first. A 4+2 extent that lost two
+  shards goes before one that lost one, and a 3-replica extent down to one copy goes before one
+  down to two. Parts on lost nodes are rebuilt without trying to read them. Extents that have
+  lost more parts than their layout tolerates are counted and left alone until a node returns.
+  An extent with no eligible target is retried after 30 s.
+- **Scrub.** When nothing needs rebuilding, it reads back and verifies the next 64 extents in id
+  order, resuming where it stopped. Missing and corrupt parts are rebuilt, so bit rot is caught.
+  A pass over every extent starts every `repair_interval_secs`, and the finished pass is reported
+  as `last_repair`.
+- **Pacing.** Rebuild and scrub traffic are capped separately (`rebuild_bytes_per_sec`,
+  `scrub_bytes_per_sec`). Client writes are held off only while a replacement is placed and
+  committed, never for a whole pass.
+
+`/v1/status` reports `rebuild` for each group the node leads: `lost_nodes`, `degraded_extents`,
+`at_risk_extents` (one more lost part from unreadable), `unrecoverable_extents`, `rebuilt` and
+`scrub` totals. `/metrics` has `atlas_native_lost_nodes`, `atlas_native_degraded_extents`,
+`atlas_native_at_risk_extents`, `atlas_native_unrebuildable_extents`,
+`atlas_native_rebuild_bytes_total`, `atlas_native_scrub_passes_total` and
+`atlas_native_scrub_bytes_total`, labelled by node and group.
 
 ## Membership changes
 

@@ -32,6 +32,11 @@ struct Cluster {
 
 impl Cluster {
     fn start() -> Self {
+        Self::start_with(None)
+    }
+
+    /// Three data nodes, three metadata voters; `erasure` codes extents of 64 KiB and up.
+    fn start_with(erasure: Option<&str>) -> Self {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("token"), TOKEN).unwrap();
         let data_l: Vec<(String, TcpListener)> =
@@ -94,6 +99,12 @@ impl Cluster {
                     bootstrap: None,
                     data_nodes: specs.clone(),
                     replicas: 3,
+                    erasure: erasure.map(|e| e.parse().unwrap()),
+                    erasure_min_bytes: 64 << 10,
+                    rebuild_delay_secs: 60,
+                    rebuild_bytes_per_sec: 0,
+                    scrub_bytes_per_sec: 0,
+                    tiering: None,
                     extent_bytes: 64 << 10,
                     tick_ms: 10,
                     proposal_timeout_ms: 3000,
@@ -365,6 +376,41 @@ fn direct_reads_fetch_extents_from_the_data_nodes() {
     writer.flush(f.ino).unwrap();
     assert_eq!(ops.read(f.ino, 100_000, 9).unwrap(), b"rewritten");
     assert_eq!(ops.direct_fallbacks(), 0);
+}
+
+#[test]
+fn direct_reads_of_erasure_coded_extents_read_the_data_shards() {
+    let c = Cluster::start_with(Some("2+1"));
+    create_fs(&c, "ec");
+    let writer = mount(&c, "ec", OpsConfig::default());
+    let f = writer
+        .mknode(ROOT_INO, "data.bin", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    // Ten coded 64 KiB extents and a replicated tail below erasure_min_bytes.
+    let data: Vec<u8> = (0..700_001u32).map(|i| (i * 37 % 241) as u8).collect();
+    writer.write(f.ino, 0, &data).unwrap();
+    writer.flush(f.ino).unwrap();
+    let layout = c
+        .client()
+        .json(
+            Method::GET,
+            &format!("/v1/fs/ec/inodes/{}/layout?offset=0&len=700001", f.ino),
+            Body::Empty,
+            Retry::Idempotent,
+        )
+        .unwrap();
+    let extents = layout["extents"].as_array().unwrap();
+    assert_eq!(extents.len(), 11);
+    assert_eq!(extents[0]["ec"]["data"], 2);
+    assert_eq!(extents[0]["ec"]["shard_len"], 32 << 10);
+    assert!(extents[10].get("ec").is_none());
+
+    let ops = mount(&c, "ec", direct(None));
+    assert_eq!(ops.read(f.ino, 0, 1 << 20).unwrap(), data);
+    assert_eq!(ops.read(f.ino, 65_530, 20).unwrap(), &data[65_530..65_550]);
+    assert_eq!(ops.direct_fallbacks(), 0);
+    // Through the leader too.
+    assert_eq!(writer.read(f.ino, 0, 1 << 20).unwrap(), data);
 }
 
 #[test]

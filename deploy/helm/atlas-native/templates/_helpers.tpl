@@ -98,9 +98,37 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
     "extent_bytes" (.Values.node.extentBytes | int64)
     "tick_ms" (.Values.node.tickMs | int)
     "proposal_timeout_ms" (.Values.node.proposalTimeoutMs | int)
+    "erasure_min_bytes" (.Values.node.erasureMinBytes | int64)
     "repair_interval_secs" (.Values.node.repairIntervalSecs | int)
+    "rebuild_delay_secs" (.Values.node.rebuildDelaySecs | int)
+    "rebuild_bytes_per_sec" (.Values.node.rebuildBytesPerSec | int64)
+    "scrub_bytes_per_sec" (.Values.node.scrubBytesPerSec | int64)
     "gc_interval_secs" (.Values.node.gcIntervalSecs | int)
     "groups" (.Values.node.metadataGroups | int)) -}}
+{{- if .Values.tiering.enabled -}}
+{{- $t := .Values.tiering -}}
+{{- $byo := and $t.endpoint $t.bucket $t.existingSecret -}}
+{{- if not (or $byo $t.objectBucketClaim.storageClassName) }}{{ fail "tiering needs tiering.objectBucketClaim.storageClassName, or tiering.endpoint, bucket and existingSecret" }}{{ end -}}
+{{- $s3 := dict
+  "endpoint" (ternary $t.endpoint "http://${BUCKET_HOST}:${BUCKET_PORT}" (not (empty $byo)))
+  "bucket" (ternary $t.bucket "${BUCKET_NAME}" (not (empty $byo)))
+  "region" $t.region
+  "access_key_file" "/etc/atlas-native/s3/AWS_ACCESS_KEY_ID"
+  "secret_key_file" "/etc/atlas-native/s3/AWS_SECRET_ACCESS_KEY" -}}
+{{- $_ := set $cfg.metadata "tiering" (dict
+  "store" (dict "s3" $s3)
+  "prefix" $t.prefix
+  "cold_after_secs" ($t.coldAfterSecs | int64)
+  "interval_secs" ($t.intervalSecs | int64)
+  "bytes_per_sec" ($t.bytesPerSec | int64)
+  "min_extent_bytes" ($t.minExtentBytes | int64)) -}}
+{{- end -}}
+{{- with .Values.node.erasure -}}
+{{- $km := splitList "+" . -}}
+{{- if ne (len $km) 2 }}{{ fail "node.erasure must look like \"4+2\"" }}{{ end -}}
+{{- if gt (add (atoi (index $km 0)) (atoi (index $km 1))) $n }}{{ fail "node.erasure needs a pod per shard: data + parity cannot exceed replicas" }}{{ end -}}
+{{- $_ := set $cfg.metadata "erasure" . -}}
+{{- end -}}
 {{- if .Values.tls.enabled -}}
 {{- $_ := set $cfg "tls" (dict "ca" "/etc/atlas-native/tls/ca.crt" "cert" "/etc/atlas-native/tls/tls.crt" "key" "/etc/atlas-native/tls/tls.key") -}}
 {{- end -}}
@@ -110,4 +138,14 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- $_ := set $cfg "http_tls" $h -}}
 {{- end -}}
 {{- toPrettyJson $cfg -}}
+{{- end -}}
+
+{{/* The Secret holding the tiering bucket's credentials. */}}
+{{- define "atlas-native.tierSecret" -}}
+{{- $t := .Values.tiering -}}
+{{- if and $t.endpoint $t.bucket $t.existingSecret -}}
+{{- $t.existingSecret -}}
+{{- else -}}
+{{- printf "%s-tier" (include "atlas-native.fullname" .) -}}
+{{- end -}}
 {{- end -}}

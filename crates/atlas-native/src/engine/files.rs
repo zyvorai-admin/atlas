@@ -51,7 +51,23 @@ pub struct LayoutExtent {
     pub len: usize,
     /// Hex SHA-256 of the whole extent.
     pub checksum: String,
+    /// Full copies in the order to try them; for an erasure-coded extent, its shards in shard
+    /// order.
     pub replicas: Vec<LayoutReplica>,
+    /// Set for an erasure-coded extent; a client that doesn't know it falls back on a checksum
+    /// mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ec: Option<LayoutEc>,
+}
+
+/// How to read an erasure-coded extent directly: concatenate data shards `0..data` (each
+/// `shard_len` bytes, verified against its hex SHA-256) and cut to the extent's length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutEc {
+    pub data: usize,
+    pub parity: usize,
+    pub shard_len: usize,
+    pub shard_checksums: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,7 +542,10 @@ impl NativeEngine {
         let extents = extents
             .into_iter()
             .map(|ext| {
-                let start = super::replica_start(&ext.id, ext.replicas.len());
+                let start = match ext.ec {
+                    Some(_) => 0,
+                    None => super::replica_start(&ext.id, ext.replicas.len()),
+                };
                 let replicas = ext
                     .replicas
                     .iter()
@@ -550,6 +569,12 @@ impl NativeEngine {
                     len: ext.len,
                     checksum: hex(&ext.checksum),
                     replicas,
+                    ec: ext.ec.as_ref().map(|e| LayoutEc {
+                        data: e.data,
+                        parity: e.parity,
+                        shard_len: e.shard_len,
+                        shard_checksums: e.shard_checksums.iter().map(|c| hex(c)).collect(),
+                    }),
                 }
             })
             .collect();

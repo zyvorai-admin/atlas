@@ -359,7 +359,27 @@ excludes it permanently.
   other command. Under Raft it runs on the leader behind the same `leader_ready` barrier and fence
   as writes. It reports `extents_checked`, `replicas_repaired`, `unrecoverable` (no good copy left)
   and `deferred` (no eligible target, or the extent changed underneath; retried on the next pass).
-  The engine does not schedule it; the hosting process decides how often to call it.
+  It holds the write lock only while a replacement is placed and committed, so writers are not
+  stalled behind a scan. `repair_extent(id, lost)` repairs one extent, treating parts on `lost`
+  nodes as missing without reading them. `lost_nodes`, `probe_nodes` and `degraded_extents`
+  (extents with parts on lost nodes, least spare redundancy first, from metadata alone) feed the
+  rebuild controller (`crate::rebuild`, `docs/NATIVE_NODE.md`), which schedules, prioritises and
+  paces repair; `tests/rebuild.rs` covers it.
+- **Tiered extents** (`ExtentRef.object`): `MetaCommand::TierExtent { extent_id, key, replicas }`
+  records the object holding the whole extent, clears its replicas and erasure layout and returns
+  their ranges to the free list. It is refused unless the extent still has exactly `replicas`, so
+  a concurrent repair can neither lose its new range nor have it freed. `ExtentRef.created_ms`,
+  which the leader stamps when it places an extent, dates it for the tiering policy (0 for older
+  extents). Reads that fail because the extent moved after they looked it up re-read it from
+  where it is now. `tests/tiering.rs` covers this.
+- **Erasure-coded extents** (`EngineConfig::erasure`, `ExtentRef.ec`) keep one `ReplicaRef` per
+  shard, in shard order, plus each shard's length and SHA-256. Every install command checks that
+  the layout is consistent and that no two shards share a node. The free list and GC count the
+  shard length per replica, so reclaiming a coded extent frees every shard. Reads decode around up
+  to m bad shards; `repair_once` reads every shard, rebuilds the bad ones from any k good ones and
+  moves each with the same `ReplaceReplica` command, onto a node holding no other shard. An extent
+  with more than m bad shards counts as `unrecoverable`. `tests/erasure.rs` covers placement and
+  space, partial overwrites and GC, corrupt and lost shards, too many lost shards and too few nodes.
 
 Metrics: `atlas_native_node_up{node}`, `atlas_native_node_failures_total{node}`,
 `atlas_native_replica_write_failures_total`, `atlas_native_replicas_repaired_total`;
@@ -399,7 +419,6 @@ Raft-backed engines writing to TLS data nodes.
 Not implemented yet:
 
 - per-client authorization on data nodes, certificate hot reload and revocation;
-- a background repair schedule and repair rate limiting (`repair_once` is a full scan per call);
 - membership changes: the voter set is fixed at open (quorum math already supports joint
   configurations);
 - lease-based reads (every read barrier costs the leader one round of appends).
@@ -431,6 +450,5 @@ Not implemented yet:
 - a container image, Helm chart and gateway integration for `atlas-native-node`
   (`docs/NATIVE_NODE.md`);
 - joint-consensus membership changes;
-- incremental, rate-limited background scrub (today `repair_once` scans everything);
 - hole punching for freed ranges at the device tail;
 - io_uring/raw-NVMe data path.

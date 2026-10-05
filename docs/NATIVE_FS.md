@@ -137,6 +137,9 @@ modes and ownership.
   cluster CA in `--ca-file`, and that identity is also accepted for writes by the data nodes, so
   give it only to trusted clients. Direct reads take read traffic off the leader; on a single host
   they cost an extra round trip (see the table below).
+  An erasure-coded extent's layout lists its shards in shard order with each shard's checksum; the
+  client reads and verifies the k data shards and joins them, and leaves decoding around a missing
+  shard to the leader.
 
 ## Data path
 
