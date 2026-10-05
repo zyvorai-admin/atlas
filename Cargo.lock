@@ -620,6 +620,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-native-csi"
+version = "0.4.0"
+dependencies = [
+ "atlas-native",
+ "atlas-native-fuse",
+ "clap",
+ "hyper-util",
+ "libc",
+ "prost",
+ "reqwest 0.13.5",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "atlas-native-fuse"
 version = "0.4.0"
 dependencies = [

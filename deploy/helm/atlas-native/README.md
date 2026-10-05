@@ -30,6 +30,10 @@ kubectl -n atlas-native get secret atlas-native-api -o jsonpath='{.data.token}' 
 | `persistence.size`, `persistence.storageClass` | 5Gi, default class | Per-pod state volume. |
 | `podAntiAffinity` | soft | `soft`, `hard` or `none`. |
 | `serviceMonitor.enabled` | false | Prometheus Operator `ServiceMonitor` for `/metrics`. |
+| `csi.enabled` | false | CSI driver `native.atlas.zyvor.ai` ([`docs/NATIVE_CSI.md`](../../../docs/NATIVE_CSI.md)): CSIDriver, controller Deployment, node DaemonSet and the StorageClass `csi.storageClass.name`. Not compatible with `httpTls.requireClientCert` yet. |
+| `csi.snapshots.enabled` | false | external-snapshotter sidecar and the VolumeSnapshotClass `csi.snapshots.className`; needs the VolumeSnapshot CRDs and snapshot-controller. |
+| `csi.node.updateStrategy` | OnDelete | Restarting a node plugin breaks the mounts on that node, so upgrades don't roll it. |
+| `csi.storageClass.extentBytes`, `csi.storageClass.mountOptions` | 0, [] | Extent grid of new filesystems; whitelisted `atlas-native-mount` options. |
 
 Pods roll only when the rendered config or the pod template changes (`checksum/config`), so an
 unchanged `helm upgrade` is a no-op. `deploy/native/helm-live-check.sh` installs the chart with
