@@ -1072,6 +1072,8 @@ mod tests {
                         offset: off,
                     }],
                     ec: None,
+                    created_ms: 0,
+                    object: None,
                 },
                 size: off + len as u64,
                 now_ns: 5,

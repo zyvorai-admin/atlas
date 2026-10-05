@@ -78,6 +78,11 @@ spec:
             - name: POD_NAME
               valueFrom:
                 fieldRef: { fieldPath: metadata.name }
+          {{- if and .Values.tiering.enabled (eq (include "atlas-native.tierSecret" .) (printf "%s-tier" $full)) }}
+          # BUCKET_HOST, BUCKET_PORT, BUCKET_NAME of the ObjectBucketClaim.
+          envFrom:
+            - configMapRef: { name: {{ $full }}-tier }
+          {{- end }}
           ports:
             - { name: http, containerPort: 7480 }
             - { name: data, containerPort: 7481 }
@@ -108,6 +113,9 @@ spec:
             {{- if .Values.httpTls.enabled }}
             - { name: http-tls, mountPath: /etc/atlas-native/http-tls, readOnly: true }
             {{- end }}
+            {{- if .Values.tiering.enabled }}
+            - { name: s3, mountPath: /etc/atlas-native/s3, readOnly: true }
+            {{- end }}
       volumes:
         - name: config
           configMap: { name: {{ $full }}-config }
@@ -120,6 +128,10 @@ spec:
         {{- if .Values.httpTls.enabled }}
         - name: http-tls
           secret: { secretName: {{ required "httpTls.existingSecret is required when httpTls.enabled" .Values.httpTls.existingSecret }} }
+        {{- end }}
+        {{- if .Values.tiering.enabled }}
+        - name: s3
+          secret: { secretName: {{ include "atlas-native.tierSecret" . }} }
         {{- end }}
   volumeClaimTemplates:
     - metadata:

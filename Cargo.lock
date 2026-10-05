@@ -601,6 +601,8 @@ dependencies = [
 name = "atlas-native"
 version = "0.4.0"
 dependencies = [
+ "anyhow",
+ "atlas-driver-rgw",
  "io-uring",
  "libc",
  "rcgen",
@@ -613,6 +615,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "uuid",
 ]
 

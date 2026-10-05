@@ -22,6 +22,7 @@ use crate::{
     metadata::{Catalog, ExtentRef, MetaCommand, MetaError, ReplicaRef, SnapshotId, VolumeId},
     metrics::PromText,
     namespace::{FsOp, InodeKind},
+    object::ObjectStore,
     placement::{select_replicas, Node, PlacementPolicy},
     raft::RaftError,
     raft_server::RaftServer,
@@ -32,13 +33,19 @@ use crate::{
     wal::{Wal, WalError, WalRecord},
 };
 
+mod export;
 mod files;
 mod leases;
+mod rebuild;
+mod tier;
+pub use export::{check_export_name, ExportExtent, ExportInfo, ExportManifest, ExportStats};
 pub use files::{
     Attr, DirEntry, FileLayout, FsInfo, FsSnapshotInfo, FsStat, LayoutEc, LayoutExtent,
     LayoutReplica, NewNode,
 };
 pub use leases::{now_ms, LockRequest, LockTable};
+pub use rebuild::Degraded;
+pub use tier::{TierPolicy, TierStats};
 
 /// Extents fetched concurrently by one read.
 const READ_PARALLELISM: usize = 8;
@@ -147,6 +154,15 @@ pub struct EngineConfig {
     /// replicating them (`placement.replicas` still applies to smaller ones).
     pub erasure: Option<EcScheme>,
     pub erasure_min_bytes: usize,
+    /// Where tiered extents live ([`NativeEngine::tier_once`]); reads of tiered extents fail
+    /// without it.
+    pub objects: Option<Arc<dyn ObjectStore>>,
+    /// Key prefix of this engine's objects. Engines sharing a bucket need distinct prefixes:
+    /// each deletes objects under its own prefix that its catalog doesn't reference.
+    pub object_prefix: String,
+    /// Key prefix of snapshot exports ([`NativeEngine::export_snapshot`]), shared by every
+    /// group of a cluster.
+    pub export_prefix: String,
 }
 
 /// Extents smaller than this stay replicated by default: their shards would be tiny.
@@ -163,6 +179,9 @@ impl EngineConfig {
             catalog_cache_inodes: DEFAULT_CACHE_INODES,
             erasure: None,
             erasure_min_bytes: DEFAULT_ERASURE_MIN_BYTES,
+            objects: None,
+            object_prefix: "atlas-native/".into(),
+            export_prefix: "atlas-native/".into(),
         }
     }
 }
@@ -206,6 +225,8 @@ impl std::fmt::Debug for Meta {
 struct NodeHealth {
     failures: AtomicU64,
     down_until: Mutex<Option<Instant>>,
+    /// First failure since the node last answered; what the rebuild controller ages.
+    down_since: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug)]
@@ -251,6 +272,21 @@ pub struct RepairStats {
     pub unrecoverable: u64,
     /// Bad replicas left for a later pass: no eligible target, or the extent changed meanwhile.
     pub deferred: u64,
+    /// Bytes read from data nodes to check and rebuild extents.
+    pub bytes_read: u64,
+    /// Bytes written to data nodes as replacement replicas or shards.
+    pub bytes_written: u64,
+}
+
+impl RepairStats {
+    pub fn add(&mut self, o: &RepairStats) {
+        self.extents_checked += o.extents_checked;
+        self.replicas_repaired += o.replicas_repaired;
+        self.unrecoverable += o.unrecoverable;
+        self.deferred += o.deferred;
+        self.bytes_read += o.bytes_read;
+        self.bytes_written += o.bytes_written;
+    }
 }
 
 #[derive(Debug)]
@@ -261,6 +297,13 @@ pub struct NativeEngine {
     /// Serializes free-list allocation through data write and `InstallExtent` commit, so two
     /// writers can never be handed the same free range.
     write_lock: Mutex<()>,
+    /// One repair at a time, so two never write replacements for the same part.
+    repair_lock: Mutex<()>,
+    /// When each extent was last read (ms since the epoch), tracked only with an object store,
+    /// so recently read extents aren't tiered. Not replicated: a new leader treats everything
+    /// as read when it opened its engine.
+    reads: Mutex<std::collections::HashMap<String, u64>>,
+    opened_ms: u64,
     pub telemetry: NativeIoCounters,
 }
 
@@ -330,6 +373,9 @@ impl NativeEngine {
             nodes: runtimes,
             meta,
             write_lock: Mutex::new(()),
+            repair_lock: Mutex::new(()),
+            reads: Mutex::new(Default::default()),
+            opened_ms: now_ms(),
             telemetry: NativeIoCounters::default(),
         };
         if let Meta::Local { catalog, store, .. } = &engine.meta {
@@ -631,6 +677,8 @@ impl NativeEngine {
             checksum: checksum::sha256(chunk),
             replicas,
             ec: None,
+            created_ms: now_ms(),
+            object: None,
         })
     }
 
@@ -697,6 +745,8 @@ impl NativeEngine {
             checksum: checksum::sha256(chunk),
             replicas: slots.into_iter().flatten().collect(),
             ec: Some(enc.layout),
+            created_ms: now_ms(),
+            object: None,
         })
     }
 
@@ -822,8 +872,14 @@ impl NativeEngine {
             ..Default::default()
         };
         for eid in candidates {
+            let object =
+                self.with_catalog(|c| c.extents.get(&eid).and_then(|e| e.extent.object.clone()))?;
             self.commit(MetaCommand::MarkExtentReclaimed { extent_id: eid }, None)?;
             stats.reclaimed += 1;
+            // A failed delete leaves an orphan for the next tiering pass's sweep.
+            if let (Some(key), Some(store)) = (object, &self.cfg.objects) {
+                let _ = store.delete(&key);
+            }
         }
         stats.freed_bytes = self.free_bytes()?.saturating_sub(free_before);
         self.telemetry.gc_reclaimed(stats.reclaimed);
@@ -832,82 +888,102 @@ impl NativeEngine {
 
     /// Scrubs every extent (reads each replica and verifies its checksum) and re-replicates
     /// replicas that are unreachable or corrupt onto healthy nodes, preserving host diversity.
-    /// Under Raft only the leader's engine can repair.
+    /// Under Raft only the leader's engine can repair. Writers are held off only while a
+    /// replacement is placed and committed, not for the whole scan.
     pub fn repair_once(&self) -> Result<RepairStats, NativeError> {
-        let _write = self
-            .write_lock
+        let fence = self.write_fence()?;
+        let _repair = self
+            .repair_lock
             .lock()
-            .map_err(|_| NativeError::Poisoned("write"))?;
-        let fence = match &self.meta {
-            Meta::Local { .. } => 0,
-            Meta::Raft { server, timeout } => server.leader_ready(*timeout)?,
-        };
-        let extents: Vec<ExtentRef> =
-            self.with_catalog(|c| c.extents.values().map(|e| e.extent.clone()).collect())?;
+            .map_err(|_| NativeError::Poisoned("repair"))?;
+        let ids: Vec<String> = self.with_catalog(|c| c.extents.keys().cloned().collect())?;
         let mut st = RepairStats::default();
-        for ext in extents {
-            st.extents_checked += 1;
-            if let Some(ec) = &ext.ec {
-                let shards: Vec<Option<Vec<u8>>> = (0..ec.shards())
-                    .map(|i| self.read_shard(&ext, ec, i))
-                    .collect();
-                let bad: Vec<usize> = (0..shards.len()).filter(|i| shards[*i].is_none()).collect();
-                if bad.is_empty() {
-                    continue;
-                }
-                let Ok(all) = ec.rebuild(shards) else {
-                    st.unrecoverable += 1;
-                    continue;
-                };
-                let bad = bad
-                    .into_iter()
-                    .map(|i| (ext.replicas[i].clone(), all[i].as_slice()))
-                    .collect();
-                self.replace_replicas(&ext, bad, fence, &mut st)?;
-                continue;
-            }
-            let mut good: Option<Vec<u8>> = None;
-            let mut bad = Vec::new();
-            for r in &ext.replicas {
-                let Some((node, device)) = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.spec.id == r.node_id && n.spec.healthy)
-                    .and_then(|n| n.devices.get(r.device_index).map(|d| (n, d)))
-                else {
-                    bad.push(r.clone());
-                    continue;
-                };
-                match device.read_exact_at(r.offset, ext.len) {
-                    Ok(buf) if checksum::verify(&buf, &ext.checksum) => {
-                        self.mark_up(node);
-                        good.get_or_insert(buf);
-                    }
-                    Ok(_) => {
-                        self.telemetry.checksum_failure();
-                        bad.push(r.clone());
-                    }
-                    Err(_) => {
-                        self.mark_down(node);
-                        bad.push(r.clone());
-                    }
-                }
-            }
-            if bad.is_empty() {
-                continue;
-            }
-            let Some(data) = good else {
-                st.unrecoverable += 1;
-                continue;
-            };
-            let bad = bad.into_iter().map(|r| (r, data.as_slice())).collect();
-            self.replace_replicas(&ext, bad, fence, &mut st)?;
+        for id in ids {
+            self.repair_extent_with(&id, &BTreeSet::new(), fence, &mut st)?;
         }
         Ok(st)
     }
 
+    /// Checks one extent and rebuilds its bad parts. Parts on `lost` nodes count as bad without
+    /// being read. An extent that no longer exists is skipped.
+    fn repair_extent_with(
+        &self,
+        id: &str,
+        lost: &BTreeSet<String>,
+        fence: u64,
+        st: &mut RepairStats,
+    ) -> Result<(), NativeError> {
+        let Some(ext) = self.with_catalog(|c| c.extents.get(id).map(|e| e.extent.clone()))? else {
+            return Ok(());
+        };
+        st.extents_checked += 1;
+        if let Some(ec) = &ext.ec {
+            let shards: Vec<Option<Vec<u8>>> = (0..ec.shards())
+                .map(|i| {
+                    if lost.contains(&ext.replicas[i].node_id) {
+                        return None;
+                    }
+                    let shard = self.read_shard(&ext, ec, i);
+                    st.bytes_read += shard.as_ref().map_or(0, |b| b.len() as u64);
+                    shard
+                })
+                .collect();
+            let bad: Vec<usize> = (0..shards.len()).filter(|i| shards[*i].is_none()).collect();
+            if bad.is_empty() {
+                return Ok(());
+            }
+            let Ok(all) = ec.rebuild(shards) else {
+                st.unrecoverable += 1;
+                return Ok(());
+            };
+            let bad = bad
+                .into_iter()
+                .map(|i| (ext.replicas[i].clone(), all[i].as_slice()))
+                .collect();
+            return self.replace_replicas(&ext, bad, fence, st);
+        }
+        let mut good: Option<Vec<u8>> = None;
+        let mut bad = Vec::new();
+        for r in &ext.replicas {
+            let Some((node, device)) = self
+                .nodes
+                .iter()
+                .find(|n| n.spec.id == r.node_id && n.spec.healthy && !lost.contains(&n.spec.id))
+                .and_then(|n| n.devices.get(r.device_index).map(|d| (n, d)))
+            else {
+                bad.push(r.clone());
+                continue;
+            };
+            match device.read_exact_at(r.offset, ext.len) {
+                Ok(buf) if checksum::verify(&buf, &ext.checksum) => {
+                    st.bytes_read += buf.len() as u64;
+                    self.mark_up(node);
+                    good.get_or_insert(buf);
+                }
+                Ok(_) => {
+                    self.telemetry.checksum_failure();
+                    bad.push(r.clone());
+                }
+                Err(_) => {
+                    self.mark_down(node);
+                    bad.push(r.clone());
+                }
+            }
+        }
+        if bad.is_empty() {
+            return Ok(());
+        }
+        let Some(data) = good else {
+            st.unrecoverable += 1;
+            return Ok(());
+        };
+        let bad = bad.into_iter().map(|r| (r, data.as_slice())).collect();
+        self.replace_replicas(&ext, bad, fence, st)
+    }
+
     /// Writes each bad replica's (or shard's) bytes to a new node that holds no other part of
     /// the extent, then commits the move. Stops at the first commit the extent's state rejects.
+    /// Holds `write_lock`, and does nothing if the extent changed since it was read.
     fn replace_replicas(
         &self,
         ext: &ExtentRef,
@@ -915,6 +991,19 @@ impl NativeEngine {
         fence: u64,
         st: &mut RepairStats,
     ) -> Result<(), NativeError> {
+        let _write = self
+            .write_lock
+            .lock()
+            .map_err(|_| NativeError::Poisoned("write"))?;
+        let unchanged = self.with_catalog(|c| {
+            c.extents
+                .get(&ext.id)
+                .is_some_and(|e| e.extent.replicas == ext.replicas)
+        })?;
+        if !unchanged {
+            st.deferred += 1;
+            return Ok(());
+        }
         let mut current = ext.replicas.clone();
         for (old, data) in bad {
             let others: Vec<&ReplicaRef> = current.iter().filter(|r| **r != old).collect();
@@ -949,6 +1038,7 @@ impl NativeEngine {
             match self.commit(cmd, Some(fence)) {
                 Ok(()) => {
                     st.replicas_repaired += 1;
+                    st.bytes_written += data.len() as u64;
                     self.telemetry.replica_repaired();
                     if let Some(slot) = current.iter_mut().find(|r| **r == old) {
                         *slot = new;
@@ -1050,6 +1140,12 @@ impl NativeEngine {
     /// Prometheus text exposition for I/O counters, metadata and free space.
     pub fn render_metrics(&self) -> Result<String, NativeError> {
         let t = self.telemetry.snapshot();
+        let (tiered, tiered_bytes) = self.with_catalog(|c| {
+            c.extents
+                .values()
+                .filter(|e| e.extent.object.is_some())
+                .fold((0u64, 0u64), |(n, b), e| (n + 1, b + e.extent.len as u64))
+        })?;
         let (applied, volumes, snapshots, extents, free_bytes, free_ranges, sessions, locks) = self
             .with_catalog(|c| {
                 (
@@ -1103,6 +1199,16 @@ impl NativeEngine {
                 "Replicas re-created by repair.",
                 t.replicas_repaired,
             ),
+            (
+                "atlas_native_extents_tiered_total",
+                "Extents moved to object storage.",
+                t.extents_tiered,
+            ),
+            (
+                "atlas_native_object_reads_total",
+                "Extent reads served from object storage.",
+                t.object_reads,
+            ),
         ] {
             p.single(name, "counter", help, v);
         }
@@ -1135,6 +1241,18 @@ impl NativeEngine {
             "gauge",
             "Live physical extents.",
             extents,
+        );
+        p.single(
+            "atlas_native_tiered_extents",
+            "gauge",
+            "Live extents held in object storage instead of on data nodes.",
+            tiered,
+        );
+        p.single(
+            "atlas_native_tiered_bytes",
+            "gauge",
+            "Bytes of the live extents held in object storage.",
+            tiered_bytes,
         );
         p.single(
             "atlas_native_client_sessions",
@@ -1234,13 +1352,20 @@ impl NativeEngine {
 
     fn mark_down(&self, n: &NodeRuntime) {
         n.health.failures.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
         if let Ok(mut d) = n.health.down_until.lock() {
-            *d = Some(Instant::now() + self.cfg.node_retry_after);
+            *d = Some(now + self.cfg.node_retry_after);
+        }
+        if let Ok(mut d) = n.health.down_since.lock() {
+            d.get_or_insert(now);
         }
     }
 
     fn mark_up(&self, n: &NodeRuntime) {
         if let Ok(mut d) = n.health.down_until.lock() {
+            *d = None;
+        }
+        if let Ok(mut d) = n.health.down_since.lock() {
             *d = None;
         }
     }
@@ -1456,10 +1581,51 @@ impl NativeEngine {
         Ok(())
     }
 
-    /// The whole extent from the first replica whose checksum verifies. Reads start at a
-    /// replica chosen from the extent id, so the read load of many extents spreads over all
-    /// their replicas instead of always landing on the first.
+    /// The whole extent, verified. If it fails because the extent moved since `ext` was looked
+    /// up (tiered or repaired, its old ranges reused), it is read again where it is now.
     fn read_extent(&self, ext: &ExtentRef) -> Result<Vec<u8>, NativeError> {
+        if self.cfg.objects.is_some() {
+            if let Ok(mut r) = self.reads.lock() {
+                r.insert(ext.id.clone(), now_ms());
+            }
+        }
+        match self.read_placed(ext) {
+            Err(NativeError::Checksum(id)) => {
+                let now = self.with_catalog(|c| c.extents.get(&id).map(|e| e.extent.clone()))?;
+                match now {
+                    Some(now) if now != *ext => self.read_placed(&now),
+                    _ => Err(NativeError::Checksum(id)),
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// A tiered extent from its object.
+    fn read_object(&self, ext: &ExtentRef, key: &str) -> Result<Vec<u8>, NativeError> {
+        let store = self.cfg.objects.as_ref().ok_or_else(|| {
+            NativeError::Invalid(format!(
+                "extent {} is tiered but no object store is configured",
+                ext.id
+            ))
+        })?;
+        let buf = store.get(key)?;
+        if buf.len() != ext.len || !checksum::verify(&buf, &ext.checksum) {
+            self.telemetry.checksum_failure();
+            return Err(NativeError::Checksum(ext.id.clone()));
+        }
+        self.telemetry.object_read();
+        self.telemetry.record_read(buf.len());
+        Ok(buf)
+    }
+
+    /// The whole extent from wherever `ext` says it is: its object, its shards, or the first
+    /// replica whose checksum verifies. Replica reads start at a replica chosen from the extent
+    /// id, so the read load of many extents spreads over all their replicas.
+    fn read_placed(&self, ext: &ExtentRef) -> Result<Vec<u8>, NativeError> {
+        if let Some(key) = &ext.object {
+            return self.read_object(ext, key);
+        }
         if let Some(ec) = &ext.ec {
             return self.read_shards(ext, ec);
         }

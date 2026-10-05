@@ -12,6 +12,7 @@ use std::{
 
 use atlas_native::node::{
     DataNodeRole, DataNodeSpec, DeviceConfig, Listeners, MetadataRole, NativeNode, NodeConfig,
+    ObjectStoreConfig, TieringConfig,
 };
 use atlas_native::DeviceBackend;
 
@@ -70,6 +71,27 @@ impl Cluster {
 
     /// [`Self::start`] with the namespace sharded across `groups` Raft groups.
     fn start_groups(meta: usize, data: usize, repair_interval_secs: u64, groups: u32) -> Self {
+        Self::start_full(meta, data, repair_interval_secs, groups, 60)
+    }
+
+    /// [`Self::start_groups`] with the rebuild controller's delay.
+    fn start_full(
+        meta: usize,
+        data: usize,
+        repair_interval_secs: u64,
+        groups: u32,
+        rebuild_delay_secs: u64,
+    ) -> Self {
+        Self::start_with(meta, data, |m| {
+            m.repair_interval_secs = repair_interval_secs;
+            m.groups = groups;
+            m.rebuild_delay_secs = rebuild_delay_secs;
+        })
+    }
+
+    /// `meta` metadata nodes and `data` data nodes, with `tweak` applied to every metadata
+    /// node's config.
+    fn start_with(meta: usize, data: usize, tweak: impl Fn(&mut MetadataRole)) -> Self {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("token"), format!("{TOKEN}\n")).unwrap();
         let data_l: BTreeMap<String, TcpListener> =
@@ -133,7 +155,7 @@ impl Cluster {
         let mut meta_nodes = BTreeMap::new();
         for (id, l) in meta_l {
             let mut cfg = base(&id, td.path());
-            cfg.metadata = Some(MetadataRole {
+            let mut role = MetadataRole {
                 listen: l.local_addr().unwrap(),
                 // Every voter, this node included: the node ignores its own entry.
                 peers: raft_addrs.clone(),
@@ -142,13 +164,19 @@ impl Cluster {
                 replicas: 3,
                 erasure: None,
                 erasure_min_bytes: 64 << 10,
+                rebuild_delay_secs: 60,
+                rebuild_bytes_per_sec: 0,
+                scrub_bytes_per_sec: 0,
+                tiering: None,
                 extent_bytes: 4096,
                 tick_ms: 10,
                 proposal_timeout_ms: 3000,
-                repair_interval_secs,
+                repair_interval_secs: 0,
                 gc_interval_secs: 0,
-                groups,
-            });
+                groups: 1,
+            };
+            tweak(&mut role);
+            cfg.metadata = Some(role);
             let n = NativeNode::start_with(
                 cfg,
                 Listeners {
@@ -476,6 +504,189 @@ fn background_repair_restores_replicas_after_losing_a_data_node() {
 }
 
 #[test]
+fn a_lost_data_node_is_rebuilt_without_waiting_for_a_scrub() {
+    // A scrub would take an hour to come round; only the rebuild path can restore replicas.
+    let mut c = Cluster::start_full(3, 4, 3600, 1, 1);
+    let (_, body) = c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"name":"vol","size_bytes":16384}"#,
+        201,
+    );
+    let v = json(&body)["id"].as_str().unwrap().to_string();
+    c.on_leader(
+        "PUT",
+        &format!("/v1/volumes/{v}/data?offset=0"),
+        &[6u8; 16384],
+        204,
+    );
+
+    c.data.insert("d2".into(), None);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let rebuilt = c.meta_addrs().into_iter().find_map(|(_, addr)| {
+            let (_, b) = api(addr, "GET", "/v1/status", b"");
+            let r = json(&b)["rebuild"][0].clone();
+            // The same node's metrics, before leadership can move on a loaded host.
+            let (_, m) = api(addr, "GET", "/metrics", b"");
+            (r["lost_nodes"] == serde_json::json!(["d2"])
+                && r["degraded_extents"] == 0
+                && r["rebuilt"]["replicas_repaired"].as_u64() >= Some(1))
+            .then(|| (r, String::from_utf8_lossy(&m).into_owned()))
+        });
+        if let Some((r, m)) = rebuilt {
+            assert_eq!(r["unrecoverable_extents"], 0, "{r}");
+            assert!(m.contains("atlas_native_lost_nodes{node="), "{m}");
+            assert!(m.contains("atlas_native_degraded_extents{node="), "{m}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the lost node was never rebuilt");
+        thread::sleep(Duration::from_millis(100));
+    }
+    c.data.insert("d1".into(), None);
+    c.wait_read(
+        &format!("/v1/volumes/{v}/data?offset=0&len=16384"),
+        &[6u8; 16384],
+    );
+}
+
+#[test]
+fn tiered_extents_are_read_from_objects_with_every_data_node_gone() {
+    let bucket = tempfile::tempdir().unwrap();
+    let path = bucket.path().to_path_buf();
+    let mut c = Cluster::start_with(3, 3, |m| {
+        m.tiering = Some(TieringConfig {
+            store: ObjectStoreConfig::Dir { path: path.clone() },
+            prefix: "cluster-a/".into(),
+            cold_after_secs: 0,
+            interval_secs: 0,
+            bytes_per_sec: 0,
+            min_extent_bytes: 0,
+        });
+    });
+    let (_, body) = c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"name":"vol","size_bytes":16384}"#,
+        201,
+    );
+    let v = json(&body)["id"].as_str().unwrap().to_string();
+    let data: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+    c.on_leader("PUT", &format!("/v1/volumes/{v}/data?offset=0"), &data, 204);
+
+    let (leader, body) = c.on_leader("POST", "/v1/tier", b"", 200);
+    assert_eq!(
+        json(&body)["tiered"],
+        4,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let objects = std::fs::read_dir(bucket.path().join("cluster-a/g0/extents"))
+        .unwrap()
+        .count();
+    assert_eq!(objects, 4);
+
+    // Every replica of the metadata applied the move, so any new leader reads the objects.
+    for id in ["d1", "d2", "d3"] {
+        c.data.insert(id.into(), None);
+    }
+    c.meta.insert(leader, None);
+    c.wait_read(&format!("/v1/volumes/{v}/data?offset=0&len=16384"), &data);
+}
+
+#[test]
+fn snapshots_export_to_objects_and_import_into_a_new_volume() {
+    let bucket = tempfile::tempdir().unwrap();
+    let path = bucket.path().to_path_buf();
+    let c = Cluster::start_with(3, 3, |m| {
+        m.tiering = Some(TieringConfig {
+            store: ObjectStoreConfig::Dir { path: path.clone() },
+            prefix: "cluster-a/".into(),
+            cold_after_secs: 3600,
+            interval_secs: 0,
+            bytes_per_sec: 0,
+            min_extent_bytes: 0,
+        });
+    });
+    let (_, body) = c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"name":"vol","size_bytes":16384}"#,
+        201,
+    );
+    let v = json(&body)["id"].as_str().unwrap().to_string();
+    let data: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+    c.on_leader("PUT", &format!("/v1/volumes/{v}/data?offset=0"), &data, 204);
+    let (_, body) = c.on_leader(
+        "POST",
+        &format!("/v1/volumes/{v}/snapshots"),
+        br#"{"name":"nightly"}"#,
+        201,
+    );
+    let s = json(&body)["id"].as_str().unwrap().to_string();
+
+    let finish = |node: &str, body: &[u8]| -> serde_json::Value {
+        let t = json(body)["transfer"].as_str().unwrap().to_string();
+        let addr = c.meta[node].as_ref().unwrap().http_addr();
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let (st, b) = api(addr, "GET", &format!("/v1/transfers/{t}"), b"");
+            assert_eq!(st, 200);
+            let j = json(&b);
+            match j["state"].as_str().unwrap() {
+                "done" => return j,
+                "failed" => panic!("transfer failed: {j}"),
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transfer {t} never finished: {j}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let (node, body) = c.on_leader(
+        "POST",
+        &format!("/v1/snapshots/{s}/export"),
+        br#"{"name":"vol-nightly"}"#,
+        202,
+    );
+    let t = finish(&node, &body);
+    assert_eq!(
+        (t["kind"].as_str(), t["done"].as_u64()),
+        (Some("export"), Some(4))
+    );
+    assert_eq!(t["result"]["uploaded"], 4, "{t}");
+    assert!(path
+        .join("cluster-a/exports/vol-nightly/manifest.json")
+        .exists());
+    let (_, body) = c.on_leader("GET", "/v1/exports", b"", 200);
+    assert_eq!(json(&body)["exports"][0]["snapshot_name"], "nightly");
+    c.on_leader(
+        "POST",
+        &format!("/v1/snapshots/{s}/export"),
+        br#"{"name":"../escape"}"#,
+        400,
+    );
+
+    let (node, body) = c.on_leader(
+        "POST",
+        "/v1/volumes/import",
+        br#"{"export":"vol-nightly","name":"restored"}"#,
+        202,
+    );
+    let w = json(&body)["id"].as_str().unwrap().to_string();
+    let t = finish(&node, &body);
+    assert_eq!(t["result"]["bytes"], 16384, "{t}");
+    c.wait_read(&format!("/v1/volumes/{w}/data?offset=0&len=16384"), &data);
+
+    let (_, body) = c.on_leader("DELETE", "/v1/exports/vol-nightly", b"", 200);
+    assert_eq!(json(&body)["blobs_deleted"], 4);
+    c.on_leader("GET", "/v1/exports/vol-nightly", b"", 404);
+}
+
+#[test]
 fn config_validation_rejects_bad_files() {
     let td = tempfile::tempdir().unwrap();
     let write = |name: &str, body: &str| {
@@ -510,6 +721,13 @@ fn config_validation_rejects_bad_files() {
             r#"{"node_id":"m1","data_dir":"/tmp/x","http_listen":"127.0.0.1:0",
                 "metadata":{"listen":"127.0.0.1:0","peers":{"m2":"no-port"},"replicas":1,
                 "data_nodes":[{"id":"d1","addr":"d1.svc:7481"}]}}"#,
+        ),
+        (
+            "tierprefix.json",
+            r#"{"node_id":"m1","data_dir":"/tmp/x","http_listen":"127.0.0.1:0",
+                "metadata":{"listen":"127.0.0.1:0","peers":{},"replicas":1,
+                "data_nodes":[{"id":"d1","addr":"127.0.0.1:1"}],
+                "tiering":{"store":{"dir":{"path":"/tmp/b"}},"prefix":"../up/"}}}"#,
         ),
         (
             "unsetenv.json",

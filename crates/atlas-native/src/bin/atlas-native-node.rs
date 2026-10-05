@@ -8,6 +8,9 @@ use std::{process::ExitCode, thread, time::Duration};
 use atlas_native::node::{NativeNode, NodeConfig};
 
 fn main() -> ExitCode {
+    // With the `s3` feature reqwest also links aws-lc-rs, and rustls refuses to pick a provider
+    // on its own when two are compiled in.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args: Vec<String> = std::env::args().collect();
     let path = match args.as_slice() {
         [_, flag, path] if flag == "--config" => path,
