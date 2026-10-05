@@ -122,3 +122,51 @@ serviceMonitor:
   labels: {}
 
 clusterDomain: cluster.local
+
+# CSI driver `native.atlas.zyvor.ai` (docs/NATIVE_CSI.md): PVCs become atlas-native filesystems,
+# VolumeSnapshots filesystem snapshots, and every pod mounts its volume through FUSE. All access
+# modes (RWO, ROX, RWX) are supported; block volumes and expansion are not.
+csi:
+  enabled: false
+  image:
+    repository: ghcr.io/zyvorai/atlas-native-csi
+    tag: ""          # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  # The node plugin mounts under the kubelet root; change it only for distributions that move it.
+  kubeletDir: /var/lib/kubelet
+  sidecars:
+    provisioner: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
+    snapshotter: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
+    registrar: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 128Mi }
+  controller:
+    replicas: 1
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 128Mi }
+  node:
+    # Restarting a node plugin pod breaks the volumes mounted on that node until their pods
+    # restart, so upgrades don't roll it: drain a node, then delete its plugin pod. RollingUpdate
+    # rolls it on every chart upgrade that changes the pod.
+    updateStrategy: OnDelete
+    # Each published volume is one FUSE client process in this pod, with its own caches.
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 2Gi }
+    nodeSelector: {}
+    tolerations: []
+  storageClass:
+    create: true
+    name: atlas-native-fs
+    reclaimPolicy: Delete
+    # Extent grid of new filesystems in bytes; 0 uses node.extentBytes.
+    extentBytes: 0
+    # atlas-native-mount options: ro, cache-leases, direct-reads, writeback-parallel=<n>, ...
+    mountOptions: []
+  snapshots:
+    # Needs the VolumeSnapshot CRDs and snapshot-controller installed in the cluster.
+    enabled: false
+    createClass: true
+    className: atlas-native-fs

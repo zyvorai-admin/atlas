@@ -23,6 +23,7 @@ members = [
     "crates/atlas-io",
     "crates/atlas-native",
     "crates/atlas-native-fuse",
+    "crates/atlas-native-csi",
     "crates/atlasctl",
 ]
 resolver = "2"

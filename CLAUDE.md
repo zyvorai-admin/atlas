@@ -159,6 +159,11 @@ integrations beyond the gRPC surface.
 - `crates/atlas-native-fuse` — `atlas-native-mount` FUSE client for native filesystems (`fuse`
   feature, Linux only; the kernel-independent `ops` layer is tested on any OS against in-process
   nodes). See `docs/NATIVE_FS.md`.
+- `crates/atlas-native-csi` — CSI driver `native.atlas.zyvor.ai` (bin `atlas-native-csi`,
+  `Dockerfile.native-csi`, chart `csi.enabled`): PVCs → filesystems, VolumeSnapshots, clones, per-pod
+  `atlas-native-mount` FUSE mounts. `proto/csi.proto` is a wire-compatible subset of the CSI spec
+  (no well-known-type imports: Debian's protoc lacks them). Unmounts use `umount2(2)`, not
+  `fusermount3 -u` (Ubuntu's AppArmor profile blocks it). Verified on the lab k3s; see `docs/NATIVE_CSI.md`.
 - `crates/atlas-driver-weka` — read-only WEKA discovery over its REST API (`ATLAS_WEKA_ENABLE`, fake/real);
  see `docs/COMPARISON.md`.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
