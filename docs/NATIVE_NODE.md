@@ -68,6 +68,8 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `max_request_bytes` | 64 MiB | Larger HTTP bodies and read lengths get 413. |
 | `metadata.bootstrap` | every `peers` entry | Initial Raft voters, used until the first membership change commits. A node not listed starts as a non-voter (it never campaigns) and waits to be added through `POST /v1/members`. Every id needs a `peers` entry. |
 | `metadata.replicas` | 3 | Between 1 and the number of `data_nodes`. |
+| `metadata.erasure` | unset | Reed-Solomon scheme `k+m` (e.g. `4+2`, `8+3`; k up to 32, m up to 8) for new extents; unset keeps replicating. Needs at least k+m data nodes; see [Erasure coding](#erasure-coding). |
+| `metadata.erasure_min_bytes` | 64 KiB | Smaller extents (file tails, small files) are still replicated. |
 | `metadata.extent_bytes` | 4 MiB | Writes are split into extents of this size. |
 | `metadata.tick_ms` | 50 | Raft tick; elections take 10–20 ticks. |
 | `metadata.proposal_timeout_ms` | 5000 | Bounds leader readiness, each proposal and each data-node I/O. |
@@ -113,6 +115,27 @@ Upgrade order: upgrade the data nodes first, then raise `data_nodes[].devices` o
 replicas. A client asking for device 1 or above first asks the data node how many devices it
 serves; an older data node doesn't understand the question, so the request fails instead of
 silently landing on device 0. Requests for device 0 are unchanged on the wire.
+
+### Erasure coding
+
+With `"erasure": "4+2"` in the `metadata` section, each extent of at least `erasure_min_bytes` is
+split into 4 data shards and 2 Reed-Solomon parity shards, each on a different data node (and so a
+different host), so a 4 MiB extent occupies 6 MiB instead of the 12 MiB three replicas take. Any
+2 shards can be lost. Each shard carries its own SHA-256 next to the extent's.
+
+- **Reads** fetch the data shards, preferring nodes that are up. A shard that fails its checksum or
+  can't be read is replaced by a parity shard and the missing data is decoded.
+- **Repair** (the scrub loop) reads every shard, rebuilds the missing or corrupt ones and writes
+  each to a node holding no other shard of that extent. With more than m shards gone the extent is
+  reported unrecoverable, as with replicas.
+- **Writes** need a node per shard; a node that fails is swapped for a spare. With fewer than k+m
+  nodes up, the write fails rather than storing a weaker layout.
+- **Existing data** stays as written: changing or removing `erasure` affects new extents only, and
+  coded and replicated extents can be mixed in one file. Clients that read data nodes directly
+  (`docs/NATIVE_FS.md`) read the data shards and fall back to the leader when any is missing.
+
+Measured codec speed on one core (4 MiB extents, release build): about 1.5 GiB/s to encode
+(checksums included) and 2 GiB/s or more to rebuild two lost data shards, for both 4+2 and 8+3.
 
 ## HTTP API
 

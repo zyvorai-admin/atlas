@@ -140,6 +140,8 @@ impl Cluster {
                 bootstrap: None,
                 data_nodes: specs.clone(),
                 replicas: 3,
+                erasure: None,
+                erasure_min_bytes: 64 << 10,
                 extent_bytes: 4096,
                 tick_ms: 10,
                 proposal_timeout_ms: 3000,

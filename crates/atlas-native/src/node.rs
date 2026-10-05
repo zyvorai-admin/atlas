@@ -23,6 +23,7 @@ use serde_json::json;
 use crate::{
     data_node::{DataNodeServer, RemoteDevice},
     device::BlockStore,
+    ec::EcScheme,
     engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind, RepairStats},
     gc::GcStats,
     http::{Handler, HttpServer, Request, Response},
@@ -114,6 +115,13 @@ pub struct MetadataRole {
     pub data_nodes: Vec<DataNodeSpec>,
     #[serde(default = "default_replicas")]
     pub replicas: usize,
+    /// Erasure-code extents of at least `erasure_min_bytes` (default 64 KiB) as `"<data>+<parity>"`
+    /// shards (e.g. `"4+2"`, `"8+3"`), each on its own data node; smaller extents keep
+    /// `replicas` copies. Applies to extents written from then on.
+    #[serde(default)]
+    pub erasure: Option<EcScheme>,
+    #[serde(default = "default_erasure_min_bytes")]
+    pub erasure_min_bytes: usize,
     #[serde(default = "default_extent_bytes")]
     pub extent_bytes: usize,
     #[serde(default = "default_tick_ms")]
@@ -169,6 +177,9 @@ fn default_max_request_bytes() -> usize {
 }
 fn default_replicas() -> usize {
     3
+}
+fn default_erasure_min_bytes() -> usize {
+    crate::engine::DEFAULT_ERASURE_MIN_BYTES
 }
 fn default_extent_bytes() -> usize {
     4 << 20
@@ -251,6 +262,15 @@ impl NodeConfig {
                     m.replicas,
                     m.data_nodes.len()
                 ));
+            }
+            if let Some(e) = m.erasure {
+                if e.shards() > m.data_nodes.len() {
+                    return invalid(format!(
+                        "metadata.erasure {e} needs {} data_nodes, {} configured",
+                        e.shards(),
+                        m.data_nodes.len()
+                    ));
+                }
             }
             if m.extent_bytes == 0 || m.extent_bytes as u64 > crate::data_node::MAX_PAYLOAD {
                 return invalid("metadata.extent_bytes out of range".into());
@@ -479,6 +499,8 @@ impl NativeNode {
                     }
                     let mut ecfg = EngineConfig::new(group_dir(&cfg.data_dir, "engine", g));
                     ecfg.extent_bytes = m.extent_bytes;
+                    ecfg.erasure = m.erasure;
+                    ecfg.erasure_min_bytes = m.erasure_min_bytes;
                     ecfg.placement = PlacementPolicy {
                         replicas: m.replicas,
                         ..PlacementPolicy::default()
@@ -1249,5 +1271,29 @@ mod tests {
         );
         assert!(expand_env("${MISSING}", env).is_err());
         assert!(expand_env("${POD_NAME", env).is_err());
+    }
+
+    #[test]
+    fn an_erasure_scheme_needs_a_data_node_per_shard() {
+        let cfg = |erasure: &str| {
+            let nodes: Vec<_> = (1..=5)
+                .map(|i| serde_json::json!({ "id": format!("d{i}"), "addr": format!("d{i}:7000") }))
+                .collect();
+            serde_json::from_value::<super::NodeConfig>(serde_json::json!({
+                "node_id": "m1",
+                "data_dir": "/tmp/x",
+                "http_listen": "127.0.0.1:0",
+                "metadata": {
+                    "listen": "127.0.0.1:0",
+                    "peers": {},
+                    "data_nodes": nodes,
+                    "erasure": erasure,
+                },
+            }))
+        };
+        cfg("4+1").unwrap().validate().unwrap();
+        let e = cfg("4+2").unwrap().validate().unwrap_err().to_string();
+        assert!(e.contains("needs 6 data_nodes, 5 configured"), "{e}");
+        assert!(cfg("4-2").is_err());
     }
 }

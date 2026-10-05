@@ -360,6 +360,14 @@ excludes it permanently.
   as writes. It reports `extents_checked`, `replicas_repaired`, `unrecoverable` (no good copy left)
   and `deferred` (no eligible target, or the extent changed underneath; retried on the next pass).
   The engine does not schedule it; the hosting process decides how often to call it.
+- **Erasure-coded extents** (`EngineConfig::erasure`, `ExtentRef.ec`) keep one `ReplicaRef` per
+  shard, in shard order, plus each shard's length and SHA-256. Every install command checks that
+  the layout is consistent and that no two shards share a node. The free list and GC count the
+  shard length per replica, so reclaiming a coded extent frees every shard. Reads decode around up
+  to m bad shards; `repair_once` reads every shard, rebuilds the bad ones from any k good ones and
+  moves each with the same `ReplaceReplica` command, onto a node holding no other shard. An extent
+  with more than m bad shards counts as `unrecoverable`. `tests/erasure.rs` covers placement and
+  space, partial overwrites and GC, corrupt and lost shards, too many lost shards and too few nodes.
 
 Metrics: `atlas_native_node_up{node}`, `atlas_native_node_failures_total{node}`,
 `atlas_native_replica_write_failures_total`, `atlas_native_replicas_repaired_total`;

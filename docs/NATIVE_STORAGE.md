@@ -11,7 +11,10 @@ GDS and erasure-coding work can build on.
 
 - Writes allocate new extents; existing extents are never overwritten in place.
 - Every extent is checksummed with SHA-256.
-- Placement is failure-domain aware and defaults to 3 replicas on distinct hosts/racks.
+- Placement is failure-domain aware and defaults to 3 replicas on distinct hosts/racks. With
+  `metadata.erasure` set (`4+2`, `8+3`, any k+m up to 32+8), extents of at least
+  `erasure_min_bytes` are Reed-Solomon coded into k data and m parity shards on k+m distinct
+  nodes instead (`docs/NATIVE_NODE.md`, "Erasure coding").
 - Metadata is checkpointed incrementally into `catalog.redb` (one durable redb transaction per checkpoint).
 - Snapshot creation copies only extent references, so subsequent writes are copy-on-write.
 - Reads validate checksums and may fall back to another healthy replica; a read starts at a
@@ -30,7 +33,7 @@ The roadmap and the comparison it serves are in [`COMPARISON.md`](COMPARISON.md)
 | Data path: parallel extent I/O, group commit, pooled data-node connections, direct client reads | Done (`docs/NATIVE_FS.md`, "Data path") |
 | `io_uring` device backend with `O_DIRECT` on raw NVMe, multi-device striping | Done (`docs/NATIVE_NODE.md`, "Devices"); verified on ext4, not yet benchmarked on NVMe |
 | Namespace sharded across Raft groups, on-disk catalog, client leases | Started: commits cost one fsync, Raft replication is pipelined, and checkpoints write only changed records to an embedded KV store (`catalog.redb`; `metadata_bench`: ~9k creates/s from one proposer and ~12k/s from eight on a 3-voter group at 20k files). Inode tables are paged from the store through a bounded cache, and so are directory entries, one name or one page at a time, so memory no longer holds the whole namespace (filesystem snapshot trees still do); volumes and filesystems shard across Raft groups that share voters and data nodes (`metadata.groups`), with ReadIndex barriers so any replica routes correctly; client sessions (leases) hold cross-mount `fcntl`/`flock` locks that survive leader failover and are released when a client stops renewing; cache leases recalled before every change let mounts cache attributes and names without ever serving them stale (`--cache-leases`) |
-| Erasure coding, rebuild controller, S3 tiering of cold extents | Not started; 3 replicas |
+| Erasure coding, rebuild controller, S3 tiering of cold extents | Started: Reed-Solomon k+m extents (`metadata.erasure`), read around lost shards and rebuilt onto spare nodes by repair; codec ~1.5 GiB/s encode and ~2 GiB/s two-shard rebuild per core (4 MiB extents). The rebuild controller and S3 tiering are not started |
 | RDMA transport, GPUDirect Storage, checkpoint fast path, CSI driver | Not started |
 | NFS, SMB and S3 front ends, POSIX ACLs, quotas, `O_DIRECT` | Not started |
 | libbpf/aya loader for the native eBPF maps | Not started (`atlas-io` covers block-layer attribution) |

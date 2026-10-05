@@ -16,6 +16,7 @@ pub mod checksum;
 pub mod data_node;
 pub mod device;
 mod durable;
+pub mod ec;
 pub mod engine;
 pub mod gc;
 pub mod http;

@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     alloc::FreeList,
+    ec::EcLayout,
     leases::{LeaseOp, Leases},
     membership::Membership,
     namespace::{FsId, FsMeta, FsOp, FsSnapshotMeta},
@@ -29,7 +30,34 @@ pub struct ExtentRef {
     pub logical_offset: u64,
     pub len: usize,
     pub checksum: [u8; 32],
+    /// Full copies; for an erasure-coded extent, shard `i` of `ec` is `replicas[i]`.
     pub replicas: Vec<ReplicaRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ec: Option<EcLayout>,
+}
+
+impl ExtentRef {
+    /// Bytes each replica (or shard) takes on its device.
+    pub fn stored_len(&self) -> u64 {
+        self.ec.as_ref().map_or(self.len, |e| e.shard_len) as u64
+    }
+
+    /// Checks an extent about to be installed: an erasure-coded one must match its layout, and
+    /// no two of its replicas or shards may share a node.
+    pub fn check(&self) -> Result<(), MetaError> {
+        if let Some(ec) = &self.ec {
+            ec.check(self.len, self.replicas.len())?;
+            let mut nodes: Vec<&str> = self.replicas.iter().map(|r| r.node_id.as_str()).collect();
+            nodes.sort_unstable();
+            if nodes.windows(2).any(|w| w[0] == w[1]) {
+                return Err(MetaError::Invalid(format!(
+                    "extent {} puts two shards on one node",
+                    self.id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +279,7 @@ impl Catalog {
                 logical_offset,
                 extent,
             } => {
+                extent.check()?;
                 let old = {
                     let vol = self
                         .volumes
@@ -264,6 +293,9 @@ impl Catalog {
                 }
             }
             MetaCommand::InstallExtents { volume_id, extents } => {
+                for e in extents {
+                    e.check()?;
+                }
                 let old: Vec<ExtentId> = {
                     let vol = self
                         .volumes
@@ -408,7 +440,7 @@ impl Catalog {
                 let e = self.extents.remove(extent_id).expect("checked above");
                 for r in &e.extent.replicas {
                     self.free
-                        .release(&r.node_id, r.device_index, r.offset, e.extent.len as u64)
+                        .release(&r.node_id, r.device_index, r.offset, e.extent.stored_len())
                         .map_err(MetaError::Invalid)?;
                 }
             }
@@ -448,7 +480,7 @@ impl Catalog {
                         new.node_id
                     )));
                 }
-                let len = e.extent.len as u64;
+                let len = e.extent.stored_len();
                 e.extent.replicas[pos] = new.clone();
                 self.free
                     .reserve(&new.node_id, new.device_index, new.offset, len);
@@ -548,7 +580,7 @@ impl Catalog {
         if !self.extents.contains_key(&extent.id) {
             for r in &extent.replicas {
                 self.free
-                    .reserve(&r.node_id, r.device_index, r.offset, extent.len as u64);
+                    .reserve(&r.node_id, r.device_index, r.offset, extent.stored_len());
             }
         }
         if let Some(e) = self.extents.get_mut(&extent.id) {

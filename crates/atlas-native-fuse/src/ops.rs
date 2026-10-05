@@ -834,8 +834,31 @@ impl Ops {
         Ok(out)
     }
 
-    /// One whole extent from the first replica whose checksum verifies.
+    /// One whole extent from the first replica whose checksum verifies, or from the data shards
+    /// of an erasure-coded one (a missing or bad shard falls back to the leader, which rebuilds).
     fn read_extent_direct(&self, d: &DirectReads, ext: &LayoutExtent) -> Result<Vec<u8>, String> {
+        if let Some(ec) = &ext.ec {
+            let mut out = Vec::with_capacity(ec.data * ec.shard_len);
+            for (i, r) in ext.replicas.iter().take(ec.data).enumerate() {
+                let endpoint = r
+                    .endpoint
+                    .as_ref()
+                    .ok_or_else(|| format!("shard {i} on {} has no endpoint", r.node_id))?;
+                let dev = self.data_node(d, &r.node_id, endpoint, r.device_index)?;
+                let shard = dev
+                    .read_exact_at(r.offset, ec.shard_len)
+                    .map_err(|e| format!("shard {i} on {}: {e}", r.node_id))?;
+                if ec.shard_checksums.get(i) != Some(&hex(&checksum::sha256(&shard))) {
+                    return Err(format!("shard {i} checksum mismatch on {}", r.node_id));
+                }
+                out.extend_from_slice(&shard);
+            }
+            out.truncate(ext.len);
+            if hex(&checksum::sha256(&out)) != ext.checksum {
+                return Err("erasure-coded extent checksum mismatch".into());
+            }
+            return Ok(out);
+        }
         let mut last = format!("extent at {} has no reachable replica", ext.logical_offset);
         for r in &ext.replicas {
             let Some(endpoint) = &r.endpoint else {

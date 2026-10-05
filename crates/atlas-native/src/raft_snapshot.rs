@@ -332,6 +332,7 @@ mod tests {
                     device_index: 0,
                     offset: i * 4096,
                 }],
+                ec: None,
             });
         }
         // Paged on the leader's store, with some changes on top of it.

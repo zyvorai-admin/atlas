@@ -268,6 +268,7 @@ fn replace_replica_rejects_invalid_moves() {
                 len: 4096,
                 checksum: [0; 32],
                 replicas: vec![r("a", 0), r("b", 0)],
+                ec: None,
             },
         },
     )

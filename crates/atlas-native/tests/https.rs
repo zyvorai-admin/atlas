@@ -137,6 +137,8 @@ fn start_node(root: &Path, server: &(String, String), client_ca: &str) -> Native
                 devices: 1,
             }],
             replicas: 1,
+            erasure: None,
+            erasure_min_bytes: 64 << 10,
             extent_bytes: 4096,
             tick_ms: 10,
             proposal_timeout_ms: 3000,
