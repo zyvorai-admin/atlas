@@ -87,6 +87,10 @@ struct Args {
     /// a change by another client recalls them first, so nothing cached is stale.
     #[arg(long)]
     cache_leases: bool,
+    /// Enforce POSIX ACLs (`setfacl`/`getfacl`): the kernel checks them on every access, at the
+    /// cost of one ACL lookup per inode it hasn't cached.
+    #[arg(long)]
+    acl: bool,
 }
 
 fn read(path: &Option<PathBuf>, what: &str) -> Result<Option<Vec<u8>>, String> {
@@ -160,7 +164,7 @@ fn mount(args: &Args, ops: Ops) -> Result<(), String> {
     }
     cfg.n_threads = Some(args.fuse_threads.max(1));
     cfg.clone_fd = args.fuse_threads > 1;
-    let fs = atlas_native_fuse::fuse::AtlasFs::new(ops);
+    let fs = atlas_native_fuse::fuse::AtlasFs::new(ops).with_posix_acl(args.acl);
     fuser::mount(fs, &args.mountpoint, &cfg).map_err(|e| format!("mount: {e}"))
 }
 

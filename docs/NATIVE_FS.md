@@ -113,7 +113,7 @@ the background, default 4; 0 sends them in the write call), `--readahead-bytes` 
 `--max-io-bytes` (largest request, default 8 MiB; keep at or below the nodes' `max_request_bytes`),
 `--retry-secs` (default 30), `--read-only`, `--allow-other`, `--fuse-threads` (kernel request
 workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the mount's
-session, default 15000), `--cache-leases` (see Consistency), `--direct-reads` and `--prefer-host` (below). It runs in the
+session, default 15000), `--cache-leases` (see Consistency), `--acl` (see "POSIX ACLs"), `--direct-reads` and `--prefer-host` (below). It runs in the
 foreground until `fusermount3 -u`; the mount uses `default_permissions`, so the kernel checks
 modes and ownership.
 
@@ -184,6 +184,31 @@ Mount on the pinned host with `--direct-reads --prefer-host <host>` to read the 
 CSI driver doesn't pass `--prefer-host` yet, since it needs the data nodes' `host` to match the
 Kubernetes node names, which the chart doesn't configure.
 
+## POSIX ACLs
+
+Mount with `--acl` (CSI: the `acl` mount option) and `setfacl`/`getfacl` work as on a local
+filesystem: the kernel enforces the ACLs (`FUSE_POSIX_ACL`), and the cluster keeps them
+consistent, the same for every client:
+
+- `system.posix_acl_access` and `system.posix_acl_default` are validated (the Linux xattr
+  encoding: one owner, group and other entry, a mask with any named entry, sorted, no duplicates)
+  and refused with EINVAL otherwise. A default ACL is for directories only.
+- Setting an access ACL sets the mode's permission bits from it (owner, mask or else group, and
+  other); one that says no more than the mode is not stored. `chmod` rewrites the access ACL's
+  owner, mask (or group) and other entries.
+- A node created in a directory with a default ACL gets it as its access ACL, ANDed with the
+  requested mode, and the umask is not applied; a new directory also inherits the default ACL.
+  Symlinks have no ACLs. Without a default ACL the umask applies as usual.
+- Without `--acl` the kernel neither enforces nor exposes ACLs (`getfacl` shows the mode only),
+  but ACLs set by `--acl` mounts are still stored and inherited by the cluster.
+- Each mount's kernel caches an inode's ACL. A change made through another mount may be missed
+  until that kernel drops the inode from its cache, so treat ACL changes like other metadata
+  across mounts (`--ttl-ms`, close-to-open).
+- Not done: clearing setgid when a non-member of the group sets an ACL (the kernel's
+  `FUSE_SETXATTR_ACL_KILL_SGID`). NFSv4 ACLs are not supported.
+- Upgrades: ACL xattrs and the create mode sent for inheritance are new to the metadata
+  commands, so upgrade every metadata node before mounting with `--acl`.
+
 ## Quotas
 
 `PUT /v1/fs/{fs}/quota {"max_bytes": 107374182400, "max_inodes": 1000000}` limits a filesystem;
@@ -250,7 +275,8 @@ either limit may be left out, and `{}` removes the quota.
   disappears for everyone.
 - **Extended attributes** in the `user.`, `trusted.` and `security.` namespaces are stored on the
   inode (replicated, copied by snapshots and clones): at most 64 KiB per value and 256 KiB per
-  inode. `system.*` (POSIX ACLs) is refused with EOPNOTSUPP rather than stored unenforced.
+  inode. Of `system.*`, only the two POSIX ACLs are stored (see "POSIX ACLs"); the rest is
+  refused with EOPNOTSUPP.
 - **Locks**: `fcntl` byte-range locks and `flock` locks are held in the cluster, so every mount
   of the filesystem sees them. A mount opens a session on its first lock and renews it every
   third of `--session-ttl-ms`; the session holds its locks. Closing a file drops its process's
@@ -262,7 +288,7 @@ either limit may be left out, and `{}` removes the quota.
   `--fuse-threads` − 1 waits run at once, more fail with ENOLCK, so waiters never take the
   kernel worker an unlock needs. A snapshot mount grants every lock locally (nothing writes
   there). Locks need every metadata node upgraded first: an older node cannot apply them.
-- Not implemented: POSIX ACLs, `O_DIRECT`.
+- Not implemented: `O_DIRECT`.
 
 ## Atlas gateway
 

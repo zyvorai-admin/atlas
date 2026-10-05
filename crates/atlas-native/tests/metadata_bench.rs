@@ -35,6 +35,7 @@ fn new_file(i: usize) -> NewNode {
         target: None,
         rdev: 0,
         mode: 0o644,
+        create_mode: None,
         uid: 0,
         gid: 0,
     }

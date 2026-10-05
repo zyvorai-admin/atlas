@@ -39,6 +39,7 @@ fn mk(e: &NativeEngine, parent: u64, name: &str, kind: NodeType) -> u64 {
             target: None,
             rdev: 0,
             mode: 0o755,
+            create_mode: None,
             uid: 0,
             gid: 0,
         },

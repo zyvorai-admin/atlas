@@ -603,6 +603,7 @@ impl Ops {
                 target,
                 rdev: 0,
                 mode,
+                create_mode: None,
                 uid,
                 gid,
             },

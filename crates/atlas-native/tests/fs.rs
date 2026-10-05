@@ -39,6 +39,7 @@ fn node(name: &str, kind: NodeType) -> NewNode {
         target: (kind == NodeType::Symlink).then(|| "target".into()),
         rdev: 0,
         mode: 0o644,
+        create_mode: None,
         uid: 1000,
         gid: 1000,
     }

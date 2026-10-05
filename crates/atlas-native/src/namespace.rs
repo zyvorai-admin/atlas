@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
+    acl::{self, Acl},
     inodes::{DirEntries, InodeTable},
     metadata::{Catalog, ExtentId, ExtentRef, MetaError, SnapshotId},
 };
@@ -182,7 +183,12 @@ pub enum FsOp {
         /// Device number of a character or block device node.
         #[serde(default)]
         rdev: u64,
+        /// With the creating process's umask applied.
         mode: u32,
+        /// The mode as requested, before the umask: used instead of `mode` when the parent has a
+        /// default ACL (the ACL replaces the umask). `None` uses `mode`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        create_mode: Option<u32>,
         uid: u32,
         gid: u32,
         now_ns: i64,
@@ -374,6 +380,35 @@ impl FsMeta {
     }
 
     /// Adjusts a directory's link count (`+1` per subdirectory) and stamps it modified.
+    /// The mode and ACL xattrs of a node created in `parent`: from the parent's default ACL and
+    /// `create_mode` (else `mode`) if it has one (a directory also inherits the default itself),
+    /// else `mode` as is. Symlinks carry no ACLs.
+    #[allow(clippy::type_complexity)]
+    fn inherit_acls(
+        &self,
+        parent: u64,
+        node_type: NodeType,
+        mode: u32,
+        create_mode: Option<u32>,
+    ) -> Result<(u32, Vec<(String, Vec<u8>)>), MetaError> {
+        if node_type == NodeType::Symlink {
+            return Ok((mode, Vec::new()));
+        }
+        let p = self.inode(parent)?;
+        let Some(raw) = p.xattrs.get(acl::DEFAULT) else {
+            return Ok((mode, Vec::new()));
+        };
+        let (access, mode) = Acl::parse(raw)?.create_masq(create_mode.unwrap_or(mode));
+        let mut acls = Vec::new();
+        if !access.is_minimal() {
+            acls.push((acl::ACCESS.to_string(), access.encode()));
+        }
+        if node_type == NodeType::Dir {
+            acls.push((acl::DEFAULT.to_string(), raw.clone()));
+        }
+        Ok((mode, acls))
+    }
+
     /// Fails if one more inode would take the filesystem over its inode quota (the root counts).
     fn check_inode_quota(&self) -> Result<(), MetaError> {
         match self.quota.and_then(|q| q.max_inodes) {
@@ -429,13 +464,16 @@ pub fn file_extents<'a>(
         .flatten()
 }
 
-/// An extended attribute name in a namespace we store. `system.*` (POSIX ACLs and the like)
-/// is refused: the kernel would not enforce what we stored.
+/// An extended attribute name in a namespace we store. Of `system.*` only the two POSIX ACLs
+/// are stored (validated, and kept in sync with the mode); the rest is refused.
 pub fn check_xattr_name(name: &str) -> Result<(), MetaError> {
     if name.is_empty() || name.len() > MAX_NAME_BYTES || name.contains('\0') {
         return Err(MetaError::Invalid(format!(
             "invalid extended attribute name {name:?}"
         )));
+    }
+    if name == acl::ACCESS || name == acl::DEFAULT {
+        return Ok(());
     }
     match name.split_once('.') {
         Some(("user" | "trusted" | "security", rest)) if !rest.is_empty() => Ok(()),
@@ -652,6 +690,7 @@ impl Catalog {
                 target,
                 rdev,
                 mode,
+                create_mode,
                 uid,
                 gid,
                 now_ns,
@@ -665,6 +704,7 @@ impl Catalog {
                     return Err(MetaError::Exists(format!("{name:?} in directory {parent}")));
                 }
                 f.check_inode_quota()?;
+                let (mode, acls) = f.inherit_acls(*parent, *node_type, *mode, *create_mode)?;
                 let kind = match node_type {
                     NodeType::File => InodeKind::File {
                         size: 0,
@@ -692,8 +732,9 @@ impl Catalog {
                 };
                 let ino = f.next_ino;
                 f.next_ino += 1;
-                let mut inode = Inode::new(ino, kind, *mode, *uid, *gid, *now_ns);
+                let mut inode = Inode::new(ino, kind, mode, *uid, *gid, *now_ns);
                 inode.op_id = op_id.clone();
+                inode.xattrs.extend(acls);
                 let is_dir = inode.is_dir();
                 f.inodes.insert(inode);
                 f.set_entry(*parent, name, Some(ino))?;
@@ -832,6 +873,15 @@ impl Catalog {
                 now_ns,
             } => {
                 let i = self.fs_mut(fs)?.inode_mut(*ino)?;
+                // chmod rewrites the access ACL's owner, group (mask) and other entries.
+                let acl = match (attr.mode, i.xattrs.get(acl::ACCESS)) {
+                    (Some(m), Some(raw)) => {
+                        let mut a = Acl::parse(raw)?;
+                        a.chmod(m);
+                        Some(a.encode())
+                    }
+                    _ => None,
+                };
                 let mut cut = BTreeMap::new();
                 let mut resized = None;
                 if let Some(new_size) = attr.size {
@@ -851,6 +901,9 @@ impl Catalog {
                 }
                 if let Some(m) = attr.mode {
                     i.mode = m & 0o7777;
+                }
+                if let Some(a) = acl {
+                    i.xattrs.insert(acl::ACCESS.to_string(), a);
                 }
                 if let Some(u) = attr.uid {
                     i.uid = u;
@@ -891,6 +944,21 @@ impl Catalog {
                     )));
                 }
                 let i = self.fs_mut(fs)?.inode_mut(*ino)?;
+                // The access ACL's bits become the mode's, and one that says no more than the
+                // mode is not stored (as `posix_acl_update_mode`). A default ACL is for
+                // directories only.
+                let mut acl_mode = None;
+                if name == acl::ACCESS {
+                    let a = Acl::parse(value)?;
+                    acl_mode = Some((a.apply_to_mode(i.mode), a.is_minimal()));
+                } else if name == acl::DEFAULT {
+                    Acl::parse(value)?;
+                    if !i.is_dir() {
+                        return Err(MetaError::Invalid(format!(
+                            "inode {ino}: only directories have a default ACL"
+                        )));
+                    }
+                }
                 let old = i.xattrs.get(name);
                 match (mode, old) {
                     (XattrMode::Create, Some(_)) => {
@@ -912,7 +980,19 @@ impl Catalog {
                         "extended attributes of inode {ino} would exceed {MAX_XATTR_TOTAL_BYTES} bytes"
                     )));
                 }
-                i.xattrs.insert(name.clone(), value.clone());
+                match acl_mode {
+                    Some((m, true)) => {
+                        i.mode = m;
+                        i.xattrs.remove(name);
+                    }
+                    Some((m, false)) => {
+                        i.mode = m;
+                        i.xattrs.insert(name.clone(), value.clone());
+                    }
+                    None => {
+                        i.xattrs.insert(name.clone(), value.clone());
+                    }
+                }
                 i.ctime_ns = *now_ns;
             }
             FsOp::RemoveXattr {
@@ -1176,6 +1256,7 @@ mod tests {
             target: (t == NodeType::Symlink).then(|| "/tmp/x".to_string()),
             rdev: 0,
             mode: 0o100644,
+            create_mode: None,
             uid: 1000,
             gid: 1000,
             now_ns: 2,
@@ -1479,6 +1560,125 @@ mod tests {
         )
         .unwrap();
         assert!(old.filesystems.is_empty());
+    }
+
+    /// An ACL in the xattr encoding from `(tag, perm, id)` entries (`u32::MAX`: no id).
+    fn acl_xattr(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut v = 2u32.to_le_bytes().to_vec();
+        for &(tag, perm, id) in entries {
+            v.extend_from_slice(&tag.to_le_bytes());
+            v.extend_from_slice(&perm.to_le_bytes());
+            v.extend_from_slice(&id.to_le_bytes());
+        }
+        v
+    }
+
+    fn setxattr(ino: u64, name: &str, value: Vec<u8>) -> FsOp {
+        FsOp::SetXattr {
+            fs: "f".into(),
+            ino,
+            name: name.into(),
+            value,
+            mode: XattrMode::Set,
+            now_ns: 7,
+        }
+    }
+
+    #[test]
+    fn acls_stay_in_sync_with_the_mode_and_are_inherited() {
+        const N: u32 = u32::MAX;
+        let mut t = T::new();
+        let d = t.mk(ROOT_INO, "d", NodeType::Dir);
+        let f = t.mk(ROOT_INO, "f", NodeType::File);
+        // owner rwx, user 1000 rw, group r-x, mask rw, other none.
+        let full = acl_xattr(&[
+            (0x01, 7, N),
+            (0x02, 6, 1000),
+            (0x04, 5, N),
+            (0x10, 6, N),
+            (0x20, 0, N),
+        ]);
+        t.ok(setxattr(f, acl::ACCESS, full.clone()));
+        let i = t.fs().inode(f).unwrap();
+        assert_eq!((i.mode & 0o777, &i.xattrs[acl::ACCESS]), (0o760, &full));
+        // chmod rewrites owner, mask and other.
+        t.ok(FsOp::SetAttr {
+            fs: "f".into(),
+            ino: f,
+            attr: SetAttr {
+                mode: Some(0o100604),
+                ..Default::default()
+            },
+            now_ns: 8,
+        });
+        let i = t.fs().inode(f).unwrap();
+        let a = Acl::parse(&i.xattrs[acl::ACCESS]).unwrap();
+        assert_eq!(a.apply_to_mode(0), 0o604);
+        // An ACL that says no more than the mode sets the mode and is not stored.
+        t.ok(setxattr(
+            f,
+            acl::ACCESS,
+            acl_xattr(&[(0x01, 6, N), (0x04, 4, N), (0x20, 0, N)]),
+        ));
+        let i = t.fs().inode(f).unwrap();
+        assert_eq!((i.mode & 0o7777, i.xattrs.get(acl::ACCESS)), (0o640, None));
+
+        // Invalid ACLs, default ACLs on files and other system.* names are refused untouched.
+        let before = t.c.filesystems.clone();
+        for (ino, name, value, want) in [
+            (f, acl::ACCESS, b"junk".to_vec(), "invalid"),
+            (f, acl::DEFAULT, full.clone(), "invalid"),
+            (f, "system.foo", b"x".to_vec(), "unsupported"),
+        ] {
+            let err = t.run(setxattr(ino, name, value)).unwrap_err();
+            let got = match err {
+                MetaError::Invalid(_) => "invalid",
+                MetaError::Unsupported(_) => "unsupported",
+                e => panic!("{e:?}"),
+            };
+            assert_eq!(got, want, "{name}");
+        }
+        assert_eq!(t.c.filesystems, before);
+
+        // Children of a directory with a default ACL inherit it, ignoring the umask.
+        t.ok(setxattr(d, acl::DEFAULT, full.clone()));
+        let mut create = |name: &str, node_type, mode, create_mode| {
+            let mut op = mknode(d, name, node_type, name);
+            if let FsOp::Mknode {
+                mode: m,
+                create_mode: c,
+                ..
+            } = &mut op
+            {
+                *m = mode;
+                *c = create_mode;
+            }
+            t.ok(op);
+            let ino = t.fs().lookup(d, name).unwrap();
+            t.fs().inode(ino).unwrap()
+        };
+        // open(O_CREAT, 0666) with umask 077: the default ACL decides, not the umask.
+        let child = create("c", NodeType::File, 0o100600, Some(0o100666));
+        assert_eq!(child.mode & 0o777, 0o660);
+        let a = Acl::parse(&child.xattrs[acl::ACCESS]).unwrap();
+        assert!(!a.is_minimal());
+        assert!(!child.xattrs.contains_key(acl::DEFAULT));
+        let sub = create("s", NodeType::Dir, 0o40700, Some(0o40777));
+        assert_eq!(sub.mode & 0o777, 0o760);
+        assert_eq!(sub.xattrs[acl::DEFAULT], full);
+        // Old clients (no create_mode) inherit from their already-masked mode.
+        let old = create("o", NodeType::File, 0o100600, None);
+        assert_eq!(old.mode & 0o777, 0o600);
+        // Symlinks carry no ACLs; outside an ACL'd directory the mode is kept as given.
+        let l = create("l", NodeType::Symlink, 0o120777, Some(0o120777));
+        assert!(l.xattrs.is_empty());
+        t.ok(mknode(ROOT_INO, "plain", NodeType::File, "plain"));
+        let p = t
+            .fs()
+            .inode(t.fs().lookup(ROOT_INO, "plain").unwrap())
+            .unwrap();
+        assert!(p.xattrs.is_empty());
+        assert_eq!(p.mode & 0o7777, 0o644);
     }
 
     fn quota(max_bytes: Option<u64>, max_inodes: Option<u64>) -> FsOp {

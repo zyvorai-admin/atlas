@@ -139,6 +139,9 @@ pub struct NewNode {
     pub rdev: u64,
     #[serde(default)]
     pub mode: u32,
+    /// The mode before the umask, for a parent with a default ACL (`FsOp::Mknode`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_mode: Option<u32>,
     #[serde(default)]
     pub uid: u32,
     #[serde(default)]
@@ -386,6 +389,7 @@ impl NativeEngine {
             target: node.target,
             rdev: node.rdev,
             mode: node.mode,
+            create_mode: node.create_mode,
             uid: node.uid,
             gid: node.gid,
             now_ns: now_ns(),

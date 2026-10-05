@@ -61,6 +61,7 @@ fn statfs_counts(s: &FsStat) -> StatfsCounts {
 pub struct AtlasFs {
     pub ops: Ops,
     dirs: DirStreams,
+    posix_acl: bool,
 }
 
 fn time(ns: i64) -> SystemTime {
@@ -121,6 +122,22 @@ fn name(n: &OsStr) -> Result<&str, Errno> {
     n.to_str().ok_or(Errno::EINVAL)
 }
 
+/// A node to create with the umask applied, and the mode before it for a parent with a default
+/// ACL (with `--acl` the kernel leaves masking to us: `FUSE_DONT_MASK`).
+fn new_node(req: &Request, n: &str, kind: NodeType, mode: u32, umask: u32) -> NewNode {
+    NewNode {
+        name: n.into(),
+        op_id: String::new(),
+        kind,
+        target: None,
+        rdev: 0,
+        mode: mode & !umask,
+        create_mode: Some(mode),
+        uid: req.uid(),
+        gid: req.gid(),
+    }
+}
+
 /// `size == 0` asks for the length; a buffer too small for the value is ERANGE.
 fn xattr_reply(reply: ReplyXattr, value: &[u8], size: u32) {
     if size == 0 {
@@ -137,7 +154,15 @@ impl AtlasFs {
         Self {
             ops,
             dirs: DirStreams::default(),
+            posix_acl: false,
         }
+    }
+
+    /// Has the kernel enforce POSIX ACLs (`FUSE_POSIX_ACL`); the mount fails on a kernel
+    /// without it rather than silently ignoring ACLs.
+    pub fn with_posix_acl(mut self, on: bool) -> Self {
+        self.posix_acl = on;
+        self
     }
 
     fn ttl(&self) -> Duration {
@@ -181,6 +206,15 @@ impl Filesystem for AtlasFs {
             if config.add_capabilities(cap).is_err() {
                 tracing::warn!(?cap, "kernel lacks the capability; those locks stay local");
             }
+        }
+        if self.posix_acl {
+            config
+                .add_capabilities(InitFlags::FUSE_POSIX_ACL | InitFlags::FUSE_DONT_MASK)
+                .map_err(|missing| {
+                    std::io::Error::other(format!(
+                        "--acl: the kernel lacks {missing:?}; ACLs would not be enforced"
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -366,6 +400,7 @@ impl Filesystem for AtlasFs {
             target: None,
             rdev: u64::from(rdev),
             mode: mode & !umask,
+            create_mode: Some(mode),
             uid: req.uid(),
             gid: req.gid(),
         };
@@ -383,15 +418,9 @@ impl Filesystem for AtlasFs {
     ) {
         tri!(reply, self.mutate());
         let n = tri!(reply, name(n));
-        let r = self.ops.mknode(
-            parent.0,
-            n,
-            NodeType::Dir,
-            None,
-            mode & !umask,
-            req.uid(),
-            req.gid(),
-        );
+        let r = self
+            .ops
+            .create(parent.0, new_node(req, n, NodeType::Dir, mode, umask));
         self.entry(r, reply);
     }
 
@@ -484,15 +513,10 @@ impl Filesystem for AtlasFs {
     ) {
         tri!(reply, self.mutate());
         let n = tri!(reply, name(n));
-        match self.ops.mknode(
-            parent.0,
-            n,
-            NodeType::File,
-            None,
-            mode & !umask,
-            req.uid(),
-            req.gid(),
-        ) {
+        match self
+            .ops
+            .create(parent.0, new_node(req, n, NodeType::File, mode, umask))
+        {
             Ok(a) => {
                 self.ops.opened(a.ino);
                 reply.created(
