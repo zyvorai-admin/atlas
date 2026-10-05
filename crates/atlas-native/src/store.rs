@@ -25,7 +25,7 @@ use crate::{
     inodes::InodeTable,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
-    namespace::{FsId, FsMeta, FsUsage, Inode, InodeKind},
+    namespace::{FsId, FsMeta, FsSnapshotMeta, FsUsage, Inode, InodeKind},
     tracked::Tracked,
 };
 
@@ -72,6 +72,53 @@ struct FsHeader {
     /// Inode count (absent before tables were paged: counted on load).
     #[serde(default)]
     inodes: Option<u64>,
+}
+
+impl FsHeader {
+    fn of(f: &FsMeta) -> Self {
+        Self {
+            id: f.id.clone(),
+            name: f.name.clone(),
+            next_ino: f.next_ino,
+            source_snapshot: f.source_snapshot.clone(),
+            extent_bytes: f.extent_bytes,
+            usage: f.usage,
+            inodes: Some(f.inodes.len()),
+        }
+    }
+
+    /// The filesystem, its inodes paged from the store under `key`.
+    fn paged(self, key: FsId, snap: &Arc<StoreSnapshot>) -> io::Result<FsMeta> {
+        let len = match self.inodes {
+            Some(n) => n,
+            None => snap.inos(&key)?.len() as u64,
+        };
+        Ok(FsMeta {
+            inodes: InodeTable::paged(key, snap.clone(), len),
+            id: self.id,
+            name: self.name,
+            next_ino: self.next_ino,
+            source_snapshot: self.source_snapshot,
+            extent_bytes: self.extent_bytes,
+            usage: self.usage,
+        })
+    }
+}
+
+/// A filesystem snapshot without its tree's inodes, which have records of their own under
+/// `@<snapshot id>`. (Before that, the record held the whole tree; such records are read and
+/// rewritten in this form at the next checkpoint.)
+#[derive(Serialize, Deserialize)]
+struct SnapHeader {
+    id: SnapshotId,
+    fs_id: FsId,
+    name: String,
+    created_ns: i64,
+    tree: FsHeader,
+}
+
+fn snapshot_key(id: &str) -> String {
+    format!("@{id}")
 }
 
 /// redb's own page cache; the operating system's page cache sits behind it.
@@ -211,7 +258,10 @@ impl CatalogStore {
         c.volumes = read_table(&tx, VOLUMES)?;
         c.snapshots = read_table(&tx, SNAPSHOTS)?;
         c.extents = read_table(&tx, EXTENTS)?;
-        c.fs_snapshots = read_table(&tx, FS_SNAPSHOTS)?;
+        let snapshots: Vec<Vec<u8>> = read_table::<serde_json::Value>(&tx, FS_SNAPSHOTS)?
+            .into_values()
+            .map(|v| json(&v))
+            .collect::<io::Result<_>>()?;
         let headers: Vec<FsHeader> = read_table::<FsHeader>(&tx, FILESYSTEMS)?
             .into_values()
             .collect();
@@ -219,22 +269,35 @@ impl CatalogStore {
         let snap = self.snapshot(&BTreeSet::new(), &BTreeSet::new())?;
         let mut filesystems = BTreeMap::new();
         for h in headers {
-            let len = match h.inodes {
-                Some(n) => n,
-                None => snap.inos(&h.id)?.len() as u64,
-            };
-            let fs = FsMeta {
-                inodes: InodeTable::paged(h.id.clone(), snap.clone(), len),
-                id: h.id.clone(),
-                name: h.name,
-                next_ino: h.next_ino,
-                source_snapshot: h.source_snapshot,
-                extent_bytes: h.extent_bytes,
-                usage: h.usage,
-            };
-            filesystems.insert(h.id, fs);
+            let id = h.id.clone();
+            filesystems.insert(id.clone(), h.paged(id, &snap)?);
         }
         c.filesystems = filesystems.into();
+        let mut legacy = Vec::new();
+        let mut fs_snapshots = BTreeMap::new();
+        for raw in snapshots {
+            match serde_json::from_slice::<SnapHeader>(&raw) {
+                Ok(h) => {
+                    let tree = h.tree.paged(snapshot_key(&h.id), &snap)?;
+                    fs_snapshots.insert(
+                        h.id.clone(),
+                        FsSnapshotMeta {
+                            id: h.id,
+                            fs_id: h.fs_id,
+                            name: h.name,
+                            created_ns: h.created_ns,
+                            tree,
+                        },
+                    );
+                }
+                Err(_) => legacy.push(parse::<FsSnapshotMeta>(&raw)?),
+            }
+        }
+        c.fs_snapshots = fs_snapshots.into();
+        for s in legacy {
+            // Recorded as replaced, so the next checkpoint writes it in the paged form.
+            c.fs_snapshots.insert(s.id.clone(), s);
+        }
         c.in_store = true;
         Ok(Some(c))
     }
@@ -263,27 +326,49 @@ impl CatalogStore {
             + write_map(&tx, VOLUMES, &c.volumes, full)?
             + write_map(&tx, SNAPSHOTS, &c.snapshots, full)?
             + write_map(&tx, EXTENTS, &c.extents, full)?
-            + write_map(&tx, FS_SNAPSHOTS, &c.fs_snapshots, full)?
-            + write_filesystems(&tx, &c.filesystems, full)?;
+            + write_filesystems(&tx, &c.filesystems, full)?
+            + write_fs_snapshots(&tx, &c.fs_snapshots, full)?;
         tx.commit().map_err(err)?;
 
-        let stale_fs: BTreeSet<FsId> = c.filesystems.replaced().iter().cloned().collect();
-        let stale: BTreeSet<(FsId, u64)> = c
+        // Cache entries the next snapshot can't keep: tables replaced or removed, and inodes
+        // changed in the others.
+        let mut stale_fs: BTreeSet<FsId> = c.filesystems.replaced().iter().cloned().collect();
+        stale_fs.extend(c.fs_snapshots.replaced().iter().map(|id| snapshot_key(id)));
+        let mut stale: BTreeSet<(FsId, u64)> = BTreeSet::new();
+        for f in c
             .filesystems
             .touched()
             .iter()
             .filter_map(|id| c.filesystems.get(id))
-            .flat_map(|f| f.inodes.touched().map(|ino| (f.id.clone(), ino)))
-            .collect();
+        {
+            stale.extend(f.inodes.touched().map(|ino| (f.id.clone(), ino)));
+        }
+        for s in c
+            .fs_snapshots
+            .touched()
+            .iter()
+            .filter_map(|id| c.fs_snapshots.get(id))
+        {
+            stale.extend(
+                s.tree
+                    .inodes
+                    .touched()
+                    .map(|ino| (snapshot_key(&s.id), ino)),
+            );
+        }
         c.volumes.clear_changes();
         c.snapshots.clear_changes();
         c.extents.clear_changes();
-        c.fs_snapshots.clear_changes();
+        c.fs_snapshots
+            .clear_changes_with(|s| s.tree.inodes.clear_changes());
         c.filesystems
             .clear_changes_with(|f| f.inodes.clear_changes());
         let snap = self.snapshot(&stale, &stale_fs)?;
         for f in c.filesystems.values_mut_quietly() {
-            f.inodes.attach(&f.id, snap.clone());
+            f.inodes.attach(f.id.clone(), snap.clone());
+        }
+        for s in c.fs_snapshots.values_mut_quietly() {
+            s.tree.inodes.attach(snapshot_key(&s.id), snap.clone());
         }
         c.in_store = true;
         Ok(records)
@@ -365,6 +450,101 @@ fn write_map<V: Serialize>(
     Ok(n)
 }
 
+type InodeRows<'t> = redb::Table<'t, (&'static str, u64), &'static [u8]>;
+type EntryRows<'t> = redb::Table<'t, (&'static str, u64, &'static str), u64>;
+
+/// Drops every inode and entry record under `key`.
+fn delete_rows(inodes: &mut InodeRows, dirents: &mut EntryRows, key: &str) -> io::Result<()> {
+    inodes
+        .retain_in((key, 0)..=(key, u64::MAX), |_, _| false)
+        .map_err(err)?;
+    dirents
+        .retain_in((key, 0, "")..(key, u64::MAX, ""), |_, _| false)
+        .map_err(err)
+}
+
+/// Writes inode `i` under `key` with its directory entries: all of them if `fresh`, else the
+/// changed ones. Returns the records written.
+fn put_inode(
+    inodes: &mut InodeRows,
+    dirents: &mut EntryRows,
+    key: &str,
+    i: &Inode,
+    fresh: bool,
+) -> io::Result<u64> {
+    inodes
+        .insert((key, i.ino), inode_record(i)?.as_slice())
+        .map_err(err)?;
+    let mut n = 1;
+    if let InodeKind::Dir { entries, .. } = &i.kind {
+        let names: Box<dyn Iterator<Item = &String>> = if fresh {
+            Box::new(entries.keys())
+        } else {
+            Box::new(entries.touched().iter())
+        };
+        for name in names {
+            n += 1;
+            match entries.get(name) {
+                Some(child) => {
+                    dirents
+                        .insert((key, i.ino, name.as_str()), *child)
+                        .map_err(err)?;
+                }
+                None => {
+                    dirents.remove((key, i.ino, name.as_str())).map_err(err)?;
+                }
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// Writes an inode table under `key`: all of it if `rewrite` (replacing whatever the store held
+/// there unless the whole store is being rewritten), else its changes.
+fn write_inodes(
+    inodes: &mut InodeRows,
+    dirents: &mut EntryRows,
+    key: &str,
+    table: &InodeTable,
+    rewrite: bool,
+    full: bool,
+) -> io::Result<u64> {
+    let mut n = 0;
+    if rewrite {
+        if !full {
+            delete_rows(inodes, dirents, key)?;
+        }
+        let mut written = Ok(());
+        table
+            .for_each(|i| {
+                if written.is_ok() {
+                    written = put_inode(inodes, dirents, key, i, true).map(|k| n += k);
+                }
+            })
+            .map_err(io::Error::other)?;
+        written?;
+        return Ok(n);
+    }
+    let changed: Vec<u64> = table.touched().collect();
+    for ino in changed {
+        // An inode inserted or removed (not just edited) keeps none of its old entries.
+        let fresh = table.replaced(ino);
+        if fresh {
+            dirents
+                .retain_in((key, ino, "")..(key, ino + 1, ""), |_, _| false)
+                .map_err(err)?;
+        }
+        match table.get(ino).map_err(io::Error::other)? {
+            Some(i) => n += put_inode(inodes, dirents, key, &i, fresh)?,
+            None => {
+                n += 1;
+                inodes.remove((key, ino)).map_err(err)?;
+            }
+        }
+    }
+    Ok(n)
+}
+
 fn write_filesystems(
     tx: &WriteTransaction,
     filesystems: &Tracked<FsId, FsMeta>,
@@ -381,75 +561,62 @@ fn write_filesystems(
     let mut n = 0;
     for id in ids {
         n += 1;
-        let fs = id.as_str();
         // A filesystem replaced or removed since the last checkpoint keeps none of its records.
         let rewrite = full || filesystems.replaced().contains(id);
-        if rewrite && !full {
-            inodes
-                .retain_in((fs, 0)..=(fs, u64::MAX), |_, _| false)
-                .map_err(err)?;
-            dirents
-                .retain_in((fs, 0, "")..(fs, u64::MAX, ""), |_, _| false)
-                .map_err(err)?;
-        }
         let Some(f) = filesystems.get(id) else {
-            headers.remove(fs).map_err(err)?;
+            delete_rows(&mut inodes, &mut dirents, id)?;
+            headers.remove(id.as_str()).map_err(err)?;
             continue;
         };
-        let header = json(&FsHeader {
-            id: f.id.clone(),
-            name: f.name.clone(),
-            next_ino: f.next_ino,
-            source_snapshot: f.source_snapshot.clone(),
-            extent_bytes: f.extent_bytes,
-            usage: f.usage,
-            inodes: Some(f.inodes.len()),
-        })?;
-        headers.insert(fs, header.as_slice()).map_err(err)?;
-        let all;
-        let changed: Box<dyn Iterator<Item = u64>> = if rewrite {
-            all = f.inodes.scan().map_err(io::Error::other)?;
-            Box::new(all.iter().map(|i| i.ino))
-        } else {
-            Box::new(f.inodes.touched())
+        headers
+            .insert(id.as_str(), json(&FsHeader::of(f))?.as_slice())
+            .map_err(err)?;
+        n += write_inodes(&mut inodes, &mut dirents, id, &f.inodes, rewrite, full)?;
+    }
+    Ok(n)
+}
+
+fn write_fs_snapshots(
+    tx: &WriteTransaction,
+    snapshots: &Tracked<SnapshotId, FsSnapshotMeta>,
+    full: bool,
+) -> io::Result<u64> {
+    let mut headers = tx.open_table(FS_SNAPSHOTS).map_err(err)?;
+    let mut inodes = tx.open_table(INODES).map_err(err)?;
+    let mut dirents = tx.open_table(DIR_ENTRIES).map_err(err)?;
+    let ids: Box<dyn Iterator<Item = &SnapshotId>> = if full {
+        Box::new(snapshots.keys())
+    } else {
+        Box::new(snapshots.touched().iter())
+    };
+    let mut n = 0;
+    for id in ids {
+        n += 1;
+        let key = snapshot_key(id);
+        let rewrite = full || snapshots.replaced().contains(id);
+        let Some(s) = snapshots.get(id) else {
+            delete_rows(&mut inodes, &mut dirents, &key)?;
+            headers.remove(id.as_str()).map_err(err)?;
+            continue;
         };
-        for ino in changed {
-            n += 1;
-            // An inode inserted or removed (not just edited) keeps none of its old entries.
-            let fresh = rewrite || f.inodes.replaced(ino);
-            if fresh && !rewrite {
-                dirents
-                    .retain_in((fs, ino, "")..(fs, ino + 1, ""), |_, _| false)
-                    .map_err(err)?;
-            }
-            let Some(i) = f.inodes.get(ino).map_err(io::Error::other)? else {
-                inodes.remove((fs, ino)).map_err(err)?;
-                continue;
-            };
-            inodes
-                .insert((fs, ino), inode_record(&i)?.as_slice())
-                .map_err(err)?;
-            if let InodeKind::Dir { entries, .. } = &i.kind {
-                let names: Box<dyn Iterator<Item = &String>> = if fresh {
-                    Box::new(entries.keys())
-                } else {
-                    Box::new(entries.touched().iter())
-                };
-                for name in names {
-                    n += 1;
-                    match entries.get(name) {
-                        Some(child) => {
-                            dirents
-                                .insert((fs, ino, name.as_str()), *child)
-                                .map_err(err)?;
-                        }
-                        None => {
-                            dirents.remove((fs, ino, name.as_str())).map_err(err)?;
-                        }
-                    }
-                }
-            }
-        }
+        let header = json(&SnapHeader {
+            id: s.id.clone(),
+            fs_id: s.fs_id.clone(),
+            name: s.name.clone(),
+            created_ns: s.created_ns,
+            tree: FsHeader::of(&s.tree),
+        })?;
+        headers
+            .insert(id.as_str(), header.as_slice())
+            .map_err(err)?;
+        n += write_inodes(
+            &mut inodes,
+            &mut dirents,
+            &key,
+            &s.tree.inodes,
+            rewrite,
+            full,
+        )?;
     }
     Ok(n)
 }
@@ -890,8 +1057,8 @@ mod tests {
                     );
                 }
             }
-            if round == 3 {
-                run(
+            match round {
+                2 => run(
                     &mut paged,
                     &mut mem,
                     FsOp::SnapshotFs {
@@ -900,10 +1067,43 @@ mod tests {
                         name: "s".into(),
                         now_ns: 5,
                     },
-                );
+                ),
+                3 => {
+                    run(
+                        &mut paged,
+                        &mut mem,
+                        FsOp::CloneFs {
+                            id: "g".into(),
+                            name: "g".into(),
+                            snapshot_id: "s".into(),
+                        },
+                    );
+                    run(
+                        &mut paged,
+                        &mut mem,
+                        FsOp::SnapshotFs {
+                            id: "t".into(),
+                            fs: "f".into(),
+                            name: "t".into(),
+                            now_ns: 6,
+                        },
+                    );
+                }
+                4 => run(
+                    &mut paged,
+                    &mut mem,
+                    FsOp::DeleteFsSnapshot { id: "t".into() },
+                ),
+                _ => {}
             }
             store.checkpoint(&mut paged).unwrap();
             assert!(lock(&lock(&store.last).as_ref().unwrap().cache).len() <= 64);
+            if round >= 2 {
+                // A snapshot's record is a header; its tree's inodes are records of their own.
+                let tx = store.db.begin_read().unwrap();
+                let t = tx.open_table(FS_SNAPSHOTS).unwrap();
+                assert!(t.get("s").unwrap().unwrap().value().len() < 1024);
+            }
             assert!(paged.filesystems["f"].inodes.len() > 64);
             assert_eq!(
                 serde_json::to_value(&paged).unwrap(),
@@ -918,6 +1118,50 @@ mod tests {
             serde_json::to_value(&loaded).unwrap(),
             serde_json::to_value(&mem).unwrap()
         );
+    }
+
+    #[test]
+    fn a_snapshot_recorded_with_its_whole_tree_is_rewritten_paged() {
+        let mut h = Harness::new();
+        h.fs(FsOp::CreateFs {
+            fs: "f".into(),
+            name: "f".into(),
+            now_ns: 1,
+            extent_bytes: None,
+        });
+        h.mknode("f", ROOT_INO, "a", NodeType::File);
+        h.fs(FsOp::SnapshotFs {
+            id: "s".into(),
+            fs: "f".into(),
+            name: "s".into(),
+            now_ns: 2,
+        });
+        h.check();
+        // What an older version wrote: the whole tree in the snapshot's record, no tree rows.
+        {
+            let tx = h.store.db.begin_write().unwrap();
+            {
+                let s = &h.catalog.fs_snapshots["s"];
+                let whole = serde_json::to_vec(s).unwrap();
+                tx.open_table(FS_SNAPSHOTS)
+                    .unwrap()
+                    .insert("s", whole.as_slice())
+                    .unwrap();
+                let mut inodes = tx.open_table(INODES).unwrap();
+                let mut dirents = tx.open_table(DIR_ENTRIES).unwrap();
+                delete_rows(&mut inodes, &mut dirents, "@s").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let want = serde_json::to_value(&h.catalog).unwrap();
+        let mut loaded = h.store.load().unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), want);
+        h.store.checkpoint(&mut loaded).unwrap();
+        let reloaded = h.store.load().unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&reloaded).unwrap(), want);
+        let tx = h.store.db.begin_read().unwrap();
+        let t = tx.open_table(FS_SNAPSHOTS).unwrap();
+        assert!(serde_json::from_slice::<SnapHeader>(t.get("s").unwrap().unwrap().value()).is_ok());
     }
 
     #[test]

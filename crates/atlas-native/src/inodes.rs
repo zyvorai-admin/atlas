@@ -29,29 +29,34 @@ pub struct InodeTable {
     paged: Option<Paged>,
 }
 
+/// Where a paged table's inodes are in the store: under `key`, a filesystem's id or
+/// `@<snapshot id>` for a snapshot's frozen tree.
 #[derive(Clone)]
 struct Paged {
-    fs: FsId,
+    key: FsId,
     store: Arc<StoreSnapshot>,
 }
 
 impl fmt::Debug for Paged {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Paged").field("fs", &self.fs).finish()
+        f.debug_struct("Paged").field("key", &self.key).finish()
     }
 }
+
+/// Inodes read at a time by full walks of a table.
+const PAGE: usize = 1024;
 
 fn store_err(e: io::Error) -> MetaError {
     MetaError::Store(e.to_string())
 }
 
 impl InodeTable {
-    /// A table of `len` inodes that the store holds.
-    pub(crate) fn paged(fs: FsId, store: Arc<StoreSnapshot>, len: u64) -> Self {
+    /// A table of `len` inodes that the store holds under `key`.
+    pub(crate) fn paged(key: FsId, store: Arc<StoreSnapshot>, len: u64) -> Self {
         Self {
             map: Tracked::default(),
             len,
-            paged: Some(Paged { fs, store }),
+            paged: Some(Paged { key, store }),
         }
     }
 
@@ -67,7 +72,7 @@ impl InodeTable {
             return Ok(Some(i.clone()));
         }
         match self.behind(ino) {
-            Some(p) => p.store.get(&p.fs, ino).map_err(store_err),
+            Some(p) => p.store.get(&p.key, ino).map_err(store_err),
             None => Ok(None),
         }
     }
@@ -88,7 +93,7 @@ impl InodeTable {
         let Some(p) = self.behind(ino) else {
             return Ok(false);
         };
-        match p.store.take(&p.fs, ino).map_err(store_err)? {
+        match p.store.take(&p.key, ino).map_err(store_err)? {
             Some(i) => {
                 self.map.insert_quietly(ino, i);
                 Ok(true)
@@ -129,11 +134,11 @@ impl InodeTable {
             return Ok(self.map.values().cloned().collect());
         };
         let mut all = BTreeMap::new();
-        for ino in p.store.inos(&p.fs).map_err(store_err)? {
+        for ino in p.store.inos(&p.key).map_err(store_err)? {
             if self.map.touched().contains(&ino) {
                 continue;
             }
-            if let Some(i) = p.store.peek(&p.fs, ino).map_err(store_err)? {
+            if let Some(i) = p.store.peek(&p.key, ino).map_err(store_err)? {
                 all.insert(ino, i);
             }
         }
@@ -153,10 +158,10 @@ impl InodeTable {
             let touched = self.map.touched();
             for ino in p
                 .store
-                .inos_from(&p.fs, from, limit, |i| touched.contains(&i))
+                .inos_from(&p.key, from, limit, |i| touched.contains(&i))
                 .map_err(store_err)?
             {
-                if let Some(i) = p.store.peek(&p.fs, ino).map_err(store_err)? {
+                if let Some(i) = p.store.peek(&p.key, ino).map_err(store_err)? {
                     out.insert(ino, i);
                 }
             }
@@ -164,10 +169,19 @@ impl InodeTable {
         Ok(out.into_values().take(limit).collect())
     }
 
-    /// The same inodes in memory, apart from the store and with no changes recorded (a
-    /// snapshot's frozen tree).
-    pub fn detached(&self) -> Result<Self, MetaError> {
-        Ok(self.scan()?.into_iter().map(Arc::unwrap_or_clone).collect())
+    /// Calls `f` on every inode in inode order, a page at a time.
+    pub fn for_each(&self, mut f: impl FnMut(&Inode)) -> Result<(), MetaError> {
+        let mut from = 0;
+        loop {
+            let page = self.page(from, PAGE)?;
+            for i in &page {
+                f(i);
+            }
+            match page.last() {
+                Some(last) if page.len() == PAGE => from = last.ino + 1,
+                _ => return Ok(()),
+            }
+        }
     }
 
     /// Inodes changed since [`Self::clear_changes`].
@@ -192,17 +206,14 @@ impl InodeTable {
         });
     }
 
-    /// Pages the table on `store`, which holds all of it, handing the inodes in memory to its
-    /// cache. Only after [`Self::clear_changes`].
-    pub(crate) fn attach(&mut self, fs: &FsId, store: Arc<StoreSnapshot>) {
+    /// Pages the table on `store`, which holds all of it under `key`, handing the inodes in
+    /// memory to its cache. Only after [`Self::clear_changes`].
+    pub(crate) fn attach(&mut self, key: FsId, store: Arc<StoreSnapshot>) {
         debug_assert!(self.map.touched().is_empty());
         for i in std::mem::take(&mut self.map).into_values() {
-            store.put(fs, i.ino, i);
+            store.put(&key, i.ino, i);
         }
-        self.paged = Some(Paged {
-            fs: fs.clone(),
-            store,
-        });
+        self.paged = Some(Paged { key, store });
     }
 }
 

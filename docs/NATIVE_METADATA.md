@@ -71,8 +71,14 @@ with either a 4096-inode or a 262,144-inode cache. `store::bench::memory_of_a_pa
 (4096-inode cache, 400k files, one directory or 1000) peaks at ~112 MB, growing ~9 MB per 100k
 files at the end as redb's 64 MiB page cache fills.
 
-Limits: filesystem snapshot trees are still held in memory in full (one `fs_snapshots` record
-each), and a directory's entries are paged in with it as a whole. Checkpoints run on the commit
+Filesystem snapshot trees are paged the same way. A snapshot's `fs_snapshots` record holds only a
+small header; its inodes and directory entries live in the same tables as a filesystem's, keyed
+`@<snapshot id>` (filesystem ids never contain `@`). Taking a snapshot writes the whole tree once;
+later checkpoints leave it alone until the snapshot is deleted. A snapshot record from before
+this change, which holds its whole tree, is read in full on load and rewritten in the paged form at
+the next checkpoint.
+
+Limits: a directory's entries are paged in with it as a whole. Checkpoints run on the commit
 path, under the catalog lock.
 
 ## Checkpoint and WAL compaction

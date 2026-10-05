@@ -386,6 +386,13 @@ impl FsMeta {
     }
 }
 
+/// Every extent a table's files reference, a page of inodes at a time.
+fn extents_of(inodes: &InodeTable) -> Result<Vec<ExtentId>, MetaError> {
+    let mut out = Vec::new();
+    inodes.for_each(|i| out.extend(file_extents([i].into_iter()).cloned()))?;
+    Ok(out)
+}
+
 /// Every extent referenced by a table of inodes (hard links count once: they share an inode).
 pub fn file_extents<'a>(
     inodes: impl Iterator<Item = &'a Inode>,
@@ -461,14 +468,29 @@ impl Catalog {
     }
 
     fn share_extents(&mut self, inodes: &InodeTable) -> Result<(), MetaError> {
-        let all = inodes.scan()?;
-        for eid in file_extents(all.iter().map(|i| &**i)) {
+        for eid in extents_of(inodes)? {
             self.extents
-                .get_mut(eid)
+                .get_mut(&eid)
                 .ok_or_else(|| MetaError::NotFound(eid.clone()))?
                 .refs += 1;
         }
         Ok(())
+    }
+
+    /// Where the store keeps an inode table: under its filesystem's id, or `@<snapshot id>`
+    /// for a snapshot's frozen tree (filesystem ids never contain `@`).
+    pub(crate) fn inode_table(&self, key: &str) -> Option<&InodeTable> {
+        match key.strip_prefix('@') {
+            Some(snap) => self.fs_snapshots.get(snap).map(|s| &s.tree.inodes),
+            None => self.filesystems.get(key).map(|f| &f.inodes),
+        }
+    }
+
+    pub(crate) fn inode_table_mut(&mut self, key: &str) -> Option<&mut InodeTable> {
+        match key.strip_prefix('@') {
+            Some(snap) => self.fs_snapshots.get_mut(snap).map(|s| &mut s.tree.inodes),
+            None => self.filesystems.get_mut(key).map(|f| &mut f.inodes),
+        }
     }
 
     fn extent_len(&self, eid: &ExtentId) -> u64 {
@@ -495,17 +517,14 @@ impl Catalog {
     /// Counts the usage of every filesystem and snapshot tree that doesn't keep it yet.
     pub fn fill_usage(&mut self) -> Result<(), MetaError> {
         let count = |c: &Catalog, f: &FsMeta| -> Result<FsUsage, MetaError> {
-            let all = f.inodes.scan()?;
-            Ok(FsUsage {
-                file_bytes: all
-                    .iter()
-                    .filter(|i| matches!(i.kind, InodeKind::File { .. }))
-                    .map(|i| i.size())
-                    .sum(),
-                used_bytes: file_extents(all.iter().map(|i| &**i))
-                    .map(|e| c.extent_len(e))
-                    .sum(),
-            })
+            let mut u = FsUsage::default();
+            f.inodes.for_each(|i| {
+                if let InodeKind::File { size, extents } = &i.kind {
+                    u.file_bytes += size;
+                    u.used_bytes += extents.values().map(|e| c.extent_len(e)).sum::<u64>();
+                }
+            })?;
+            Ok(u)
         };
         let fs: Vec<(FsId, FsUsage)> = self
             .filesystems
@@ -574,10 +593,10 @@ impl Catalog {
                 );
             }
             FsOp::DeleteFs { fs } => {
-                let all = self.filesystem(fs)?.inodes.scan()?;
+                let extents = extents_of(&self.filesystem(fs)?.inodes)?;
                 self.filesystems.remove(fs);
-                for inode in &all {
-                    self.drop_inode(inode, gc)?;
+                for eid in &extents {
+                    self.dec_ref(eid, gc)?;
                 }
             }
             FsOp::Mknode {
@@ -938,11 +957,9 @@ impl Catalog {
                     }
                     return Err(MetaError::Exists(format!("filesystem snapshot {id}")));
                 }
-                let f = self.filesystem(fs)?;
-                let tree = FsMeta {
-                    inodes: f.inodes.detached()?,
-                    ..f.clone()
-                };
+                // Shares the live table's inodes and store snapshot; the next checkpoint writes
+                // the tree under the snapshot's own key.
+                let tree = self.filesystem(fs)?.clone();
                 self.share_extents(&tree.inodes)?;
                 self.fs_snapshots.insert(
                     id.clone(),
@@ -958,10 +975,12 @@ impl Catalog {
             FsOp::DeleteFsSnapshot { id } => {
                 let s = self
                     .fs_snapshots
-                    .remove(id)
+                    .get(id)
                     .ok_or_else(|| MetaError::NotFound(format!("filesystem snapshot {id}")))?;
-                for inode in s.tree.inodes.scan()? {
-                    self.drop_inode(&inode, gc)?;
+                let extents = extents_of(&s.tree.inodes)?;
+                self.fs_snapshots.remove(id);
+                for eid in &extents {
+                    self.dec_ref(eid, gc)?;
                 }
             }
             FsOp::CloneFs {

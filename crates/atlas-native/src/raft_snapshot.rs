@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Snapshot transfer in chunks. The leader streams its applied catalog to a follower that fell
-//! behind its compacted log: a header (everything but extents and the inodes of filesystems),
-//! then pages of extents and of each filesystem's inodes, then `Done`. Each chunk waits for the
+//! behind its compacted log: a header (everything but extents and inodes), then pages of extents
+//! and of the inodes of each filesystem and filesystem snapshot, then `Done`. Each chunk waits for the
 //! follower's acknowledgement of the previous one, so neither side holds more than a chunk in
 //! flight.
 //!
@@ -35,15 +35,16 @@ const STAGING: &str = "catalog.redb.incoming";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotChunk {
-    /// The catalog without its extents and without the inodes of its filesystems.
+    /// The catalog without its extents and inodes.
     Header {
         catalog: Box<Catalog>,
     },
     Extents {
         extents: Vec<(ExtentId, ExtentMeta)>,
     },
+    /// Inodes of the table under `table`: a filesystem's id, or `@<snapshot id>`.
     Inodes {
-        fs: FsId,
+        table: FsId,
         inodes: Vec<Inode>,
     },
     Done,
@@ -53,7 +54,7 @@ pub enum SnapshotChunk {
 #[derive(Debug)]
 enum Cursor {
     ExtentsAfter(Option<ExtentId>),
-    Inodes { fs: usize, from: u64 },
+    Inodes { table: usize, from: u64 },
     Done,
     End,
 }
@@ -69,7 +70,7 @@ pub(crate) struct Outgoing {
     pub sent_at: u64,
     pub chunk: SnapshotChunk,
     catalog: Catalog,
-    filesystems: Vec<FsId>,
+    tables: Vec<FsId>,
     next: Cursor,
 }
 
@@ -93,9 +94,23 @@ impl Outgoing {
                     (id.clone(), f)
                 })
                 .collect(),
-            fs_snapshots: catalog.fs_snapshots.clone(),
+            fs_snapshots: catalog
+                .fs_snapshots
+                .iter()
+                .map(|(id, s)| {
+                    let mut s = s.clone();
+                    s.tree.inodes = InodeTable::default();
+                    (id.clone(), s)
+                })
+                .collect(),
             in_store: false,
         };
+        let tables = catalog
+            .filesystems
+            .keys()
+            .cloned()
+            .chain(catalog.fs_snapshots.keys().map(|id| format!("@{id}")))
+            .collect();
         Self {
             index: catalog.applied_index,
             seq: 0,
@@ -103,7 +118,7 @@ impl Outgoing {
             chunk: SnapshotChunk::Header {
                 catalog: Box::new(header),
             },
-            filesystems: catalog.filesystems.keys().cloned().collect(),
+            tables,
             catalog,
             next: Cursor::ExtentsAfter(None),
         }
@@ -130,7 +145,7 @@ impl Outgoing {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     if page.is_empty() {
-                        self.next = Cursor::Inodes { fs: 0, from: 0 };
+                        self.next = Cursor::Inodes { table: 0, from: 0 };
                         continue;
                     }
                     let last = page.last().map(|(k, _)| k.clone());
@@ -139,22 +154,22 @@ impl Outgoing {
                         Cursor::ExtentsAfter(last),
                     )
                 }
-                Cursor::Inodes { fs, from } => {
-                    let Some(id) = self.filesystems.get(*fs) else {
+                Cursor::Inodes { table, from } => {
+                    let Some(id) = self.tables.get(*table) else {
                         self.next = Cursor::Done;
                         continue;
                     };
-                    let page = match self.catalog.filesystems.get(id) {
-                        Some(f) => f.inodes.page(*from, CHUNK_INODES)?,
+                    let page = match self.catalog.inode_table(id) {
+                        Some(t) => t.page(*from, CHUNK_INODES)?,
                         None => Vec::new(),
                     };
                     let next = match page.last() {
                         Some(last) if page.len() == CHUNK_INODES => Cursor::Inodes {
-                            fs: *fs,
+                            table: *table,
                             from: last.ino + 1,
                         },
                         _ => Cursor::Inodes {
-                            fs: fs + 1,
+                            table: table + 1,
                             from: 0,
                         },
                     };
@@ -164,7 +179,7 @@ impl Outgoing {
                     }
                     (
                         SnapshotChunk::Inodes {
-                            fs: id.clone(),
+                            table: id.clone(),
                             inodes: page
                                 .into_iter()
                                 .map(std::sync::Arc::unwrap_or_clone)
@@ -236,15 +251,15 @@ impl Incoming {
                     self.catalog.extents.insert(id, e);
                 }
             }
-            SnapshotChunk::Inodes { fs, inodes } => {
-                let f = self.catalog.filesystems.get_mut(&fs).ok_or_else(|| {
+            SnapshotChunk::Inodes { table, inodes } => {
+                let t = self.catalog.inode_table_mut(&table).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("snapshot inodes for unknown filesystem {fs}"),
+                        format!("snapshot inodes for unknown table {table}"),
                     )
                 })?;
                 for i in inodes {
-                    f.inodes.insert(i);
+                    t.insert(i);
                 }
             }
             SnapshotChunk::Header { .. } | SnapshotChunk::Done => {
@@ -333,6 +348,17 @@ mod tests {
                 }],
             });
         }
+        apply(
+            &mut c,
+            MetaCommand::Fs {
+                op: FsOp::SnapshotFs {
+                    id: "s".into(),
+                    fs: "f".into(),
+                    name: "s".into(),
+                    now_ns: 3,
+                },
+            },
+        );
         // Paged on the leader's store, with some changes on top of it.
         store.checkpoint(&mut c).unwrap();
         apply(
@@ -375,8 +401,9 @@ mod tests {
             }
             inc.stage(wire(&out)).unwrap();
         }
-        // Header, two extent pages, two inode pages and Done.
-        assert_eq!(chunks, 6);
+        // Header, two extent pages, two inode pages each for the filesystem and its snapshot,
+        // and Done.
+        assert_eq!(chunks, 8);
         let staged = inc.finish();
         let path = follower_dir.path().join(CATALOG_STORE);
         fs::rename(staged, &path).unwrap();
