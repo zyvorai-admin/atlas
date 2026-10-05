@@ -595,6 +595,98 @@ fn tiered_extents_are_read_from_objects_with_every_data_node_gone() {
 }
 
 #[test]
+fn snapshots_export_to_objects_and_import_into_a_new_volume() {
+    let bucket = tempfile::tempdir().unwrap();
+    let path = bucket.path().to_path_buf();
+    let c = Cluster::start_with(3, 3, |m| {
+        m.tiering = Some(TieringConfig {
+            store: ObjectStoreConfig::Dir { path: path.clone() },
+            prefix: "cluster-a/".into(),
+            cold_after_secs: 3600,
+            interval_secs: 0,
+            bytes_per_sec: 0,
+            min_extent_bytes: 0,
+        });
+    });
+    let (_, body) = c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"name":"vol","size_bytes":16384}"#,
+        201,
+    );
+    let v = json(&body)["id"].as_str().unwrap().to_string();
+    let data: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+    c.on_leader("PUT", &format!("/v1/volumes/{v}/data?offset=0"), &data, 204);
+    let (_, body) = c.on_leader(
+        "POST",
+        &format!("/v1/volumes/{v}/snapshots"),
+        br#"{"name":"nightly"}"#,
+        201,
+    );
+    let s = json(&body)["id"].as_str().unwrap().to_string();
+
+    let finish = |node: &str, body: &[u8]| -> serde_json::Value {
+        let t = json(body)["transfer"].as_str().unwrap().to_string();
+        let addr = c.meta[node].as_ref().unwrap().http_addr();
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let (st, b) = api(addr, "GET", &format!("/v1/transfers/{t}"), b"");
+            assert_eq!(st, 200);
+            let j = json(&b);
+            match j["state"].as_str().unwrap() {
+                "done" => return j,
+                "failed" => panic!("transfer failed: {j}"),
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transfer {t} never finished: {j}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let (node, body) = c.on_leader(
+        "POST",
+        &format!("/v1/snapshots/{s}/export"),
+        br#"{"name":"vol-nightly"}"#,
+        202,
+    );
+    let t = finish(&node, &body);
+    assert_eq!(
+        (t["kind"].as_str(), t["done"].as_u64()),
+        (Some("export"), Some(4))
+    );
+    assert_eq!(t["result"]["uploaded"], 4, "{t}");
+    assert!(path
+        .join("cluster-a/exports/vol-nightly/manifest.json")
+        .exists());
+    let (_, body) = c.on_leader("GET", "/v1/exports", b"", 200);
+    assert_eq!(json(&body)["exports"][0]["snapshot_name"], "nightly");
+    c.on_leader(
+        "POST",
+        &format!("/v1/snapshots/{s}/export"),
+        br#"{"name":"../escape"}"#,
+        400,
+    );
+
+    let (node, body) = c.on_leader(
+        "POST",
+        "/v1/volumes/import",
+        br#"{"export":"vol-nightly","name":"restored"}"#,
+        202,
+    );
+    let w = json(&body)["id"].as_str().unwrap().to_string();
+    let t = finish(&node, &body);
+    assert_eq!(t["result"]["bytes"], 16384, "{t}");
+    c.wait_read(&format!("/v1/volumes/{w}/data?offset=0&len=16384"), &data);
+
+    let (_, body) = c.on_leader("DELETE", "/v1/exports/vol-nightly", b"", 200);
+    assert_eq!(json(&body)["blobs_deleted"], 4);
+    c.on_leader("GET", "/v1/exports/vol-nightly", b"", 404);
+}
+
+#[test]
 fn config_validation_rejects_bad_files() {
     let td = tempfile::tempdir().unwrap();
     let write = |name: &str, body: &str| {
