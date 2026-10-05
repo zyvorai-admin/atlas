@@ -289,9 +289,19 @@ impl NativeEngine {
         self.with_fs(fs, |c, f| Ok(attr(c, f.inode(ino)?.as_ref())))
     }
 
+    /// `name` in directory `parent`; `.` is the directory itself and `..` its parent (the root's
+    /// is the root), for clients reconnecting a file handle by inode number.
     pub fn fs_lookup(&self, fs: &str, parent: u64, name: &str) -> Result<Attr, NativeError> {
         self.with_fs(fs, |c, f| {
-            Ok(attr(c, f.inode(f.lookup(parent, name)?)?.as_ref()))
+            let ino = match name {
+                "." => f.dir(parent)?.ino,
+                ".." => match f.dir(parent)?.kind {
+                    InodeKind::Dir { parent, .. } => parent,
+                    _ => unreachable!("dir() returns directories"),
+                },
+                _ => f.lookup(parent, name)?,
+            };
+            Ok(attr(c, f.inode(ino)?.as_ref()))
         })
     }
 

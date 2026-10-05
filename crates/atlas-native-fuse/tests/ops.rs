@@ -1105,3 +1105,26 @@ fn direct_io_writes_through_and_reads_around_the_caches() {
     assert_eq!(b.read_direct(f.ino, 3, 4).unwrap(), b"FERE");
     assert!(b.read_direct(f.ino, 100, 4).unwrap().is_empty());
 }
+
+#[test]
+fn dot_lookups_resolve_handles_by_inode() {
+    let c = Cluster::start();
+    create_fs(&c, "dots");
+    let ops = mount(&c, "dots", OpsConfig::default());
+    let a = ops
+        .mknode(ROOT_INO, "a", NodeType::Dir, None, 0o755, 0, 0)
+        .unwrap();
+    let b = ops
+        .mknode(a.ino, "b", NodeType::Dir, None, 0o755, 0, 0)
+        .unwrap();
+    let f = ops
+        .mknode(b.ino, "f", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    assert_eq!(ops.lookup_dot(b.ino, ".").unwrap().ino, b.ino);
+    assert_eq!(ops.lookup_dot(b.ino, "..").unwrap().ino, a.ino);
+    assert_eq!(ops.lookup_dot(ROOT_INO, "..").unwrap().ino, ROOT_INO);
+    assert_eq!(ops.lookup_dot(f.ino, "..").unwrap_err(), libc::ENOTDIR);
+    // A rename moves `..`, and nothing cached the old parent.
+    ops.rename(a.ino, "b", ROOT_INO, "b2").unwrap();
+    assert_eq!(ops.lookup_dot(b.ino, "..").unwrap().ino, ROOT_INO);
+}

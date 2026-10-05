@@ -11,6 +11,10 @@ authors.workspace = true
 name = "atlas-native-mount"
 path = "src/bin/atlas-native-mount.rs"
 
+[[bin]]
+name = "atlas-native-nfs"
+path = "src/bin/atlas-native-nfs.rs"
+
 [features]
 # The kernel FUSE adapter (Linux only); without it the binary only reports how it was built.
 fuse = ["dep:fuser"]

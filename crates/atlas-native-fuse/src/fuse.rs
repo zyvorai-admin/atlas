@@ -224,6 +224,15 @@ impl Filesystem for AtlasFs {
                 tracing::warn!(?cap, "kernel lacks the capability; those locks stay local");
             }
         }
+        // File handles name inodes by number (never reused, so generation 0): the kernel
+        // resolves one it no longer caches by looking up `.` and `..`, which lets NFS servers
+        // re-export the mount.
+        if config
+            .add_capabilities(InitFlags::FUSE_EXPORT_SUPPORT)
+            .is_err()
+        {
+            tracing::warn!("kernel lacks FUSE_EXPORT_SUPPORT; the mount cannot be re-exported");
+        }
         if self.posix_acl {
             config
                 .add_capabilities(InitFlags::FUSE_POSIX_ACL | InitFlags::FUSE_DONT_MASK)
@@ -286,7 +295,11 @@ impl Filesystem for AtlasFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEntry) {
         let n = tri!(reply, name(n));
-        self.entry(self.ops.lookup(parent.0, n), reply);
+        let r = match n {
+            "." | ".." => self.ops.lookup_dot(parent.0, n),
+            _ => self.ops.lookup(parent.0, n),
+        };
+        self.entry(r, reply);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
