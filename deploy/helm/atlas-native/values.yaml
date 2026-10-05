@@ -174,3 +174,35 @@ csi:
     enabled: false
     createClass: true
     className: atlas-native-fs
+
+# NFS gateway (docs/NATIVE_NFS.md): NFS-Ganesha serving FUSE mounts of the listed filesystems,
+# NFSv4.1/4.2 on port 2049 behind one Service. One pod: NFSv4 state is not shared.
+nfs:
+  enabled: false
+  image:
+    repository: ghcr.io/zyvorai/atlas-native-nfs
+    tag: ""          # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  # Also serve NFSv3 with NLM locks (adds rpcbind on 111, mountd on 20048 and NLM on 32803).
+  v3: false
+  # Filesystems to export, by id (for a CSI volume, its PV's volumeHandle). Each needs `clients`
+  # (addresses, CIDRs, host names or wildcards); `pseudo` defaults to /<fs>, `access` to rw
+  # (or ro), `squash` to root (or none, all). `export_id` pins Ganesha's export id; by default it
+  # is derived from the filesystem id.
+  exports: []
+  #  - fs: team-share
+  #    clients: ["10.0.0.0/8"]
+  #    access: rw
+  #    squash: root
+  # atlas-native-mount options for every export's mount. Cache leases keep the gateway's
+  # attributes current when other clients change the filesystem.
+  mountArgs: ["--cache-leases"]
+  service:
+    type: ClusterIP
+    loadBalancerIP: ""
+    annotations: {}
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 2Gi }
+  nodeSelector: {}
+  tolerations: []

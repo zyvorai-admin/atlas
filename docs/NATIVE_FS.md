@@ -54,7 +54,7 @@ All routes need the API token (and client certificate where configured), like th
 | `POST /v1/fs-snapshots/{id}/clone` | `{"name", "id"?}` → 201 `{"id"}` of the new filesystem. |
 | `GET /v1/fs/{fs}/inodes/{ino}` | Attributes: `{ino, kind, mode, uid, gid, nlink, size, blocks, rdev, atime_ns, mtime_ns, ctime_ns}`. |
 | `POST /v1/fs/{fs}/inodes/{ino}/attr` | Any of `{mode, uid, gid, size, atime_ns, mtime_ns}` → attributes. |
-| `GET /v1/fs/{fs}/inodes/{dir}/lookup?name=` | Attributes of the entry (`name` percent-encoded). |
+| `GET /v1/fs/{fs}/inodes/{dir}/lookup?name=` | Attributes of the entry (`name` percent-encoded; `.` is the directory, `..` its parent). |
 | `GET /v1/fs/{fs}/inodes/{dir}/entries` | `{"entries": [{name, ino, kind}]}` in name order. `?limit=N` returns at most N; `?after=<name>` (percent-encoded) starts after that name. Without `limit`, the whole directory. |
 | `POST /v1/fs/{fs}/inodes/{dir}/entries` | `{name, op_id, kind, mode, uid, gid, target?, rdev?}` (`kind`: `file`, `dir`, `symlink`, `fifo`, `socket`, `char_device`, `block_device`) → 201 attributes. |
 | `POST /v1/fs/{fs}/inodes/{dir}/unlink`, `/rmdir` | `{name}` → 204. |
@@ -331,6 +331,12 @@ their snapshots as `snap_native_fs_<id>`. A filesystem has no size limit: its `s
 of its file sizes (0 when empty), expanding it is refused, and the requested size at create time is
 only used for tenant quota admission. Block data routes (`/volumes/{id}/data`) refuse filesystems;
 mount them with `atlas-native-mount` instead.
+
+## NFS
+
+The FUSE client supports kernel export (`FUSE_EXPORT_SUPPORT`; the node API resolves `.` and `..`
+in `GET /v1/fs/{fs}/inodes/{dir}/lookup`), so a mount can be re-exported over NFS. The chart's NFS
+gateway does this with NFS-Ganesha; see [`NATIVE_NFS.md`](NATIVE_NFS.md).
 
 ## Limits and performance
 

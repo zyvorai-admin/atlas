@@ -158,7 +158,10 @@ integrations beyond the gRPC surface.
   (`GET`/`PUT /volumes/{id}/data`). Tested against in-process native nodes.
 - `crates/atlas-native-fuse` — `atlas-native-mount` FUSE client for native filesystems (`fuse`
   feature, Linux only; the kernel-independent `ops` layer is tested on any OS against in-process
-  nodes). See `docs/NATIVE_FS.md`.
+  nodes). See `docs/NATIVE_FS.md`. Also bin `atlas-native-nfs` (`Dockerfile.native-nfs`, chart
+  `nfs.enabled`): NFS gateway supervisor running NFS-Ganesha ≥ 9.14 (`FSAL_VFS`, separate LGPL
+  process) over `atlas-native-mount` FUSE mounts; NFSv4.1/4.2 + optional v3/NLM. Verified on the
+  lab k3s; see `docs/NATIVE_NFS.md`.
 - `crates/atlas-native-csi` — CSI driver `native.atlas.zyvor.ai` (bin `atlas-native-csi`,
   `Dockerfile.native-csi`, chart `csi.enabled`): PVCs → filesystems, VolumeSnapshots, clones, per-pod
   `atlas-native-mount` FUSE mounts. `proto/csi.proto` is a wire-compatible subset of the CSI spec

@@ -478,6 +478,14 @@ impl Ops {
         Ok(self.remember(a))
     }
 
+    /// `.` (the directory) or `..` (its parent) of directory `dir`, which the kernel looks up
+    /// to turn a file handle back into an inode (NFS re-export). Not cached: a rename moves `..`.
+    pub fn lookup_dot(&self, dir: u64, name: &str) -> Result<Attr, Errno> {
+        let rest = format!("/inodes/{dir}/lookup?name={}", encode(name));
+        let a: Attr = decode(self.call(Method::GET, &rest, Body::Empty, Retry::Idempotent)?)?;
+        self.getattr(a.ino)
+    }
+
     /// Every visible entry of a directory.
     pub fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>, Errno> {
         let mut all = Vec::new();
