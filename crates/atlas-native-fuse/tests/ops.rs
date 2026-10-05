@@ -37,10 +37,16 @@ impl Cluster {
 
     /// Three data nodes, three metadata voters; `erasure` codes extents of 64 KiB and up.
     fn start_with(erasure: Option<&str>) -> Self {
+        Self::start_nodes(erasure, 3)
+    }
+
+    /// `data_nodes` data nodes (three replicas each), three metadata voters.
+    fn start_nodes(erasure: Option<&str>, data_nodes: usize) -> Self {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("token"), TOKEN).unwrap();
-        let data_l: Vec<(String, TcpListener)> =
-            (1..=3).map(|i| (format!("d{i}"), bind())).collect();
+        let data_l: Vec<(String, TcpListener)> = (1..=data_nodes)
+            .map(|i| (format!("d{i}"), bind()))
+            .collect();
         let meta_l: Vec<(String, TcpListener)> =
             (1..=3).map(|i| (format!("m{i}"), bind())).collect();
         let specs: Vec<DataNodeSpec> = data_l
@@ -436,6 +442,7 @@ fn direct(identity: Option<Arc<TlsIdentity>>) -> OpsConfig {
         direct_reads: Some(DirectReads {
             identity,
             timeout: Duration::from_secs(5),
+            prefer_host: None,
         }),
         ..OpsConfig::default()
     }
@@ -464,6 +471,129 @@ fn direct_reads_fetch_extents_from_the_data_nodes() {
     writer.write(f.ino, 100_000, b"rewritten").unwrap();
     writer.flush(f.ino).unwrap();
     assert_eq!(ops.read(f.ino, 100_000, 9).unwrap(), b"rewritten");
+    assert_eq!(ops.direct_fallbacks(), 0);
+}
+
+#[test]
+fn locality_api_and_host_preferring_direct_reads() {
+    let c = Cluster::start_nodes(None, 4);
+    create_fs(&c, "loc");
+    let writer = mount(&c, "loc", OpsConfig::default());
+    let dir = writer
+        .mknode(ROOT_INO, "train set", NodeType::Dir, None, 0o755, 0, 0)
+        .unwrap();
+    let f = writer
+        .mknode(dir.ino, "shard-0", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i * 13 % 239) as u8).collect();
+    writer.write(f.ino, 0, &data).unwrap();
+    writer.flush(f.ino).unwrap();
+
+    let l = c
+        .client()
+        .json(
+            Method::GET,
+            "/v1/fs/loc/locality?path=%2Ftrain%20set",
+            Body::Empty,
+            Retry::Idempotent,
+        )
+        .unwrap();
+    assert_eq!(
+        (l["files"].as_u64(), l["dirs"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(l["bytes"], 300_000);
+    // Three replicas over four hosts; the last host listed holds the least.
+    let hosts = l["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 4);
+    let host_bytes = |l: &serde_json::Value, h: &str| {
+        l["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["host"] == h)
+            .unwrap()["bytes"]
+            .as_u64()
+            .unwrap()
+    };
+    let total: u64 = hosts.iter().map(|h| h["bytes"].as_u64().unwrap()).sum();
+    assert_eq!(total, 3 * 300_000);
+    let target = hosts[3]["host"].as_str().unwrap().to_string();
+    assert!(host_bytes(&l, &target) < 300_000);
+
+    let (mut moved, mut local, mut after) = (0, 0, serde_json::Value::Null);
+    loop {
+        let pin = c
+            .client()
+            .json(
+                Method::POST,
+                "/v1/fs/loc/locality/pin",
+                Body::Json(json!({
+                    "path": "/train set", "hosts": [target], "after": after, "max_extents": 2,
+                })),
+                Retry::Idempotent,
+            )
+            .unwrap();
+        assert_eq!(pin["deferred"], 0);
+        moved += pin["moved"].as_u64().unwrap();
+        local += pin["local"].as_u64().unwrap();
+        after = pin["next"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    assert!(moved > 0);
+    assert_eq!(serde_json::Value::from(moved + local), l["extents"]);
+    let l2 = c
+        .client()
+        .json(
+            Method::GET,
+            "/v1/fs/loc/locality?path=/train%20set",
+            Body::Empty,
+            Retry::Idempotent,
+        )
+        .unwrap();
+    assert_eq!(host_bytes(&l2, &target), 300_000);
+    let total: u64 = l2["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 3 * 300_000);
+    assert_eq!(writer.read(f.ino, 0, 1 << 20).unwrap(), data);
+    let err = c
+        .client()
+        .json(
+            Method::POST,
+            "/v1/fs/loc/locality/pin",
+            Body::Json(json!({ "hosts": ["elsewhere"] })),
+            Retry::Idempotent,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        atlas_native_fuse::client::Error::Api { status: 400, .. }
+    ));
+
+    let layout = c
+        .client()
+        .json(
+            Method::GET,
+            &format!("/v1/fs/loc/inodes/{}/layout?offset=0&len=300000", f.ino),
+            Body::Empty,
+            Retry::Idempotent,
+        )
+        .unwrap();
+    let replicas = layout["extents"][0]["replicas"].as_array().unwrap();
+    assert!(replicas.iter().all(|r| r["host"] == r["node_id"]));
+
+    let mut cfg = direct(None);
+    if let Some(d) = cfg.direct_reads.as_mut() {
+        d.prefer_host = Some(target.clone());
+    }
+    let ops = mount(&c, "loc", cfg);
+    assert_eq!(ops.read(f.ino, 0, 1 << 20).unwrap(), data);
     assert_eq!(ops.direct_fallbacks(), 0);
 }
 

@@ -71,6 +71,10 @@ struct Args {
     /// `--identity-file` must hold a certificate signed by the cluster CA in `--ca-file`.
     #[arg(long)]
     direct_reads: bool,
+    /// With `--direct-reads`: read full copies on this data-node host (its failure-domain
+    /// `host`) first, e.g. the host this client runs on after `POST /v1/fs/{fs}/locality/pin`.
+    #[arg(long, requires = "direct_reads")]
+    prefer_host: Option<String>,
     /// Kernel request worker threads (Linux; each gets its own /dev/fuse fd). At most one fewer
     /// blocking lock requests (`F_SETLKW`) wait at once; more fail with ENOLCK.
     #[arg(long, default_value_t = 4)]
@@ -108,6 +112,7 @@ fn ops(args: &Args) -> Result<Ops, String> {
         Some(DirectReads {
             identity,
             timeout: cfg.request_timeout,
+            prefer_host: args.prefer_host.clone(),
         })
     } else {
         None
