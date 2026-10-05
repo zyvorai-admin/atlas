@@ -206,3 +206,45 @@ nfs:
     limits: { memory: 2Gi }
   nodeSelector: {}
   tolerations: []
+
+# S3 gateway (docs/NATIVE_S3.md): the listed filesystems as S3 buckets on port 9000 (objects are
+# files, `/` in keys are directories). Stateless: scale with `replicas`. Unprivileged.
+s3:
+  enabled: false
+  image:
+    repository: ghcr.io/zyvorai/atlas-native-s3
+    tag: ""          # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  replicas: 1
+  # One bucket per filesystem (by id; for a CSI volume, its PV's volumeHandle). `snapshot` (a
+  # snapshot id) serves that snapshot read-only; `read_only` refuses writes to a live filesystem.
+  buckets: []
+  #  - bucket: team-share
+  #    fs: team-share
+  #  - bucket: team-share-monday
+  #    fs: team-share
+  #    snapshot: monday
+  # Access keys. Prefer existingSecret: a Secret with `credentials.json`, a JSON list of
+  # {"access_key", "secret_key", "buckets" (optional: all), "read_only" (optional)}. `keys` takes
+  # the same list inline and renders it into a Secret (the values end up in the release).
+  credentials:
+    existingSecret: ""
+    keys: []
+  # Owner of the files and directories S3 writes create. S3 keys bypass POSIX permissions.
+  uid: 0
+  gid: 0
+  # Secret with tls.crt and tls.key: serve HTTPS instead of HTTP.
+  tls:
+    existingSecret: ""
+  # Domains for virtual-hosted-style addressing (<bucket>.<domain>); path style always works.
+  domains: []
+  service:
+    type: ClusterIP
+    port: 9000
+    loadBalancerIP: ""
+    annotations: {}
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 1Gi }
+  nodeSelector: {}
+  tolerations: []

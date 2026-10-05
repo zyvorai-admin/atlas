@@ -177,6 +177,16 @@ impl S3Target {
                     let _ = self.abort_multipart(key, &upload_id).await;
                     anyhow::bail!("complete multipart {key} failed: HTTP {s}: {d}");
                 }
+                // S3 may answer 200 and report a failure in the body, which arrives only once
+                // the object is assembled.
+                let d = resp
+                    .text()
+                    .await
+                    .with_context(|| format!("complete multipart {key}"))?;
+                if d.contains("<Error>") {
+                    let _ = self.abort_multipart(key, &upload_id).await;
+                    anyhow::bail!("complete multipart {key} failed: {d}");
+                }
                 Ok((total, sha))
             }
             Err(e) => {
@@ -396,7 +406,9 @@ impl S3Target {
         // server rejects it ("headers present which were not signed") — found live. `headers_mut`
         // adds it to the signature; the identical header must then be sent on the actual request.
         if enable_object_lock {
-            action.headers_mut().insert("x-amz-bucket-object-lock-enabled", "true");
+            action
+                .headers_mut()
+                .insert("x-amz-bucket-object-lock-enabled", "true");
         }
         let mut req = self.http.put(action.sign(SIGN_TTL));
         if let Some(body) = create_bucket_body(self.bucket.region()) {
@@ -542,11 +554,17 @@ mod tests {
     #[test]
     fn object_lock_header_is_part_of_the_signed_headers() {
         let creds = rusty_s3::Credentials::new("ak", "sk");
-        let bucket =
-            rusty_s3::Bucket::new(url::Url::parse("http://h:9000").unwrap(), UrlStyle::Path, "b", "us-east-1")
-                .unwrap();
+        let bucket = rusty_s3::Bucket::new(
+            url::Url::parse("http://h:9000").unwrap(),
+            UrlStyle::Path,
+            "b",
+            "us-east-1",
+        )
+        .unwrap();
         let mut action = bucket.create_bucket(&creds);
-        action.headers_mut().insert("x-amz-bucket-object-lock-enabled", "true");
+        action
+            .headers_mut()
+            .insert("x-amz-bucket-object-lock-enabled", "true");
         let url = action.sign(SIGN_TTL);
         let signed_headers = url
             .query_pairs()

@@ -338,6 +338,11 @@ The FUSE client supports kernel export (`FUSE_EXPORT_SUPPORT`; the node API reso
 in `GET /v1/fs/{fs}/inodes/{dir}/lookup`), so a mount can be re-exported over NFS. The chart's NFS
 gateway does this with NFS-Ganesha; see [`NATIVE_NFS.md`](NATIVE_NFS.md).
 
+## S3
+
+The chart's S3 gateway serves filesystems (and snapshots) as buckets whose objects are these same
+files: `a/b/c` is the file `c` in directory `a/b`. See [`NATIVE_S3.md`](NATIVE_S3.md).
+
 ## Limits and performance
 
 Each filesystem lives in one Raft group's catalog (`metadata.groups` spreads filesystems across
