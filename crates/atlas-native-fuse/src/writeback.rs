@@ -3,6 +3,9 @@
 
 //! Per-inode write-back buffering. The kernel hands FUSE writes of at most 128 KiB; coalescing
 //! a sequential stream into one contiguous run per inode turns those into a few large PUTs.
+//! A full run is cut at a multiple of the run size, so a long sequential stream is sent in
+//! aligned runs (whole extents when the run size is a multiple of the extent size, which the
+//! cluster writes without serializing them) even if it started mid-extent.
 
 use std::collections::HashMap;
 
@@ -35,7 +38,8 @@ impl WriteBack {
     }
 
     /// Buffers a write. Returns the runs that must be sent now, in order: a run the write could
-    /// not extend (it is not contiguous with or inside it), then the new run if it is full.
+    /// not extend (it is not contiguous with or inside it), then the full part of the new run
+    /// (up to the last multiple of the run size; the rest stays buffered).
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Vec<Dirty> {
         let mut out = Vec::new();
         let end = offset + data.len() as u64;
@@ -66,7 +70,21 @@ impl WriteBack {
             }
         }
         if self.runs[&ino].data.len() >= self.limit {
-            out.extend(self.runs.remove(&ino));
+            let mut run = self.runs.remove(&ino).expect("just inserted");
+            let limit = self.limit.max(1) as u64;
+            let cut = run.end() - run.end() % limit;
+            if cut > run.offset && cut < run.end() {
+                let tail = run.data.split_off((cut - run.offset) as usize);
+                self.runs.insert(
+                    ino,
+                    Dirty {
+                        ino,
+                        offset: cut,
+                        data: tail,
+                    },
+                );
+            }
+            out.push(run);
         }
         out
     }
@@ -129,6 +147,21 @@ mod tests {
         // Other inodes have their own runs.
         assert!(wb.write(2, 0, b"x").is_empty());
         assert_eq!(wb.take_all().len(), 2);
+    }
+
+    #[test]
+    fn full_runs_are_cut_at_multiples_of_the_run_size() {
+        let mut wb = WriteBack::new(8);
+        // Starts mid-run: the first run ends at 8, the rest stays buffered.
+        let out = wb.write(1, 3, b"abcdefgh");
+        assert_eq!((out[0].offset, out[0].data.as_slice()), (3, &b"abcde"[..]));
+        assert_eq!(wb.end(1), Some(11));
+        let out = wb.write(1, 11, b"ijklm");
+        assert_eq!(
+            (out[0].offset, out[0].data.as_slice()),
+            (8, &b"fghijklm"[..])
+        );
+        assert_eq!(wb.end(1), None);
     }
 
     #[test]

@@ -12,4 +12,5 @@ pub mod dirs;
 pub mod fuse;
 pub mod locks;
 pub mod ops;
+pub mod pipeline;
 pub mod writeback;

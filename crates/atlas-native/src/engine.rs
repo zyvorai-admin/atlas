@@ -14,7 +14,6 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    alloc::FreeList,
     checksum,
     device::{BlockStore, FileDevice},
     ec::{EcLayout, EcScheme},
@@ -35,6 +34,7 @@ use crate::{
 
 mod export;
 mod files;
+mod inflight;
 mod leases;
 mod rebuild;
 mod tier;
@@ -294,9 +294,11 @@ pub struct NativeEngine {
     cfg: EngineConfig,
     nodes: Vec<NodeRuntime>,
     meta: Meta,
-    /// Serializes free-list allocation through data write and `InstallExtent` commit, so two
-    /// writers can never be handed the same free range.
+    /// Serializes writes that read what they overwrite (partial extents) through their commit,
+    /// and every write's commit; aligned whole-extent writes place their data without it.
     write_lock: Mutex<()>,
+    /// Free ranges held by placements whose commit hasn't applied yet.
+    inflight: inflight::Inflight,
     /// One repair at a time, so two never write replacements for the same part.
     repair_lock: Mutex<()>,
     /// When each extent was last read (ms since the epoch), tracked only with an object store,
@@ -373,6 +375,7 @@ impl NativeEngine {
             nodes: runtimes,
             meta,
             write_lock: Mutex::new(()),
+            inflight: Default::default(),
             repair_lock: Mutex::new(()),
             reads: Mutex::new(Default::default()),
             opened_ms: now_ms(),
@@ -473,18 +476,28 @@ impl NativeEngine {
         if data.is_empty() {
             return Ok(());
         }
+        let in_bounds = |c: &Catalog| {
+            let size = c
+                .volumes
+                .get(volume_id)
+                .map(|v| v.size_bytes)
+                .ok_or_else(|| NativeError::NotFound(volume_id.into()))?;
+            if offset.saturating_add(data.len() as u64) > size {
+                return Err(NativeError::Invalid("write exceeds volume size".into()));
+            }
+            Ok(())
+        };
+        let target = Target::Volume(volume_id);
+        if self.write_aligned(&target, offset, data, in_bounds)? {
+            return Ok(());
+        }
         let _write = self
             .write_lock
             .lock()
             .map_err(|_| NativeError::Poisoned("write"))?;
         let fence = self.write_fence()?;
-        let size = self
-            .with_catalog(|c| c.volumes.get(volume_id).map(|v| v.size_bytes))?
-            .ok_or_else(|| NativeError::NotFound(volume_id.into()))?;
-        if offset.saturating_add(data.len() as u64) > size {
-            return Err(NativeError::Invalid("write exceeds volume size".into()));
-        }
-        self.write_locked(&Target::Volume(volume_id), offset, data, fence)
+        self.with_catalog(in_bounds)??;
+        self.write_locked(&target, offset, data, fence)
     }
 
     /// Allocation reads the applied free list, so under Raft every earlier entry (including
@@ -541,19 +554,70 @@ impl NativeEngine {
         if let [(cell, content)] = cells.as_slice() {
             return self.install_extent(target, *cell, content, fence);
         }
-        // Every placement of this write draws from one scratch copy of the free list, so
-        // concurrent placements never pick the same free range; the single commit then
-        // reserves exactly those ranges.
-        let alloc = self.alloc_scratch()?;
+        let alloc = self.lease()?;
+        let placed = self.place_cells(&cells, fence, &alloc)?;
+        self.commit_cells(target, placed, fence, &alloc)
+    }
+
+    /// Writes whole grid cells without holding `write_lock` while their data goes to the data
+    /// nodes: nothing is read back and merged, so only the commit needs the lock. Does nothing
+    /// and returns false unless `offset` and the length are multiples of the target's grid.
+    fn write_aligned(
+        &self,
+        target: &Target,
+        offset: u64,
+        data: &[u8],
+        in_bounds: impl Fn(&Catalog) -> Result<(), NativeError>,
+    ) -> Result<bool, NativeError> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        // The fence first: on a follower it fails as "not the leader", and on the leader it
+        // waits until the catalog has applied every earlier entry (the target's creation).
+        let fence = {
+            let _write = self
+                .write_lock
+                .lock()
+                .map_err(|_| NativeError::Poisoned("write"))?;
+            self.write_fence()?
+        };
+        let grid = self.with_catalog(|c| target.grid(c, self.cfg.extent_bytes))??;
+        if !offset.is_multiple_of(grid) || !(data.len() as u64).is_multiple_of(grid) {
+            return Ok(false);
+        }
+        self.with_catalog(&in_bounds)??;
+        let cells: Vec<(u64, std::borrow::Cow<[u8]>)> = data
+            .chunks(grid as usize)
+            .enumerate()
+            .map(|(i, chunk)| (offset + i as u64 * grid, chunk.into()))
+            .collect();
+        let alloc = self.lease()?;
+        let placed = self.place_cells(&cells, fence, &alloc)?;
+        let _write = self
+            .write_lock
+            .lock()
+            .map_err(|_| NativeError::Poisoned("write"))?;
+        self.with_catalog(&in_bounds)??;
+        self.commit_cells(target, placed, fence, &alloc)?;
+        Ok(true)
+    }
+
+    /// Places each cell's content (a few at a time) and returns the extents, in cell order.
+    fn place_cells(
+        &self,
+        cells: &[(u64, std::borrow::Cow<[u8]>)],
+        fence: u64,
+        alloc: &inflight::Lease<'_>,
+    ) -> Result<Vec<ExtentRef>, NativeError> {
         let mut placed_all = Vec::with_capacity(cells.len());
         for window in cells.chunks(WRITE_PARALLELISM) {
             let placed: Vec<Result<ExtentRef, NativeError>> = if window.len() == 1 {
-                vec![self.place_extent(&window[0].1, fence, &alloc)]
+                vec![self.place_extent(&window[0].1, fence, alloc)]
             } else {
                 std::thread::scope(|s| {
                     let handles: Vec<_> = window
                         .iter()
-                        .map(|(_, content)| s.spawn(|| self.place_extent(content, fence, &alloc)))
+                        .map(|(_, content)| s.spawn(|| self.place_extent(content, fence, alloc)))
                         .collect();
                     handles
                         .into_iter()
@@ -570,6 +634,17 @@ impl NativeEngine {
                 placed_all.push(extent);
             }
         }
+        Ok(placed_all)
+    }
+
+    /// Commits placed extents into `target` as one command.
+    fn commit_cells(
+        &self,
+        target: &Target,
+        placed_all: Vec<ExtentRef>,
+        fence: u64,
+        alloc: &inflight::Lease<'_>,
+    ) -> Result<(), NativeError> {
         let bytes: usize = placed_all.iter().map(|e| e.len).sum();
         let end = placed_all
             .iter()
@@ -591,14 +666,10 @@ impl NativeEngine {
                 },
             },
         };
-        self.commit(cmd, Some(fence))?;
+        self.commit(cmd, Some(fence))
+            .inspect_err(|e| alloc.settle(e))?;
         self.telemetry.record_write(bytes);
         Ok(())
-    }
-
-    /// A private copy of the applied free list for one batch of placements.
-    fn alloc_scratch(&self) -> Result<Mutex<FreeList>, NativeError> {
-        Ok(Mutex::new(self.with_catalog(|c| c.free.clone())?))
     }
 
     /// Writes `chunk` to fresh replicas and commits it as the extent at `logical`.
@@ -609,9 +680,10 @@ impl NativeEngine {
         chunk: &[u8],
         fence: u64,
     ) -> Result<(), NativeError> {
-        let alloc = self.alloc_scratch()?;
+        let alloc = self.lease()?;
         let extent = self.place_extent(chunk, fence, &alloc)?;
         self.commit_extent(target, logical, chunk.len(), extent, fence)
+            .inspect_err(|e| alloc.settle(e))
     }
 
     /// Writes `chunk` to `replicas` fresh copies (in parallel) and returns the extent to commit.
@@ -619,7 +691,7 @@ impl NativeEngine {
         &self,
         chunk: &[u8],
         fence: u64,
-        alloc: &Mutex<FreeList>,
+        alloc: &inflight::Lease<'_>,
     ) -> Result<ExtentRef, NativeError> {
         if let Some(scheme) = self
             .cfg
@@ -689,7 +761,7 @@ impl NativeEngine {
         scheme: EcScheme,
         chunk: &[u8],
         fence: u64,
-        alloc: &Mutex<FreeList>,
+        alloc: &inflight::Lease<'_>,
     ) -> Result<ExtentRef, NativeError> {
         let enc = scheme.encode(chunk)?;
         let needed = scheme.shards();
@@ -1019,7 +1091,7 @@ impl NativeEngine {
                     || (distinct && taken_hosts.contains(n.failure_domain.host.as_str()))
             });
             let mut placed = None;
-            let alloc = self.alloc_scratch()?;
+            let alloc = self.lease()?;
             for node_id in order {
                 if let Some(r) = self.place_replica(&node_id, fence, data, &alloc)? {
                     placed = Some(r);
@@ -1035,7 +1107,10 @@ impl NativeEngine {
                 old: old.clone(),
                 new: new.clone(),
             };
-            match self.commit(cmd, Some(fence)) {
+            match self
+                .commit(cmd, Some(fence))
+                .inspect_err(|e| alloc.settle(e))
+            {
                 Ok(()) => {
                     st.replicas_repaired += 1;
                     st.bytes_written += data.len() as u64;
@@ -1394,19 +1469,12 @@ impl NativeEngine {
         node_id: &str,
         fence: u64,
         data: &[u8],
-        alloc: &Mutex<FreeList>,
+        alloc: &inflight::Lease<'_>,
     ) -> Result<Option<ReplicaRef>, NativeError> {
         let node = self.node(node_id)?;
         let len = data.len() as u64;
         let device_index = node.next_device.fetch_add(1, Ordering::Relaxed) % node.devices.len();
-        let free_off = {
-            let mut free = alloc.lock().map_err(|_| NativeError::Poisoned("alloc"))?;
-            let off = free.find(node_id, device_index, len);
-            if let Some(off) = off {
-                free.reserve(node_id, device_index, off, len);
-            }
-            off
-        };
+        let free_off = alloc.take(node_id, device_index, len)?;
         let device = &node.devices[device_index];
         let written = match free_off {
             Some(off) => device.write_at(fence, off, data).map(|()| off),

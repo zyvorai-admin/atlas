@@ -5,7 +5,8 @@
 //! every call returns a value or an errno. Attributes and name lookups are cached for a short
 //! TTL, or with cache leases for as long as the cluster's lease on them lasts (a change by
 //! another client recalls it first); writes are buffered per inode and sent on fsync, close, a
-//! non-sequential write, or once a run reaches the flush size.
+//! non-sequential write, or once a run reaches the flush size. Full runs are sent in the
+//! background, several at once ([`crate::pipeline`]).
 
 use std::{
     collections::HashMap,
@@ -25,6 +26,7 @@ use crate::{
     cache::TtlCache,
     client::{encode, Body, Client, Error, Retry},
     locks::{Conflict, Locks, Recall},
+    pipeline::{Pipeline, SendRun},
     writeback::{Dirty, WriteBack},
 };
 
@@ -37,8 +39,11 @@ type Window = (u64, Arc<Vec<u8>>);
 pub struct OpsConfig {
     /// How long attributes and name lookups may be served from cache (also the kernel TTL).
     pub ttl: Duration,
-    /// Write-back run size; 0 sends every write immediately.
+    /// Write-back run size; 0 sends every write immediately. A multiple of the filesystem's
+    /// extent size lets the cluster write the runs of a sequential stream concurrently.
     pub writeback_bytes: usize,
+    /// Full runs sent at once in the background; 0 sends them in the write call.
+    pub writeback_parallel: usize,
     /// Largest single read or write request sent to the cluster.
     pub max_io_bytes: usize,
     /// A read fetches at least this much (from the read offset) and serves following reads from
@@ -61,6 +66,7 @@ impl Default for OpsConfig {
         Self {
             ttl: Duration::from_secs(1),
             writeback_bytes: 4 << 20,
+            writeback_parallel: 4,
             max_io_bytes: 8 << 20,
             readahead_bytes: 4 << 20,
             direct_reads: None,
@@ -96,6 +102,8 @@ pub struct Ops {
     /// before that is not cached.
     recalled: Arc<Mutex<HashMap<u64, Instant>>>,
     dirty: Mutex<WriteBack>,
+    /// Sends full runs in the background (with `writeback_parallel` > 0).
+    pipeline: Option<Pipeline>,
     readahead: Mutex<TtlCache<u64, Window>>,
     /// Where each inode's last read ended: only a read that continues there reads ahead.
     last_read_end: Mutex<TtlCache<u64, u64>>,
@@ -107,7 +115,7 @@ pub struct Ops {
     /// Data-node clients for direct reads, by `(node id, endpoint, device)`.
     data_nodes: Mutex<HashMap<(String, String, usize), Arc<RemoteDevice>>>,
     direct_fallbacks: std::sync::atomic::AtomicU64,
-    locks: Locks,
+    locks: Arc<Locks>,
 }
 
 /// Prefix of the names open-but-unlinked files are parked under; hidden from listings.
@@ -169,14 +177,32 @@ impl Ops {
                 }
             }) as Recall
         });
+        let locks = Arc::new(Locks::new(
+            client.clone(),
+            &fs,
+            cfg.session_ttl,
+            cfg.lock_waiters,
+            recall,
+        ));
+        let pipeline = (cfg.writeback_parallel > 0 && cfg.writeback_bytes > 0).then(|| {
+            let send: SendRun = {
+                let (client, fs, locks, attrs) =
+                    (client.clone(), fs.clone(), locks.clone(), attrs.clone());
+                let max_io = cfg.max_io_bytes;
+                Arc::new(move |run: &Dirty| {
+                    let result = send_run(&client, &fs, &locks, max_io, run).map(drop);
+                    // Runs finish out of order, so no reply's attributes are known current.
+                    if let Ok(mut c) = attrs.lock() {
+                        c.remove(&run.ino);
+                    }
+                    result
+                })
+            };
+            Pipeline::new(cfg.writeback_parallel, send)
+        });
         Self {
-            locks: Locks::new(
-                client.clone(),
-                &fs,
-                cfg.session_ttl,
-                cfg.lock_waiters,
-                recall,
-            ),
+            locks,
+            pipeline,
             client,
             fs,
             attrs,
@@ -274,16 +300,8 @@ impl Ops {
         }
     }
 
-    /// Requests name the mount's session (once it has one), so the cluster does not recall the
-    /// mount's own cache leases for its own changes.
     fn path(&self, rest: &str) -> String {
-        match self.locks.session_id() {
-            Some(s) => {
-                let sep = if rest.contains('?') { '&' } else { '?' };
-                format!("/v1/fs/{}{rest}{sep}session={s}", self.fs)
-            }
-            None => format!("/v1/fs/{}{rest}", self.fs),
-        }
+        fs_path(&self.fs, &self.locks, rest)
     }
 
     /// Whether to ask for cache leases: enabled, writable, and the session is open.
@@ -347,6 +365,9 @@ impl Ops {
     /// `a` with this mount's buffered bytes and parked unlinks applied.
     fn adjust(&self, mut a: Attr) -> Attr {
         if let Some(end) = self.dirty.lock().ok().and_then(|d| d.end(a.ino)) {
+            a.size = a.size.max(end);
+        }
+        if let Some(end) = self.pipeline.as_ref().and_then(|p| p.end(a.ino)) {
             a.size = a.size.max(end);
         }
         if self.hidden.lock().is_ok_and(|h| h.contains_key(&a.ino)) {
@@ -912,18 +933,34 @@ impl Ops {
             return Err(libc::EROFS);
         }
         self.drop_readahead(ino);
+        if let Some(e) = self.pipeline.as_ref().and_then(|p| p.failed(ino)) {
+            return Err(e);
+        }
+        // Runs are queued under the lock, so runs of one inode queue in write order.
         let mut d = self.dirty.lock().map_err(|_| libc::EIO)?;
         for run in d.write(ino, offset, data) {
-            self.send(&run)?;
+            self.dispatch(run)?;
         }
         Ok(data.len())
     }
 
-    /// Sends any buffered bytes of `ino`.
+    fn dispatch(&self, run: Dirty) -> Result<(), Errno> {
+        match &self.pipeline {
+            Some(p) => p.submit(run),
+            None => self.send(&run),
+        }
+    }
+
+    /// Sends any buffered bytes of `ino` and waits for its runs in flight.
     pub fn flush(&self, ino: u64) -> Result<(), Errno> {
-        let mut d = self.dirty.lock().map_err(|_| libc::EIO)?;
-        match d.take(ino) {
-            Some(run) => self.send(&run),
+        {
+            let mut d = self.dirty.lock().map_err(|_| libc::EIO)?;
+            if let Some(run) = d.take(ino) {
+                self.dispatch(run)?;
+            }
+        }
+        match &self.pipeline {
+            Some(p) => p.wait(ino),
             None => Ok(()),
         }
     }
@@ -931,11 +968,16 @@ impl Ops {
     /// Sends every buffered write and removes files parked by unlink-while-open (at unmount).
     pub fn flush_all(&self) -> Result<(), Errno> {
         let mut result = Ok(());
-        let runs = self.dirty.lock().map_err(|_| libc::EIO)?.take_all();
-        for run in runs {
-            if let Err(e) = self.send(&run) {
-                result = Err(e);
+        {
+            let mut d = self.dirty.lock().map_err(|_| libc::EIO)?;
+            for run in d.take_all() {
+                if let Err(e) = self.dispatch(run) {
+                    result = Err(e);
+                }
             }
+        }
+        if let Some(Err(e)) = self.pipeline.as_ref().map(Pipeline::wait_all) {
+            result = Err(e);
         }
         let parked: Vec<(u64, String)> = self
             .hidden
@@ -950,21 +992,15 @@ impl Ops {
         result
     }
 
-    /// Writes a run in requests of at most `max_io_bytes` (each is idempotent: same bytes, same
-    /// offset), then caches the attributes the last one returned.
+    /// Writes a run, then caches the attributes the cluster returned.
     fn send(&self, run: &Dirty) -> Result<(), Errno> {
-        let mut last = None;
-        for (i, chunk) in run.data.chunks(self.cfg.max_io_bytes.max(1)).enumerate() {
-            let at = run.offset + (i * self.cfg.max_io_bytes.max(1)) as u64;
-            let v = self.call(
-                Method::PUT,
-                &format!("/inodes/{}/data?offset={at}", run.ino),
-                Body::Bytes(chunk),
-                Retry::Idempotent,
-            )?;
-            last = Some(v);
-        }
-        if let Some(v) = last {
+        if let Some(v) = send_run(
+            &self.client,
+            &self.fs,
+            &self.locks,
+            self.cfg.max_io_bytes,
+            run,
+        )? {
             let a: Attr = decode(v)?;
             if let Ok(mut c) = self.attrs.lock() {
                 c.put(a.ino, a);
@@ -972,4 +1008,37 @@ impl Ops {
         }
         Ok(())
     }
+}
+
+/// Requests name the mount's session (once it has one), so the cluster does not recall the
+/// mount's own cache leases for its own changes.
+fn fs_path(fs: &str, locks: &Locks, rest: &str) -> String {
+    match locks.session_id() {
+        Some(s) => {
+            let sep = if rest.contains('?') { '&' } else { '?' };
+            format!("/v1/fs/{fs}{rest}{sep}session={s}")
+        }
+        None => format!("/v1/fs/{fs}{rest}"),
+    }
+}
+
+/// Writes a run in requests of at most `max_io` bytes (each is idempotent: same bytes, same
+/// offset); returns the last reply (the file's attributes).
+fn send_run(
+    client: &Client,
+    fs: &str,
+    locks: &Locks,
+    max_io: usize,
+    run: &Dirty,
+) -> Result<Option<serde_json::Value>, Errno> {
+    let mut last = None;
+    for (i, chunk) in run.data.chunks(max_io.max(1)).enumerate() {
+        let at = run.offset + (i * max_io.max(1)) as u64;
+        let path = fs_path(fs, locks, &format!("/inodes/{}/data?offset={at}", run.ino));
+        let v = client
+            .json(Method::PUT, &path, Body::Bytes(chunk), Retry::Idempotent)
+            .map_err(errno)?;
+        last = Some(v);
+    }
+    Ok(last)
 }

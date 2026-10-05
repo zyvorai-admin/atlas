@@ -192,6 +192,95 @@ fn create_fs(c: &Cluster, id: &str) {
 }
 
 #[test]
+fn checkpoint_writes_go_in_the_background_and_report_failures_at_flush() {
+    let c = Cluster::start();
+    create_fs(&c, "ck");
+    let cfg = OpsConfig {
+        writeback_bytes: 256 << 10,
+        writeback_parallel: 4,
+        ..OpsConfig::default()
+    };
+    let ops = mount(&c, "ck", cfg.clone());
+    let f = ops
+        .mknode(ROOT_INO, "ckpt.pt", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    // A header, then kernel-sized chunks: runs after the first are whole extents.
+    let mut want: Vec<u8> = b"header-100".repeat(10);
+    want.extend((0..3u32 << 20).map(|i| (i ^ (i >> 11)) as u8));
+    ops.write(f.ino, 0, &want[..100]).unwrap();
+    for (i, chunk) in want[100..].chunks(128 << 10).enumerate() {
+        ops.write(f.ino, 100 + (i * (128 << 10)) as u64, chunk)
+            .unwrap();
+    }
+    // Bytes on the wire count in the size before they land.
+    assert_eq!(ops.getattr(f.ino).unwrap().size, want.len() as u64);
+    ops.flush(f.ino).unwrap();
+    let other = mount(&c, "ck", OpsConfig::default());
+    assert_eq!(other.getattr(f.ino).unwrap().size, want.len() as u64);
+    assert_eq!(other.read(f.ino, 0, 4 << 20).unwrap(), want);
+
+    // Another client removes the file: the background runs fail. Later writes to it fail
+    // fast, and flush (fsync, close) reports the failure once.
+    let g = ops
+        .mknode(ROOT_INO, "gone.pt", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    other.unlink(ROOT_INO, "gone.pt").unwrap();
+    for i in 0..8u64 {
+        if ops.write(g.ino, i << 17, &[7u8; 128 << 10]) == Err(libc::ENOENT) {
+            break;
+        }
+    }
+    assert_eq!(ops.flush(g.ino), Err(libc::ENOENT));
+    assert_eq!(ops.flush(g.ino), Ok(()));
+}
+
+/// One file written sequentially in kernel-sized chunks, with runs sent in the write call and
+/// in the background.
+/// `BENCH_MIB=256 cargo test --release -p atlas-native-fuse --test ops checkpoint_bench -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn checkpoint_bench() {
+    let mib: usize = std::env::var("BENCH_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let c = Cluster::start();
+    create_fs(&c, "bench");
+    let chunk = vec![0x5au8; 128 << 10];
+    for parallel in [0, 4] {
+        let ops = mount(
+            &c,
+            "bench",
+            OpsConfig {
+                writeback_bytes: 1 << 20,
+                writeback_parallel: parallel,
+                ..OpsConfig::default()
+            },
+        );
+        let f = ops
+            .mknode(
+                ROOT_INO,
+                &format!("ckpt-{parallel}"),
+                NodeType::File,
+                None,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        let t = std::time::Instant::now();
+        for i in 0..(mib << 20) / chunk.len() {
+            ops.write(f.ino, (i * chunk.len()) as u64, &chunk).unwrap();
+        }
+        ops.flush(f.ino).unwrap();
+        println!(
+            "checkpoint through Ops: {mib} MiB, 1 MiB runs, {parallel} in the background: {:.0} MiB/s",
+            mib as f64 / t.elapsed().as_secs_f64()
+        );
+    }
+}
+
+#[test]
 fn posix_operations_through_the_ops_layer() {
     let c = Cluster::start();
     create_fs(&c, "f1");
