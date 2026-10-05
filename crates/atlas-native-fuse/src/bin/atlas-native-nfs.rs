@@ -8,15 +8,16 @@
 //! cluster; if any process exits, it shuts the rest down and fails.
 
 use std::{
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode},
-    sync::atomic::{AtomicBool, Ordering},
+    process::{Command, ExitCode},
     thread::sleep,
     time::{Duration, Instant},
 };
 
-use atlas_native_fuse::nfs::{self, Export};
+use atlas_native_fuse::{
+    nfs::{self, Export},
+    supervise::{self, mounted, stopping, Proc},
+};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -65,68 +66,6 @@ struct Args {
     statd_bin: String,
 }
 
-static STOP: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_signal(_: libc::c_int) {
-    STOP.store(true, Ordering::SeqCst);
-}
-
-struct Proc {
-    name: String,
-    child: Child,
-}
-
-impl Proc {
-    fn spawn(name: impl Into<String>, cmd: &mut Command) -> Result<Proc, String> {
-        let name = name.into();
-        let child = cmd.spawn().map_err(|e| format!("start {name}: {e}"))?;
-        Ok(Proc { name, child })
-    }
-
-    fn exited(&mut self) -> Option<String> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Some(format!("{} exited ({status})", self.name)),
-            Ok(None) => None,
-            Err(e) => Some(format!("{}: {e}", self.name)),
-        }
-    }
-
-    /// SIGTERM, then SIGKILL after `grace`.
-    fn stop(&mut self, grace: Duration) {
-        if self.child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        if let Ok(pid) = i32::try_from(self.child.id()) {
-            // SAFETY: signalling our own child by pid.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
-        if !wait_for(&mut self.child, grace) {
-            tracing::warn!(process = %self.name, "did not stop in time; killing it");
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-fn wait_for(child: &mut Child, limit: Duration) -> bool {
-    let until = Instant::now() + limit;
-    while Instant::now() < until {
-        if child.try_wait().ok().flatten().is_some() {
-            return true;
-        }
-        sleep(Duration::from_millis(100));
-    }
-    false
-}
-
-/// Whether `dir` is a different filesystem from its parent, i.e. the mount is up.
-fn mounted(dir: &Path) -> bool {
-    match (dir.metadata(), dir.parent().map(Path::metadata)) {
-        (Ok(d), Some(Ok(p))) => d.dev() != p.dev(),
-        _ => false,
-    }
-}
-
 fn exports(args: &Args) -> Result<Vec<Export>, String> {
     let raw = std::fs::read(&args.exports_file)
         .map_err(|e| format!("exports file {}: {e}", args.exports_file.display()))?;
@@ -163,7 +102,7 @@ fn run(args: &Args, exports: &[Export], procs: &mut Vec<Proc>) -> Result<(), Str
         if let Some(why) = procs.iter_mut().find_map(Proc::exited) {
             return Err(why);
         }
-        if STOP.load(Ordering::SeqCst) {
+        if stopping() {
             return Ok(());
         }
         if Instant::now() > until {
@@ -211,7 +150,7 @@ fn run(args: &Args, exports: &[Export], procs: &mut Vec<Proc>) -> Result<(), Str
     )?);
     tracing::info!(v3 = args.nfs_v3, "serving NFS");
 
-    while !STOP.load(Ordering::SeqCst) {
+    while !stopping() {
         if let Some(why) = procs.iter_mut().find_map(Proc::exited) {
             return Err(why);
         }
@@ -230,13 +169,7 @@ fn shutdown(args: &Args, exports: &[Export], procs: &mut [Proc]) {
         p.stop(Duration::from_secs(20));
     }
     for e in exports {
-        let dir = args.root.join(&e.fs);
-        if mounted(&dir) {
-            match Command::new("fusermount3").arg("-u").arg(&dir).status() {
-                Ok(s) if s.success() => {}
-                other => tracing::warn!(fs = %e.fs, result = ?other, "unmount failed"),
-            }
-        }
+        supervise::unmount(&args.root.join(&e.fs));
     }
     for p in procs.iter_mut() {
         p.stop(Duration::from_secs(30));
@@ -252,10 +185,7 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    for sig in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: the handler only stores to an atomic.
-        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
-    }
+    supervise::handle_signals();
     let exports = match exports(&args) {
         Ok(e) => e,
         Err(e) => {

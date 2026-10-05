@@ -29,7 +29,7 @@ columns state only what has been measured or verified in this repository.
 | Data protection | Ceph replication or erasure coding | 3 replicas or Reed-Solomon erasure coding (e.g. 4+2, 8+3), SHA-256 checksums per extent and per shard | Distributed erasure coding |
 | Tiering to object storage | Not managed by Atlas | Cold extents to S3 (Ceph RGW by default, or any S3-compatible bucket), read back from their objects; snapshots export to S3 incrementally and import on any cluster | Yes |
 | GPUDirect Storage | No | No | Yes |
-| Protocols | Block, CephFS, S3 (RGW) | Block over HTTP, POSIX via FUSE, NFSv3/v4.1/v4.2 (NFS-Ganesha gateway), S3 over the same files | POSIX, NFS, SMB, S3 |
+| Protocols | Block, CephFS, S3 (RGW) | Block over HTTP, POSIX via FUSE, NFSv3/v4.1/v4.2 (NFS-Ganesha gateway), SMB 2.1/3.x (Samba gateway), S3 over the same files | POSIX, NFS, SMB, S3 |
 | Snapshots and clones | Yes (RBD, CephFS) | Yes, copy-on-write | Yes |
 | Cross-site DR | RBD mirroring, verified live (`docs/DR.md`) | Not yet | Snapshot-to-object and replication features |
 | Mixed backends under one API | Ceph, NFS, ZFS, Longhorn, S3, native | (same gateway) | WEKA only |
@@ -82,7 +82,8 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
    and MLPerf Storage results are not.
 5. **Protocols:** NFS, SMB and S3 front ends over the same namespace; ACLs, quotas, `O_DIRECT`;
    an IO500 submission. Per-filesystem byte and inode quotas, POSIX ACLs, `O_DIRECT`, an NFS gateway
-   (`docs/NATIVE_NFS.md`) and an S3 gateway (`docs/NATIVE_S3.md`) are done; SMB and IO500 are not.
+   (`docs/NATIVE_NFS.md`), an S3 gateway (`docs/NATIVE_S3.md`) and an SMB gateway
+   (`docs/NATIVE_SMB.md`) are done; IO500 is not.
 
 Status of each step is tracked in `docs/NATIVE_STORAGE.md`. Until a phase's benchmark is
 published, treat atlas-native as behind WEKA on that axis.

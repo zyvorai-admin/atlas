@@ -207,6 +207,47 @@ nfs:
   nodeSelector: {}
   tolerations: []
 
+# SMB gateway (docs/NATIVE_SMB.md): Samba serving FUSE mounts of the listed filesystems, SMB 2.1
+# and 3.x on port 445 behind one Service. One pod: open files and locks live in one smbd.
+smb:
+  enabled: false
+  image:
+    repository: ghcr.io/zyvorai/atlas-native-smb
+    tag: ""          # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  # Shares, by filesystem id (for a CSI volume, its PV's volumeHandle). `users` limits who may
+  # connect (default: every user), `read_only_users` who may only read, `clients` which addresses
+  # or CIDRs may connect (default: any). A filesystem may back several shares.
+  shares: []
+  #  - name: team
+  #    fs: team-share
+  #  - name: team-archive
+  #    fs: team-share
+  #    access: ro
+  #    users: [alice]
+  # Users: each becomes a Unix account in the gateway with this uid/gid, so SMB access is checked
+  # against mode bits (and POSIX ACLs with --acl mounts) like any other client. Prefer
+  # existingSecret: a Secret with `users.json`, a JSON list of {"user", "password", "uid", "gid"}.
+  # `list` takes the same list inline and renders it into a Secret (passwords end up in the release).
+  users:
+    existingSecret: ""
+    list: []
+  # SMB 3 encryption: desired, required or off.
+  encrypt: desired
+  # atlas-native-mount options for every share's mount.
+  mountArgs: ["--cache-leases"]
+  service:
+    type: ClusterIP
+    loadBalancerIP: ""
+    # Local keeps client addresses for `clients` checks behind a LoadBalancer or NodePort.
+    externalTrafficPolicy: ""
+    annotations: {}
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 2Gi }
+  nodeSelector: {}
+  tolerations: []
+
 # S3 gateway (docs/NATIVE_S3.md): the listed filesystems as S3 buckets on port 9000 (objects are
 # files, `/` in keys are directories). Stateless: scale with `replicas`. Unprivileged.
 s3:

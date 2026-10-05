@@ -343,6 +343,12 @@ gateway does this with NFS-Ganesha; see [`NATIVE_NFS.md`](NATIVE_NFS.md).
 The chart's S3 gateway serves filesystems (and snapshots) as buckets whose objects are these same
 files: `a/b/c` is the file `c` in directory `a/b`. See [`NATIVE_S3.md`](NATIVE_S3.md).
 
+## SMB
+
+The chart's SMB gateway runs Samba over `--allow-other` FUSE mounts, one per share. SMB users are
+Unix accounts with configured uids and gids, so the mount's permission checks apply to them. See
+[`NATIVE_SMB.md`](NATIVE_SMB.md).
+
 ## Limits and performance
 
 Each filesystem lives in one Raft group's catalog (`metadata.groups` spreads filesystems across

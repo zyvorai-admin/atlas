@@ -34,6 +34,8 @@ kubectl -n atlas-native get secret atlas-native-api -o jsonpath='{.data.token}' 
 | `csi.snapshots.enabled` | false | external-snapshotter sidecar and the VolumeSnapshotClass `csi.snapshots.className`; needs the VolumeSnapshot CRDs and snapshot-controller. |
 | `csi.node.updateStrategy` | OnDelete | Restarting a node plugin breaks the mounts on that node, so upgrades don't roll it. |
 | `csi.storageClass.extentBytes`, `csi.storageClass.mountOptions` | 0, [] | Extent grid of new filesystems; whitelisted `atlas-native-mount` options. |
+| `smb.enabled` | false | SMB gateway ([`docs/NATIVE_SMB.md`](../../../docs/NATIVE_SMB.md)): single-replica privileged Deployment running Samba over FUSE mounts of `smb.shares`, and a Service on 445. Needs `smb.users.existingSecret` (key `users.json`) or inline `smb.users.list`. Not compatible with `httpTls.requireClientCert` yet. |
+| `smb.encrypt`, `smb.mountArgs` | desired, `[--cache-leases]` | SMB 3 encryption (`desired`, `required`, `off`); `atlas-native-mount` options for every share. |
 | `s3.enabled` | false | S3 gateway ([`docs/NATIVE_S3.md`](../../../docs/NATIVE_S3.md)): Deployment of `s3.replicas` unprivileged pods and a Service on `s3.service.port`, serving `s3.buckets` (filesystem or snapshot per bucket). Needs `s3.credentials.existingSecret` (key `credentials.json`) or inline `s3.credentials.keys`. Not compatible with `httpTls.requireClientCert` yet. |
 | `s3.tls.existingSecret`, `s3.domains`, `s3.uid`, `s3.gid` | empty, [], 0, 0 | HTTPS for the S3 endpoint; virtual-hosted-style domains; owner of files S3 writes create. |
 
