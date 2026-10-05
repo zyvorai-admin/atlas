@@ -1071,3 +1071,37 @@ fn quota_overruns_fail_with_edquot_directly_and_at_flush() {
     let failed = failed.or_else(|| wb.flush(g.ino).err());
     assert_eq!(failed, Some(libc::EDQUOT));
 }
+
+#[test]
+fn direct_io_writes_through_and_reads_around_the_caches() {
+    let c = Cluster::start();
+    create_fs(&c, "dio");
+    // Large write-back and read-ahead windows, so only the direct paths can explain what
+    // another mount sees.
+    let cfg = OpsConfig {
+        writeback_bytes: 8 << 20,
+        readahead_bytes: 4 << 20,
+        ttl: Duration::from_secs(60),
+        ..OpsConfig::default()
+    };
+    let a = mount(&c, "dio", cfg.clone());
+    let b = mount(&c, "dio", cfg);
+    let f = a
+        .mknode(ROOT_INO, "db", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    // A buffered write stays in this mount until flushed...
+    a.write(f.ino, 0, b"buffered").unwrap();
+    assert!(b.read_direct(f.ino, 0, 64).unwrap().is_empty());
+    // ...and a direct write sends it first, then lands before returning.
+    a.write_through(f.ino, 8, b"-direct").unwrap();
+    assert_eq!(b.read_direct(f.ino, 0, 64).unwrap(), b"buffered-direct");
+
+    // A read-ahead window in `b` would serve stale bytes; a direct read doesn't.
+    assert_eq!(b.read(f.ino, 0, 8).unwrap(), b"buffered");
+    a.write_through(f.ino, 0, b"BUFFERED").unwrap();
+    assert_eq!(b.read(f.ino, 0, 8).unwrap(), b"buffered");
+    assert_eq!(b.read_direct(f.ino, 0, 8).unwrap(), b"BUFFERED");
+    // Unaligned and past-the-end reads behave like any read.
+    assert_eq!(b.read_direct(f.ino, 3, 4).unwrap(), b"FERE");
+    assert!(b.read_direct(f.ino, 100, 4).unwrap().is_empty());
+}

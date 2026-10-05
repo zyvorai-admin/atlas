@@ -81,7 +81,8 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
    locality API (query and pin a dataset's placement per host) are done; RDMA, GPUDirect Storage
    and MLPerf Storage results are not.
 5. **Protocols:** NFS, SMB and S3 front ends over the same namespace; ACLs, quotas, `O_DIRECT`;
-   an IO500 submission. Per-filesystem byte and inode quotas and POSIX ACLs are done; the rest is not.
+   an IO500 submission. Per-filesystem byte and inode quotas, POSIX ACLs and `O_DIRECT` are done; the rest is
+   not.
 
 Status of each step is tracked in `docs/NATIVE_STORAGE.md`. Until a phase's benchmark is
 published, treat atlas-native as behind WEKA on that axis.

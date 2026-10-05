@@ -951,6 +951,29 @@ impl Ops {
         Ok(data.len())
     }
 
+    /// An `O_DIRECT` write: whatever this mount buffered for the file goes first, then `data` is
+    /// committed on its replicas before this returns, bypassing write-back.
+    pub fn write_through(&self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
+        if self.read_only() {
+            return Err(libc::EROFS);
+        }
+        self.drop_readahead(ino);
+        self.flush(ino)?;
+        self.send(&Dirty {
+            ino,
+            offset,
+            data: data.to_vec(),
+        })?;
+        Ok(data.len())
+    }
+
+    /// An `O_DIRECT` read: from the cluster, around the read-ahead window (after this mount's
+    /// buffered writes to the file are sent).
+    pub fn read_direct(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        self.flush(ino)?;
+        self.fetch(ino, offset, len)
+    }
+
     fn dispatch(&self, run: Dirty) -> Result<(), Errno> {
         match &self.pipeline {
             Some(p) => p.submit(run),

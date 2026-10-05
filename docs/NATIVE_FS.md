@@ -253,6 +253,31 @@ either limit may be left out, and `{}` removes the quota.
 - Upgrades: the two batched commands are new log entries, so upgrade every metadata node before
   clients write through an upgraded leader; an older node cannot apply them.
 
+## Direct I/O
+
+A file opened with `O_DIRECT` bypasses the kernel's page cache (the FUSE client answers the open
+with `FOPEN_DIRECT_IO`) and the mount's own caches:
+
+- A write goes to the cluster before it returns: anything the mount still buffers for the file
+  is sent first, then the write itself, and the call returns once its extents are committed. It
+  is visible to every other mount straight away, without a `close` or `fsync`.
+- A read fetches from the data nodes, skipping read-ahead, so it returns what other mounts have
+  committed, even if this mount cached older bytes for the file.
+- No alignment is required: any offset and length work, as on other FUSE and network
+  filesystems.
+- Several direct writes to one file run in parallel (`FOPEN_PARALLEL_DIRECT_WRITES`); concurrent
+  writers to the same range still see last-writer-wins.
+- `O_DIRECT` has to be given to `open`: turning it on later with `fcntl(F_SETFL)` doesn't reach
+  FUSE, and the handle keeps its open-time behaviour. Not tested: `mmap` of an `O_DIRECT` handle
+  (the kernel restricts shared mappings of direct-I/O FUSE files); map the file through a handle
+  opened without `O_DIRECT`.
+- `O_SYNC` and `O_DSYNC` without `O_DIRECT` keep write-back: the kernel follows each write with an
+  `fsync`, which sends the buffered data before the call returns.
+- Cost: every direct write is one round trip to the cluster and waits for its commit, so small
+  direct writes are latency-bound. On the lab k3s host (shared, spinning disks, one replica) a
+  direct write took about 70–160 ms whatever its size up to 1 MiB; batch writes, or leave
+  `O_DIRECT` off, where durability per call isn't needed. Not yet measured on NVMe.
+
 ## Consistency
 
 - Within one mount, operations are linearizable: every call goes through the leader and returns
@@ -288,7 +313,7 @@ either limit may be left out, and `{}` removes the quota.
   `--fuse-threads` − 1 waits run at once, more fail with ENOLCK, so waiters never take the
   kernel worker an unlock needs. A snapshot mount grants every lock locally (nothing writes
   there). Locks need every metadata node upgraded first: an older node cannot apply them.
-- Not implemented: `O_DIRECT`.
+- `O_DIRECT` reads and writes skip the caches; see "Direct I/O".
 
 ## Atlas gateway
 
