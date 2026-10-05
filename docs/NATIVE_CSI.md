@@ -17,8 +17,9 @@ name: `native.atlas.zyvor.ai`.
 Every access mode works (ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod): each
 pod's mount is its own client of a shared filesystem, and cross-mount consistency is the
 filesystem's (`NATIVE_FS.md`, "Consistency"). Not supported: block volumes, volume expansion,
-capacity limits (filesystems are thin and unquotaed; the PVC's requested size is reported back
-unchanged and nothing enforces it), topology, and volume stats.
+capacity limits (the PVC's requested size is reported back unchanged and nothing enforces it;
+filesystems support quotas, `NATIVE_FS.md` "Quotas", but the driver doesn't set one yet),
+topology, and volume stats.
 
 ## Install
 

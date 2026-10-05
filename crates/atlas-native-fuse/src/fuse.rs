@@ -10,7 +10,7 @@ use std::{
 };
 
 use atlas_native::{
-    engine::{Attr, NewNode},
+    engine::{Attr, FsStat, NewNode},
     NodeType, SetAttr,
 };
 use fuser::{
@@ -21,6 +21,42 @@ use fuser::{
 };
 
 use crate::{dirs::DirStreams, locks::F_UNLCK, ops::Ops};
+
+const STATFS_BLOCK: u64 = 4096;
+
+#[derive(Debug, PartialEq, Eq)]
+struct StatfsCounts {
+    blocks: u64,
+    bfree: u64,
+    files: u64,
+    ffree: u64,
+}
+
+/// `statfs` totals: a quota's limits when one is set (so `df` shows the quota as the size),
+/// otherwise what is used plus headroom, since capacity is the cluster's, not this filesystem's.
+fn statfs_counts(s: &FsStat) -> StatfsCounts {
+    const HEADROOM_BLOCKS: u64 = 1 << 28;
+    const HEADROOM_INODES: u64 = 1 << 24;
+    let used_blocks = s.used_bytes.div_ceil(STATFS_BLOCK);
+    let quota = s.quota.unwrap_or_default();
+    let (blocks, bfree) = match quota.max_bytes {
+        Some(max) => {
+            let total = max / STATFS_BLOCK;
+            (total, total.saturating_sub(used_blocks))
+        }
+        None => (used_blocks + HEADROOM_BLOCKS, HEADROOM_BLOCKS),
+    };
+    let (files, ffree) = match quota.max_inodes {
+        Some(max) => (max, max.saturating_sub(s.inodes)),
+        None => (s.inodes + HEADROOM_INODES, HEADROOM_INODES),
+    };
+    StatfsCounts {
+        blocks,
+        bfree,
+        files,
+        ffree,
+    }
+}
 
 pub struct AtlasFs {
     pub ops: Ops,
@@ -598,20 +634,20 @@ impl Filesystem for AtlasFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        // Capacity is the cluster's, not this filesystem's; report what is used plus headroom.
-        const HEADROOM_BLOCKS: u64 = 1 << 28;
-        const HEADROOM_INODES: u64 = 1 << 24;
         match self.ops.statfs() {
-            Ok(s) => reply.statfs(
-                s.used_bytes.div_ceil(4096) + HEADROOM_BLOCKS,
-                HEADROOM_BLOCKS,
-                HEADROOM_BLOCKS,
-                s.inodes + HEADROOM_INODES,
-                HEADROOM_INODES,
-                4096,
-                atlas_native::namespace::MAX_NAME_BYTES as u32,
-                4096,
-            ),
+            Ok(s) => {
+                let c = statfs_counts(&s);
+                reply.statfs(
+                    c.blocks,
+                    c.bfree,
+                    c.bfree,
+                    c.files,
+                    c.ffree,
+                    STATFS_BLOCK as u32,
+                    atlas_native::namespace::MAX_NAME_BYTES as u32,
+                    STATFS_BLOCK as u32,
+                )
+            }
             Err(e) => reply.error(err(e)),
         }
     }
@@ -619,5 +655,46 @@ impl Filesystem for AtlasFs {
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
         // Permission checks are the kernel's (mounted with default_permissions).
         reply.ok();
+    }
+}
+
+#[cfg(test)]
+mod statfs_tests {
+    use atlas_native::FsQuota;
+
+    use super::*;
+
+    fn stat(used_bytes: u64, inodes: u64, quota: Option<FsQuota>) -> FsStat {
+        FsStat {
+            inodes,
+            used_bytes,
+            free_list_bytes: 0,
+            quota,
+        }
+    }
+
+    #[test]
+    fn statfs_reports_quota_limits_as_capacity() {
+        let free = statfs_counts(&stat(10 * 4096, 5, None));
+        assert_eq!((free.blocks, free.bfree), (10 + (1 << 28), 1 << 28));
+        assert_eq!((free.files, free.ffree), (5 + (1 << 24), 1 << 24));
+
+        let q = Some(FsQuota {
+            max_bytes: Some(100 * 4096),
+            max_inodes: Some(8),
+        });
+        let c = statfs_counts(&stat(10 * 4096 + 1, 5, q));
+        assert_eq!(
+            c,
+            StatfsCounts {
+                blocks: 100,
+                bfree: 89,
+                files: 8,
+                ffree: 3
+            }
+        );
+        // Over a lowered quota: nothing free, never an underflow.
+        let c = statfs_counts(&stat(200 * 4096, 9, q));
+        assert_eq!((c.bfree, c.ffree), (0, 0));
     }
 }

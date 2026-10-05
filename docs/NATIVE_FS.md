@@ -42,7 +42,9 @@ All routes need the API token (and client certificate where configured), like th
 | `GET /v1/fs` | `{"filesystems": [{id, name, inodes, bytes, source_snapshot, extent_bytes}]}`. |
 | `POST /v1/fs` | `{"name", "id"?, "extent_bytes"?}` → 201 `{"id"}`. Idempotent with the same `id` and name. `extent_bytes` (default 1 MiB, at most the cluster's `extent_bytes`) is the file extent grid; snapshots and clones keep it. |
 | `DELETE /v1/fs/{fs}` | 204. Snapshots and clones of it are unaffected. |
-| `GET /v1/fs/{fs}/statfs` | `{inodes, used_bytes, free_list_bytes}`. |
+| `GET /v1/fs/{fs}/statfs` | `{inodes, used_bytes, free_list_bytes, quota?}`. |
+| `GET /v1/fs/{fs}/quota` | `{max_bytes?, max_inodes?}` (`{}` without a quota; see "Quotas"). |
+| `PUT /v1/fs/{fs}/quota` | `{"max_bytes"?, "max_inodes"?}` replaces the quota; `{}` removes it. Unknown fields are refused. |
 | `GET /v1/fs/{fs}/locality?path=&max_inodes=` | Where a file or directory tree's data lives (see "Dataset locality"). `path` defaults to `/`, `max_inodes` to 100000. |
 | `POST /v1/fs/{fs}/locality/pin` | `{"hosts": [...], "path"?, "after"?, "max_extents"?, "max_inodes"?}` → `{examined, local, moved, bytes_moved, tiered, erasure_coded, deferred, next, truncated}`. Leader only. |
 | `POST /v1/fs/{fs}/rename` | `{parent, name, new_parent, new_name}` → 204. |
@@ -182,6 +184,31 @@ Mount on the pinned host with `--direct-reads --prefer-host <host>` to read the 
 CSI driver doesn't pass `--prefer-host` yet, since it needs the data nodes' `host` to match the
 Kubernetes node names, which the chart doesn't configure.
 
+## Quotas
+
+`PUT /v1/fs/{fs}/quota {"max_bytes": 107374182400, "max_inodes": 1000000}` limits a filesystem;
+either limit may be left out, and `{}` removes the quota.
+
+- `max_bytes` caps `used_bytes`: the bytes of the file extents the filesystem references, so
+  holes and sparse truncates cost nothing and an extent shared with a snapshot or clone counts in
+  each filesystem that references it. A write is checked when its extents are committed, against
+  the net change: rewriting a range replaces its extents, so overwrites pass even at the limit,
+  and only growth is refused.
+- `max_inodes` caps the inode count, the root directory included. Hard links don't add inodes.
+- A refused change fails with code `quota` (HTTP 409); the FUSE client returns `EDQUOT`. With
+  write-back on (the default), a buffered write can be refused after the `write` call returned,
+  so the error comes from a later `write`, `fsync` or `close`, as with NFS. The data a refused
+  write already sent to the data nodes is released straight away.
+- Lowering a limit below current usage is allowed: nothing is removed, and growth stays refused
+  until deletes bring usage back under it. Removing, truncating and rewriting always work.
+- Snapshots keep the quota they were taken with and clones inherit it. Extents that only a
+  snapshot still holds don't count against the live filesystem.
+- FUSE `statfs` (`df`) reports the quota as the filesystem's size and the remaining quota as free
+  space and free inodes; without a quota it reports usage plus a large headroom, since capacity is
+  the cluster's.
+- Upgrades: the quota is a new metadata command, so upgrade every metadata node before setting
+  one; an older node cannot apply it.
+
 ## Data path
 
 - A read fetches all the extents it covers in parallel (up to 8 at once), each from a replica
@@ -235,7 +262,7 @@ Kubernetes node names, which the chart doesn't configure.
   `--fuse-threads` − 1 waits run at once, more fail with ENOLCK, so waiters never take the
   kernel worker an unlock needs. A snapshot mount grants every lock locally (nothing writes
   there). Locks need every metadata node upgraded first: an older node cannot apply them.
-- Not implemented: POSIX ACLs, quotas, `O_DIRECT`.
+- Not implemented: POSIX ACLs, `O_DIRECT`.
 
 ## Atlas gateway
 

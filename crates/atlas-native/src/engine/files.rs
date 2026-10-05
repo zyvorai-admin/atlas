@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::{now_ns, NativeEngine, NativeError, Target};
 use crate::{
     metadata::{Catalog, MetaCommand, MetaError, SnapshotId},
-    namespace::{FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode},
+    namespace::{FsId, FsMeta, FsOp, FsQuota, Inode, InodeKind, NodeType, SetAttr, XattrMode},
 };
 
 /// File extent grid for new filesystems: a 4 KiB write rewrites at most this much.
@@ -122,6 +122,8 @@ pub struct FsStat {
     pub used_bytes: u64,
     /// Device bytes (summed over replicas) on the free lists.
     pub free_list_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<FsQuota>,
 }
 
 /// A directory entry to create.
@@ -259,7 +261,24 @@ impl NativeEngine {
                 inodes: f.inodes.len(),
                 used_bytes: f.usage.unwrap_or_default().used_bytes,
                 free_list_bytes: c.free.total_bytes(),
+                quota: f.quota,
             })
+        })
+    }
+
+    /// The filesystem's quota (also readable on a snapshot, which keeps the one it was taken with).
+    pub fn fs_quota(&self, fs: &str) -> Result<Option<FsQuota>, NativeError> {
+        self.with_fs(fs, |_, f| Ok(f.quota))
+    }
+
+    /// Replaces the filesystem's quota; [`FsQuota::default`] removes it. A limit below current
+    /// usage is accepted: it blocks further growth until usage falls under it.
+    pub fn fs_set_quota(&self, fs: &str, quota: FsQuota) -> Result<(), NativeError> {
+        writable(fs)?;
+        self.fs_commit(FsOp::SetQuota {
+            fs: fs.into(),
+            max_bytes: quota.max_bytes,
+            max_inodes: quota.max_inodes,
         })
     }
 

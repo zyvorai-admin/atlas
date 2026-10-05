@@ -18,7 +18,7 @@ use crate::{
     engine::{LockRequest, NativeEngine, NativeError, NewNode, ObjectKind},
     http::{Request, Response},
     leases::{LockKind, Session},
-    namespace::{SetAttr, XattrMode},
+    namespace::{FsQuota, SetAttr, XattrMode},
     raft::Role,
 };
 
@@ -153,6 +153,27 @@ fn fs_route(
             Ok(Response::text(204, ""))
         }
         ("GET", ["v1", "fs", fs, "statfs"]) => Ok(Response::json(200, &json!(e.fs_statfs(fs)?))),
+        ("GET", ["v1", "fs", fs, "quota"]) => Ok(Response::json(
+            200,
+            &json!(e.fs_quota(fs)?.unwrap_or_default()),
+        )),
+        ("PUT", ["v1", "fs", fs, "quota"]) => {
+            let body = parse(req)?;
+            let obj = body
+                .as_object()
+                .ok_or_else(|| NativeError::Invalid("quota body must be a JSON object".into()))?;
+            // A misspelt limit would otherwise silently clear it.
+            if let Some(k) = obj
+                .keys()
+                .find(|k| !matches!(k.as_str(), "max_bytes" | "max_inodes"))
+            {
+                return Err(NativeError::Invalid(format!("unknown quota field {k:?}")));
+            }
+            let quota: FsQuota = serde_json::from_value(body)
+                .map_err(|err| NativeError::Invalid(format!("quota body: {err}")))?;
+            e.fs_set_quota(fs, quota)?;
+            Ok(Response::json(200, &json!(quota)))
+        }
         ("GET", ["v1", "fs", fs, "locality"]) => {
             let path = match req.query.get("path") {
                 Some(p) => pct_decode(p)?,
