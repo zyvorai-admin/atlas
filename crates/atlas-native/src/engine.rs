@@ -33,10 +33,12 @@ use crate::{
     wal::{Wal, WalError, WalRecord},
 };
 
+mod export;
 mod files;
 mod leases;
 mod rebuild;
 mod tier;
+pub use export::{check_export_name, ExportExtent, ExportInfo, ExportManifest, ExportStats};
 pub use files::{
     Attr, DirEntry, FileLayout, FsInfo, FsSnapshotInfo, FsStat, LayoutEc, LayoutExtent,
     LayoutReplica, NewNode,
@@ -158,6 +160,9 @@ pub struct EngineConfig {
     /// Key prefix of this engine's objects. Engines sharing a bucket need distinct prefixes:
     /// each deletes objects under its own prefix that its catalog doesn't reference.
     pub object_prefix: String,
+    /// Key prefix of snapshot exports ([`NativeEngine::export_snapshot`]), shared by every
+    /// group of a cluster.
+    pub export_prefix: String,
 }
 
 /// Extents smaller than this stay replicated by default: their shards would be tiny.
@@ -176,6 +181,7 @@ impl EngineConfig {
             erasure_min_bytes: DEFAULT_ERASURE_MIN_BYTES,
             objects: None,
             object_prefix: "atlas-native/".into(),
+            export_prefix: "atlas-native/".into(),
         }
     }
 }

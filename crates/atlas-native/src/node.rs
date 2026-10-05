@@ -25,8 +25,8 @@ use crate::{
     device::BlockStore,
     ec::EcScheme,
     engine::{
-        EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind, RepairStats, TierPolicy,
-        TierStats,
+        check_export_name, EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind,
+        RepairStats, TierPolicy, TierStats,
     },
     gc::GcStats,
     http::{Handler, HttpServer, Request, Response},
@@ -44,6 +44,7 @@ use crate::{
 mod cache_leases;
 mod fs_api;
 mod shards;
+mod transfers;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -462,6 +463,8 @@ struct NodeShared {
     tiering: Option<(TierPolicy, u64)>,
     tier: TaskStats,
     last_tier: Mutex<Option<TierStats>>,
+    /// Snapshot exports and imports (with an object store configured).
+    transfers: transfers::Transfers,
     /// Client sessions this node expired as a group leader.
     sessions_expired: AtomicU64,
 }
@@ -637,6 +640,7 @@ impl NativeNode {
                     if let (Some(store), Some(t)) = (&objects, &m.tiering) {
                         ecfg.objects = Some(store.clone());
                         ecfg.object_prefix = format!("{}g{g}/", t.prefix);
+                        ecfg.export_prefix = t.prefix.clone();
                     }
                     ecfg.placement = PlacementPolicy {
                         replicas: m.replicas,
@@ -701,6 +705,7 @@ impl NativeNode {
             },
             tier: TaskStats::default(),
             last_tier: Mutex::new(None),
+            transfers: Default::default(),
             sessions_expired: AtomicU64::new(0),
         });
 
@@ -716,6 +721,10 @@ impl NativeNode {
                         |sh| &sh.tier,
                     )
                 }));
+            }
+            if shared.tiering.is_some() {
+                let sh = shared.clone();
+                loops.push(thread::spawn(move || transfers::run(&sh)));
             }
             if let Some(cfg) = rebuild {
                 let sh = shared.clone();
@@ -1293,9 +1302,93 @@ fn volume_route(sh: &NodeShared, req: &Request, segs: &[&str]) -> Response {
         ("POST", ["v1", "repair"]) => repair_all(sh).map(|st| Response::json(200, &json!(st))),
         ("POST", ["v1", "gc"]) => gc_all(sh).map(|st| Response::json(200, &json!(st))),
         ("POST", ["v1", "tier"]) => tier_all(sh).map(|st| Response::json(200, &json!(st))),
+        ("POST", ["v1", "snapshots", id, "export"]) => {
+            let body = match body_json(req) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let Some(name) = body["name"].as_str() else {
+                return Response::text(400, "body must be {\"name\": string}");
+            };
+            transfers_enabled(sh)
+                .and_then(|()| check_export_name(name))
+                .and_then(|()| sh.route(ObjectKind::Snapshot, id))
+                .and_then(|(g, group)| {
+                    lead(group)?;
+                    if !group.engine.holds(ObjectKind::Snapshot, id)? {
+                        return Err(NativeError::NotFound(format!("snapshot {id}")));
+                    }
+                    Ok(sh.transfers.export(g, id, name))
+                })
+                .map(|t| Response::json(202, &json!({ "transfer": t })))
+        }
+        ("POST", ["v1", "volumes", "import"]) => {
+            let body = match body_json(req) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let (Some(export), Some(name)) = (body["export"].as_str(), body["name"].as_str())
+            else {
+                return Response::text(
+                    400,
+                    "body must be {\"export\": string, \"name\": string, \"id\"?: string}",
+                );
+            };
+            let vid = match client_id(&body) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            transfers_enabled(sh)
+                .and_then(|()| sh.route(ObjectKind::Volume, &vid))
+                .and_then(|(g, group)| {
+                    lead(group)?;
+                    let m = group.engine.read_export(export)?;
+                    group
+                        .engine
+                        .create_volume_as(vid.clone(), name, m.size_bytes)?;
+                    Ok(sh.transfers.import(g, export, &vid))
+                })
+                .map(|t| Response::json(202, &json!({ "transfer": t, "id": vid })))
+        }
+        ("GET", ["v1", "exports"]) => transfers_enabled(sh)
+            .and_then(|()| sh.groups[0].engine.list_exports())
+            .map(|e| Response::json(200, &json!({ "exports": e }))),
+        ("GET", ["v1", "exports", name]) => transfers_enabled(sh)
+            .and_then(|()| sh.groups[0].engine.read_export(name))
+            .map(|m| Response::json(200, &json!(m))),
+        ("DELETE", ["v1", "exports", name]) => transfers_enabled(sh)
+            .and_then(|()| sh.groups[0].engine.delete_export(name))
+            .map(|n| Response::json(200, &json!({ "blobs_deleted": n }))),
+        ("GET", ["v1", "transfers"]) => Ok(Response::json(
+            200,
+            &json!({ "transfers": sh.transfers.list() }),
+        )),
+        ("GET", ["v1", "transfers", id]) => match sh.transfers.get(id) {
+            Some(t) => Ok(Response::json(200, &json!(t))),
+            None => Err(NativeError::NotFound(format!("transfer {id}"))),
+        },
         _ => return Response::text(404, "no such route"),
     };
     result.unwrap_or_else(error_response)
+}
+
+fn transfers_enabled(sh: &NodeShared) -> Result<(), NativeError> {
+    if sh.tiering.is_none() {
+        return Err(NativeError::Invalid(
+            "exports need metadata.tiering (an object store)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `NotLeader` (naming the leader) unless this node leads `group`.
+fn lead(group: &MetaGroup) -> Result<(), NativeError> {
+    let s = group.raft.status()?;
+    if s.role == Role::Leader {
+        Ok(())
+    } else {
+        Err(RaftError::NotLeader { leader: s.leader }.into())
+    }
 }
 
 /// The groups this node leads, or `NotLeader` (pointing at group 0's leader) if none.

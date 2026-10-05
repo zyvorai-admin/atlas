@@ -188,6 +188,32 @@ and `atlas_native_object_reads_total`. Verified against Ceph RGW on the Rook lab
 ObjectBucketClaim bucket): extents tiered, read back verified, and their objects deleted by GC
 (`tests/tiering_s3.rs`, run with `ATLAS_NATIVE_S3_*`).
 
+### Snapshot export and import
+
+The same bucket holds snapshot exports, which outlive the cluster: any cluster configured with
+the bucket and `prefix` can import them.
+
+- **Layout.** An export is a manifest (`<prefix>exports/<name>/manifest.json`, listing each
+  extent's offset, length and SHA-256) plus one blob per extent, named by its checksum
+  (`<prefix>blobs/<sha256>`). Blobs are shared, so exporting a later snapshot of the same volume
+  uploads only the extents that changed. Tiered extents are exported from their objects.
+- **Export.** `POST /v1/snapshots/{id}/export` runs on the leader of the snapshot's group. The
+  manifest is written last, so a failed or stopped export leaves no export behind; its uploaded
+  blobs are reused by the next attempt.
+- **Import.** `POST /v1/volumes/import` creates a volume of the export's size and writes every
+  blob into it, refusing a blob whose length or SHA-256 doesn't match the manifest. A failed
+  import leaves a partly written volume; delete it and import again.
+- **Delete.** `DELETE /v1/exports/{name}` deletes the manifest, then every blob no other export
+  references. While an export is uploading it keeps a marker (`<prefix>pending/<name>`)
+  refreshed every minute, and a delete frees no blob while a marker newer than 10 minutes
+  exists (the rest are freed by a later delete), so a delete never frees a blob an unfinished
+  export reuses.
+
+Exports and imports run one at a time per node, in the background, and fail if the node stops
+leading the group; resubmit them to the new leader. `GET /v1/transfers/{id}` reports `state`
+(`queued`, `running`, `done` or `failed`), `done`/`total` extents, `error`, and `result`
+(`extents`, `uploaded`, `reused`, `bytes_uploaded` for an export; `bytes` for an import).
+
 ## HTTP API
 
 | Method and path | Auth | Description |
@@ -209,6 +235,12 @@ ObjectBucketClaim bucket): extents tiered, read back verified, and their objects
 | `GET /v1/members` | yes | `{"membership": {"type": "stable", "voters": [...]}, "addrs": {id: "host:port"}}` (`type` is `joint` with `old`/`new` mid-change); `addrs` are the Raft addresses learned from membership changes; `groups` lists `{group, membership}` for every metadata group. |
 | `POST /v1/members` | yes | `{"voters": {"<id>": "<host:port>", ...}}`: move to exactly this voter set (leader only) and return once the final configuration has committed. 409 while another change is in flight. With several groups each node changes the groups it leads and answers 421 until every group has the new set, so repeat it across the metadata nodes until it returns 200. |
 | `POST /v1/repair`, `POST /v1/gc` | yes | Run one pass now over the groups this node leads (421 if it leads none) and return the summed stats. |
+| `POST /v1/tier` | yes | One tiering pass now over the groups this node leads (needs `metadata.tiering`). |
+| `POST /v1/snapshots/{id}/export` | yes | `{"name": "..."}` (1-128 of `A-Za-z0-9._-`, not starting with `.`) → 202 `{"transfer": "t1"}`; on the leader of the snapshot's group (421 elsewhere). 409 if the export exists or is in progress. Needs `metadata.tiering`. |
+| `POST /v1/volumes/import` | yes | `{"export": "...", "name": "...", "id"?: "..."}` → 202 `{"transfer": "t2", "id": "<volume>"}`: creates the volume at the export's size and fills it in the background. |
+| `GET /v1/exports`, `GET /v1/exports/{name}` | yes | Complete exports (`name`, `snapshot_id`, `snapshot_name`, `size_bytes`, `extents`, `created_ms`), or one export's manifest. |
+| `DELETE /v1/exports/{name}` | yes | 200 `{"blobs_deleted": N}`. |
+| `GET /v1/transfers`, `GET /v1/transfers/{id}` | yes | This node's exports and imports (the last 100 finished are kept); see [Snapshot export and import](#snapshot-export-and-import). |
 | `/v1/fs/...`, `/v1/fs-snapshots/...` | yes | Filesystems, inodes, file data and filesystem snapshots/clones: see `docs/NATIVE_FS.md`. |
 
 Errors are JSON `{"error": "...", "code": "...", "leader": ...}`; `code` is a stable machine-readable
