@@ -27,7 +27,7 @@ use crate::{
     leases::Leases,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
-    namespace::{FsId, FsMeta, FsUsage, Inode, InodeKind},
+    namespace::{FsId, FsMeta, FsQuota, FsUsage, Inode, InodeKind},
     tracked::Tracked,
 };
 
@@ -77,6 +77,8 @@ struct FsHeader {
     /// Inode count (absent before tables were paged: counted on load).
     #[serde(default)]
     inodes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota: Option<FsQuota>,
 }
 
 /// redb's own page cache; the operating system's page cache sits behind it.
@@ -237,6 +239,7 @@ impl CatalogStore {
                 source_snapshot: h.source_snapshot,
                 extent_bytes: h.extent_bytes,
                 usage: h.usage,
+                quota: h.quota,
             };
             filesystems.insert(h.id, fs);
         }
@@ -417,6 +420,7 @@ fn write_filesystems(
             extent_bytes: f.extent_bytes,
             usage: f.usage,
             inodes: Some(f.inodes.len()),
+            quota: f.quota,
         })?;
         headers.insert(fs, header.as_slice()).map_err(err)?;
         let all;

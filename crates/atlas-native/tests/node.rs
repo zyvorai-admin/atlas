@@ -1055,6 +1055,56 @@ fn http_file_api_on_a_three_node_cluster() {
     let (st, b) = call("POST", "/v1/gc", b"");
     assert_eq!(st, 200);
     assert!(json(&b)["reclaimed"].as_u64().unwrap() > 0);
+
+    // Quotas: the limits are enforced over the API and reported by statfs.
+    assert_eq!(
+        call("POST", "/v1/fs", br#"{"id":"fq","name":"quota"}"#).0,
+        201
+    );
+    let (st, b) = call("GET", "/v1/fs/fq/quota", b"");
+    assert_eq!((st, json(&b)), (200, serde_json::json!({})));
+    assert_eq!(
+        code("PUT", "/v1/fs/fq/quota", br#"{"max_byte":1}"#),
+        (400, "invalid".into())
+    );
+    let (st, b) = call(
+        "PUT",
+        "/v1/fs/fq/quota",
+        br#"{"max_bytes":4096,"max_inodes":3}"#,
+    );
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+    let mkq = |body: &str| call("POST", "/v1/fs/fq/inodes/1/entries", body.as_bytes());
+    let (st, b) = mkq(r#"{"name":"f","op_id":"q1","kind":"file","mode":420}"#);
+    assert_eq!(st, 201);
+    let qf = json(&b)["ino"].as_u64().unwrap();
+    assert_eq!(
+        mkq(r#"{"name":"d","op_id":"q2","kind":"dir","mode":493}"#).0,
+        201
+    );
+    let (st, b) = mkq(r#"{"name":"x","op_id":"q3","kind":"file","mode":420}"#);
+    assert_eq!(
+        (st, json(&b)["code"].as_str()),
+        (409, Some("quota")),
+        "{}",
+        String::from_utf8_lossy(&b)
+    );
+    let data = format!("/v1/fs/fq/inodes/{qf}/data?offset=");
+    assert_eq!(call("PUT", &format!("{data}0"), &[1u8; 4096]).0, 200);
+    // A rewrite at the limit is fine; growing past it is not.
+    assert_eq!(call("PUT", &format!("{data}0"), &[2u8; 4096]).0, 200);
+    assert_eq!(
+        code("PUT", &format!("{data}4096"), b"z"),
+        (409, "quota".into())
+    );
+    let (_, b) = call("GET", "/v1/fs/fq/statfs", b"");
+    let s = json(&b);
+    assert_eq!(
+        (s["used_bytes"].as_u64(), s["quota"]["max_bytes"].as_u64()),
+        (Some(4096), Some(4096))
+    );
+    assert_eq!(call("PUT", "/v1/fs/fq/quota", b"{}").0, 200);
+    assert_eq!(call("PUT", &format!("{data}4096"), b"z").0, 200);
+    assert_eq!(call("DELETE", "/v1/fs/fq", b"").0, 204);
 }
 
 #[test]

@@ -40,6 +40,19 @@ pub struct FsMeta {
     /// it was kept, until [`Catalog::fill_usage`] counts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<FsUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<FsQuota>,
+}
+
+/// Limits a filesystem's growth: a change that would take `used_bytes` above `max_bytes`, or
+/// the inode count above `max_inodes`, fails with [`MetaError::Quota`]. Changes that don't grow
+/// usage (rewrites, truncates, removes) always pass, even over a limit lowered below usage.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FsQuota {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inodes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +272,14 @@ pub enum FsOp {
         name: String,
         snapshot_id: SnapshotId,
     },
+    /// Replaces the filesystem's quota; both limits `None` removes it.
+    SetQuota {
+        fs: FsId,
+        #[serde(default)]
+        max_bytes: Option<u64>,
+        #[serde(default)]
+        max_inodes: Option<u64>,
+    },
 }
 
 impl Inode {
@@ -353,6 +374,17 @@ impl FsMeta {
     }
 
     /// Adjusts a directory's link count (`+1` per subdirectory) and stamps it modified.
+    /// Fails if one more inode would take the filesystem over its inode quota (the root counts).
+    fn check_inode_quota(&self) -> Result<(), MetaError> {
+        match self.quota.and_then(|q| q.max_inodes) {
+            Some(max) if self.inodes.len() >= max => Err(MetaError::Quota(format!(
+                "filesystem {} has reached its inode quota of {max}",
+                self.id
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn dir_changed(&mut self, dir: u64, subdirs: i64, now_ns: i64) -> Result<(), MetaError> {
         let d = self.inode_mut(dir)?;
         d.nlink = (i64::from(d.nlink) + subdirs).max(0) as u32;
@@ -474,6 +506,36 @@ impl Catalog {
         self.extents.get(eid).map_or(0, |m| m.extent.len as u64)
     }
 
+    /// Fails if installing `new` (`(logical_offset, len)` pairs) in file `ino` would grow `fs`'s
+    /// `used_bytes` past its byte quota. Extents the install replaces are credited back, so a
+    /// same-size rewrite always passes.
+    fn check_byte_quota(&self, fs: &str, ino: u64, new: &[(u64, u64)]) -> Result<(), MetaError> {
+        let f = self.filesystem(fs)?;
+        let (Some(max), Some(usage)) = (f.quota.and_then(|q| q.max_bytes), f.usage) else {
+            return Ok(());
+        };
+        let inode = f.inode(ino)?;
+        let InodeKind::File { extents, .. } = &inode.kind else {
+            return Ok(());
+        };
+        let freed: u64 = new
+            .iter()
+            .filter_map(|(off, _)| extents.get(off))
+            .map(|o| self.extent_len(o))
+            .sum();
+        let added: u64 = new.iter().map(|(_, len)| len).sum();
+        if added <= freed {
+            return Ok(());
+        }
+        let after = (usage.used_bytes + added).saturating_sub(freed);
+        if after > max {
+            return Err(MetaError::Quota(format!(
+                "filesystem {fs} would use {after} bytes, over its quota of {max}"
+            )));
+        }
+        Ok(())
+    }
+
     /// A filesystem's usage counters, if it keeps them.
     fn usage_mut(&mut self, fs: &str) -> Option<&mut FsUsage> {
         self.filesystems.get_mut(fs)?.usage.as_mut()
@@ -569,6 +631,7 @@ impl Catalog {
                         source_snapshot: None,
                         extent_bytes: *extent_bytes,
                         usage: Some(FsUsage::default()),
+                        quota: None,
                     },
                 );
             }
@@ -601,6 +664,7 @@ impl Catalog {
                     }
                     return Err(MetaError::Exists(format!("{name:?} in directory {parent}")));
                 }
+                f.check_inode_quota()?;
                 let kind = match node_type {
                     NodeType::File => InodeKind::File {
                         size: 0,
@@ -872,6 +936,7 @@ impl Catalog {
                 now_ns,
             } => {
                 extent.check()?;
+                self.check_byte_quota(fs, *ino, &[(*logical_offset, extent.len as u64)])?;
                 let i = self.fs_mut(fs)?.inode_mut(*ino)?;
                 let InodeKind::File { size, extents } = &mut i.kind else {
                     return Err(MetaError::IsDir(format!(
@@ -903,6 +968,11 @@ impl Catalog {
                 for e in new {
                     e.check()?;
                 }
+                let lens: Vec<(u64, u64)> = new
+                    .iter()
+                    .map(|e| (e.logical_offset, e.len as u64))
+                    .collect();
+                self.check_byte_quota(fs, *ino, &lens)?;
                 let i = self.fs_mut(fs)?.inode_mut(*ino)?;
                 let InodeKind::File { size, extents } = &mut i.kind else {
                     return Err(MetaError::IsDir(format!(
@@ -989,6 +1059,17 @@ impl Catalog {
                 tree.source_snapshot = Some(snapshot_id.clone());
                 self.filesystems.insert(id.clone(), tree);
             }
+            FsOp::SetQuota {
+                fs,
+                max_bytes,
+                max_inodes,
+            } => {
+                let quota = FsQuota {
+                    max_bytes: *max_bytes,
+                    max_inodes: *max_inodes,
+                };
+                self.fs_mut(fs)?.quota = (quota != FsQuota::default()).then_some(quota);
+            }
         }
         Ok(())
     }
@@ -1057,27 +1138,31 @@ mod tests {
         }
 
         fn extent(&mut self, ino: u64, off: u64, id: &str, len: usize) -> Vec<ExtentId> {
-            self.ok(FsOp::InstallFileExtent {
-                fs: "f".into(),
-                ino,
+            self.ok(install(ino, off, id, len))
+        }
+    }
+
+    fn install(ino: u64, off: u64, id: &str, len: usize) -> FsOp {
+        FsOp::InstallFileExtent {
+            fs: "f".into(),
+            ino,
+            logical_offset: off,
+            extent: ExtentRef {
+                id: id.into(),
                 logical_offset: off,
-                extent: ExtentRef {
-                    id: id.into(),
-                    logical_offset: off,
-                    len,
-                    checksum: [0; 32],
-                    replicas: vec![ReplicaRef {
-                        node_id: "n".into(),
-                        device_index: 0,
-                        offset: off,
-                    }],
-                    ec: None,
-                    created_ms: 0,
-                    object: None,
-                },
-                size: off + len as u64,
-                now_ns: 5,
-            })
+                len,
+                checksum: [0; 32],
+                replicas: vec![ReplicaRef {
+                    node_id: "n".into(),
+                    device_index: 0,
+                    offset: off,
+                }],
+                ec: None,
+                created_ms: 0,
+                object: None,
+            },
+            size: off + len as u64,
+            now_ns: 5,
         }
     }
 
@@ -1394,5 +1479,75 @@ mod tests {
         )
         .unwrap();
         assert!(old.filesystems.is_empty());
+    }
+
+    fn quota(max_bytes: Option<u64>, max_inodes: Option<u64>) -> FsOp {
+        FsOp::SetQuota {
+            fs: "f".into(),
+            max_bytes,
+            max_inodes,
+        }
+    }
+
+    #[test]
+    fn quotas_stop_growth_but_not_rewrites_or_removes() {
+        let mut t = T::new();
+        let a = t.mk(ROOT_INO, "a", NodeType::File);
+        t.extent(a, 0, "e1", 600);
+        t.ok(quota(Some(1000), Some(3)));
+        assert_eq!(
+            t.fs().quota,
+            Some(FsQuota {
+                max_bytes: Some(1000),
+                max_inodes: Some(3)
+            })
+        );
+
+        // Growth past the byte limit fails without touching anything.
+        let before = t.c.filesystems.clone();
+        let err = t.run(install(a, 4096, "e2", 600)).unwrap_err();
+        assert!(matches!(err, MetaError::Quota(_)), "{err:?}");
+        assert_eq!(t.c.filesystems, before);
+        // Up to the limit is fine; a same-size rewrite at the limit is too.
+        t.extent(a, 4096, "e2", 400);
+        assert_eq!(t.fs().usage.unwrap().used_bytes, 1000);
+        t.extent(a, 0, "e3", 600);
+        assert!(matches!(
+            t.run(install(a, 0, "e4", 601)),
+            Err(MetaError::Quota(_))
+        ));
+
+        // Root + "a" + "b" fills the inode quota.
+        t.mk(ROOT_INO, "b", NodeType::Dir);
+        let err = t
+            .run(mknode(ROOT_INO, "c", NodeType::File, "c"))
+            .unwrap_err();
+        assert!(matches!(err, MetaError::Quota(_)), "{err:?}");
+        // A retried create of an existing entry still answers idempotently.
+        t.ok(mknode(ROOT_INO, "b", NodeType::Dir, "b"));
+
+        // Lowering below usage is allowed; removing still works, then growth resumes.
+        t.ok(quota(Some(100), Some(3)));
+        t.ok(unlink(ROOT_INO, "a"));
+        t.mk(ROOT_INO, "c", NodeType::File);
+        let c = t.fs().lookup(ROOT_INO, "c").unwrap();
+        t.extent(c, 0, "e5", 100);
+
+        // Snapshots and clones carry the quota; clearing both limits removes it.
+        t.ok(FsOp::SnapshotFs {
+            id: "s".into(),
+            fs: "f".into(),
+            name: "snap".into(),
+            now_ns: 6,
+        });
+        t.ok(FsOp::CloneFs {
+            id: "g".into(),
+            name: "clone".into(),
+            snapshot_id: "s".into(),
+        });
+        assert_eq!(t.c.filesystem("g").unwrap().quota, t.fs().quota);
+        t.ok(quota(None, None));
+        assert_eq!(t.fs().quota, None);
+        t.mk(ROOT_INO, "d", NodeType::File);
     }
 }

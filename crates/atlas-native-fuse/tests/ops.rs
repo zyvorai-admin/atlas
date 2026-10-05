@@ -1012,3 +1012,58 @@ fn cache_leases_are_recalled_before_another_mount_changes_anything() {
     assert_eq!(b.getattr(h.ino).unwrap().size, 3);
     assert_eq!(a.lookup(ROOT_INO, "h").unwrap().size, 3);
 }
+
+#[test]
+fn quota_overruns_fail_with_edquot_directly_and_at_flush() {
+    let c = Cluster::start();
+    create_fs(&c, "q");
+    c.client()
+        .json(
+            Method::PUT,
+            "/v1/fs/q/quota",
+            Body::Json(json!({ "max_bytes": 1 << 20 })),
+            Retry::Idempotent,
+        )
+        .unwrap();
+    let ops = mount(
+        &c,
+        "q",
+        OpsConfig {
+            writeback_bytes: 0,
+            ..OpsConfig::default()
+        },
+    );
+    assert_eq!(
+        ops.statfs().unwrap().quota.and_then(|q| q.max_bytes),
+        Some(1 << 20)
+    );
+    let f = ops
+        .mknode(ROOT_INO, "a", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    ops.write(f.ino, 0, &[1u8; 1 << 20]).unwrap();
+    assert_eq!(ops.write(f.ino, 1 << 20, b"x"), Err(libc::EDQUOT));
+    ops.unlink(ROOT_INO, "a").unwrap();
+
+    // With writeback the overrun surfaces on a later write or at flush, never silently.
+    let wb = mount(
+        &c,
+        "q",
+        OpsConfig {
+            writeback_bytes: 256 << 10,
+            writeback_parallel: 4,
+            ..OpsConfig::default()
+        },
+    );
+    let g = wb
+        .mknode(ROOT_INO, "b", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    let mut failed = None;
+    for i in 0..16u64 {
+        if let Err(e) = wb.write(g.ino, i << 17, &[2u8; 128 << 10]) {
+            failed = Some(e);
+            break;
+        }
+    }
+    let failed = failed.or_else(|| wb.flush(g.ino).err());
+    assert_eq!(failed, Some(libc::EDQUOT));
+}

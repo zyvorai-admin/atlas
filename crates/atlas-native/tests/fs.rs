@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use atlas_native::{
-    engine::NewNode, EngineConfig, FailureDomain, NativeEngine, NativeError, Node, NodeType,
-    SetAttr, ROOT_INO,
+    engine::NewNode, metadata::MetaError, EngineConfig, FailureDomain, FsQuota, NativeEngine,
+    NativeError, Node, NodeType, SetAttr, ROOT_INO,
 };
 
 fn engine(name: &str) -> (NativeEngine, std::path::PathBuf) {
@@ -42,6 +42,10 @@ fn node(name: &str, kind: NodeType) -> NewNode {
         uid: 1000,
         gid: 1000,
     }
+}
+
+fn is_quota<T>(r: Result<T, NativeError>) -> bool {
+    matches!(r, Err(NativeError::Metadata(MetaError::Quota(_))))
 }
 
 fn truncate(size: u64) -> SetAttr {
@@ -177,6 +181,48 @@ fn namespace_survives_reopen_and_snapshots_are_frozen() {
     assert_eq!(e.fs_lookup("f@s1", d, "a").unwrap().ino, a);
     assert_eq!(e.read_file("f@s1", a, 0, 64).unwrap(), b"old contents");
     assert_eq!(e.read_file("f", a, 0, 64).unwrap(), b"NEW contents");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn quotas_are_enforced_on_writes_and_survive_reopen() {
+    let (e, root) = engine("quota");
+    e.create_fs_as("f".into(), "fs").unwrap();
+    let a = e
+        .fs_mknode("f", ROOT_INO, node("a", NodeType::File))
+        .unwrap()
+        .ino;
+    let quota = FsQuota {
+        max_bytes: Some(32),
+        max_inodes: Some(2),
+    };
+    e.fs_set_quota("f", quota).unwrap();
+    // Two 16-byte extents fill it; a partial rewrite of one stays within it.
+    e.write_file("f", a, 0, &[1; 32]).unwrap();
+    e.write_file("f", a, 4, b"abcd").unwrap();
+    assert!(is_quota(e.write_file("f", a, 32, b"x")));
+    assert!(is_quota(e.fs_mknode(
+        "f",
+        ROOT_INO,
+        node("b", NodeType::File)
+    )));
+    assert_eq!(e.fs_statfs("f").unwrap().quota, Some(quota));
+    assert!(matches!(
+        e.fs_set_quota("f@s", FsQuota::default()),
+        Err(NativeError::ReadOnly(_))
+    ));
+    e.checkpoint().unwrap();
+    drop(e);
+
+    let e = open(&root);
+    assert_eq!(e.fs_quota("f").unwrap(), Some(quota));
+    assert!(is_quota(e.write_file("f", a, 32, b"x")));
+    let mut data = vec![1; 32];
+    data[4..8].copy_from_slice(b"abcd");
+    assert_eq!(e.read_file("f", a, 0, 64).unwrap(), data);
+    e.fs_set_quota("f", FsQuota::default()).unwrap();
+    assert_eq!(e.fs_quota("f").unwrap(), None);
+    e.write_file("f", a, 32, b"x").unwrap();
     let _ = std::fs::remove_dir_all(root);
 }
 

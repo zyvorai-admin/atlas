@@ -73,6 +73,7 @@ impl Error {
                 "too_big" => libc::E2BIG,
                 "unsupported" => libc::EOPNOTSUPP,
                 "locked" => libc::EAGAIN,
+                "quota" => libc::EDQUOT,
                 "no_session" => libc::ENOLCK,
                 _ if *status == 413 => libc::EFBIG,
                 _ => libc::EIO,

@@ -988,6 +988,7 @@ fn error_response(e: NativeError) -> Response {
                 MetaError::TooBig(_) => "too_big",
                 MetaError::Unsupported(_) => "unsupported",
                 MetaError::Locked(_) => "locked",
+                MetaError::Quota(_) => "quota",
                 _ => "invalid",
             },
             None,

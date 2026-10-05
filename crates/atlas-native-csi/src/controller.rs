@@ -98,6 +98,7 @@ fn status(e: ClientError) -> Status {
             "exists" => Status::already_exists(message.clone()),
             "invalid" => Status::invalid_argument(message.clone()),
             "not_empty" | "locked" | "read_only" => Status::failed_precondition(message.clone()),
+            "quota" => Status::resource_exhausted(message.clone()),
             _ if *code_num == 401 => Status::unauthenticated(e.to_string()),
             _ if *code_num == 403 => Status::permission_denied(e.to_string()),
             _ => Status::internal(e.to_string()),
