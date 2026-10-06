@@ -161,7 +161,11 @@ integrations beyond the gRPC surface.
   nodes). See `docs/NATIVE_FS.md`. Also bin `atlas-native-nfs` (`Dockerfile.native-nfs`, chart
   `nfs.enabled`): NFS gateway supervisor running NFS-Ganesha ≥ 9.14 (`FSAL_VFS`, separate LGPL
   process) over `atlas-native-mount` FUSE mounts; NFSv4.1/4.2 + optional v3/NLM. Verified on the
-  lab k3s; see `docs/NATIVE_NFS.md`.
+  lab k3s; see `docs/NATIVE_NFS.md`. Also bin `atlas-native-smb` (`Dockerfile.native-smb`, chart
+  `smb.enabled`): SMB gateway supervisor running Samba `smbd` (separate GPL process, Debian
+  package) over `--allow-other` mounts; users are Unix accounts (password via `smbpasswd` stdin,
+  never argv/logs), oplocks/leases off, single pod. Process supervision shared in `supervise.rs`.
+  Verified on the lab k3s; see `docs/NATIVE_SMB.md`.
 - `crates/atlas-native-s3` — S3 gateway (bin `atlas-native-s3`, `Dockerfile.native-s3`, chart
   `s3.enabled`) on s3s over the native cluster API (no FUSE, unprivileged): bucket = filesystem or
   snapshot, object = file, temp-file + rename PUTs, ETag/headers in xattr `user.atlas.s3`, multipart
