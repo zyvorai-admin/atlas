@@ -24,8 +24,8 @@ export const ENGINE_VERIFICATION: EngineVerification[] = [
   },
   {
     engine: "mysql",
-    live: ["discover", "full-load", "validate", "cdc"],
-    note: "CDC live for DATETIME columns; TIMESTAMP breaks JDBC sink. Cutover pending on lab.",
+    live: ["discover", "full-load", "validate", "cdc", "cutover"],
+    note: "End-to-end incl. TIMESTAMP columns (Debezium JDBC sink) → PXC on Rook Ceph.",
   },
   {
     engine: "mariadb",
@@ -39,13 +39,13 @@ export const ENGINE_VERIFICATION: EngineVerification[] = [
   },
   {
     engine: "sqlserver",
-    live: ["discover"],
-    note: "Heterogeneous → Postgres; full-load is Debezium initial snapshot (CDC path).",
+    live: ["discover", "full-load", "cdc", "cutover"],
+    note: "Heterogeneous → CloudNativePG; the Debezium initial snapshot is the full-load. Validate is advisory.",
   },
   {
     engine: "oracle",
-    live: ["discover"],
-    note: "Heterogeneous → Postgres; full-load is Debezium initial snapshot (CDC path).",
+    live: ["discover", "full-load", "cdc", "cutover"],
+    note: "Heterogeneous (26ai, CDB/PDB) → CloudNativePG; the Debezium initial snapshot is the full-load. Validate is advisory.",
   },
 ];
 
