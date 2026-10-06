@@ -17,14 +17,23 @@ pub mod devmap;
 pub mod hist;
 pub mod http;
 pub mod lease;
+pub mod procscan;
 pub mod rca;
 pub mod source;
 
 pub use collector::Collector;
 pub use source::{FakeSource, IoSource};
 
-/// Pin directory advertised in health (the live source does not pin its maps yet).
+/// Pin directory advertised in health; the live source pins the native maps under
+/// [`NATIVE_PIN_DIR`].
 pub const PIN_DIR: &str = "/sys/fs/bpf/atlas";
+/// Default bpffs directory for `atlas_native_{pids,stats,slow}` (best effort; the agent's
+/// `--native-pin-dir` overrides it, an empty value disables pinning).
+pub const NATIVE_PIN_DIR: &str = "/sys/fs/bpf/atlas/native";
+/// Must match `ATLAS_NATIVE_SLOW_IO_NS` in `bpf/atlas_native_io.bpf.c`.
+pub const NATIVE_SLOW_US: u64 = 5_000;
+/// Atlas Native binaries tracked by default (`--native-process` overrides).
+pub const DEFAULT_NATIVE_PROCESSES: &str = "atlas-native-node,atlas-native-mount,atlas-native-nfs,atlas-native-smb,atlas-native-s3,atlas-native-replicate";
 
 /// Hard cap on (dev, op) histogram keys and workload keys.
 pub const CARDINALITY_CAP: u64 = 4096;

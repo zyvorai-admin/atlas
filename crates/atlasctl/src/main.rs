@@ -494,6 +494,8 @@ enum IoCommand {
     },
     /// GET /io/coverage
     Coverage,
+    /// GET /io/native — kernel-aggregated Atlas Native I/O and recent slow requests
+    Native,
     /// GET /io/leases
     Leases,
     /// GET /metrics
@@ -524,6 +526,7 @@ async fn io_request(
             .await;
         }
         IoCommand::Coverage => "/io/coverage",
+        IoCommand::Native => "/io/native",
         IoCommand::Leases => "/io/leases",
         IoCommand::Metrics => "/metrics",
     };

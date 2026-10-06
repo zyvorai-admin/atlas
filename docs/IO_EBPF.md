@@ -23,10 +23,12 @@ owns sockets; this agent owns **bio / NFS / ZFS / io_uring**.
 | Read-only RCA | implemented |
 | Write-freeze leases, fail-open, 15m cap | implemented |
 | HTTP + Prometheus text | implemented (`:5111`) |
-| `atlasctl io …` | implemented |
+| `atlasctl io …` | implemented (incl. `atlasctl io native`) |
 | DaemonSet manifest | implemented, fake mode (live settings in its header) |
 | Live block-layer attach (`aya`, CO-RE) | implemented behind the `bpf` feature; verified live (below) |
-| NFS / ZFS / io_uring programs, queue time, volume binding | not yet — reported in `programs_missing`, `queued_ns` is 0 |
+| Scheduler queue time (`block_rq_insert`) | implemented; verified live (below) |
+| Atlas Native maps (`/io/native`, pinned under `/sys/fs/bpf/atlas/native`) | implemented; verified live against a real native cluster (below) |
+| NFS / ZFS / io_uring programs, cgroup→volume map (`atlas_cgroup`) | not yet — reported in `programs_missing` |
 
 ## Run
 
@@ -42,7 +44,14 @@ cargo run -p atlasctl -- io rca --volume vol_vm_web01
 (plus libbpf headers) and embeds it; `Dockerfile.io` builds that way. With `--mode live` the agent
 attaches it to `block/block_rq_issue` and `block/block_rq_complete`: issue records time, size, op and
 the issuing task's pid / comm / cgroup id under `(dev, sector)`; completion joins and pushes one event
-to a ring buffer, which the agent drains every second. Devices are named from `/sys/class/block`
+to a ring buffer, which the agent drains every second.
+
+A third program on `block/block_rq_insert` records when a request entered the I/O scheduler, so
+each event also carries the time it waited before issue. Histograms report it as `queued` /
+`queue_sum_us` (and `atlas_io_hist_queue_avg_us` in `/metrics`), separate from the issue→complete
+latency in the buckets. Requests that bypass the scheduler (`none` elevator — loop, rbd, most NVMe
+setups) are never inserted, so they count no queue time rather than a made-up one. If this program
+alone fails to attach the agent logs it and keeps going without queue time. Devices are named from `/sys/class/block`
 at startup (later ones show as `major:minor`); kernel-side drops (inflight map full, ring buffer
 full) are added to `events_dropped`.
 
@@ -52,10 +61,32 @@ containerd's default only allows it with `CAP_SYS_ADMIN`, so `Unconfined`), and 
 `/sys/kernel/tracing`. If attaching fails the agent logs why and keeps serving with the programs
 reported missing — it never fabricates events.
 
+### Atlas Native view
+
+The same object carries the Atlas Native maps (ABI in `bpf/atlas_native_io.bpf.c`). Every 5 s the
+agent scans `/proc/*/comm` for the native binaries (`--native-process` /
+`ATLAS_IO_NATIVE_PROCESSES`, default `atlas-native-node`, `-mount`, `-nfs`, `-smb`, `-s3`,
+`-replicate`) and syncs their tgids into `atlas_native_pids`. When a request issued by one of them
+completes, the kernel adds it to `atlas_native_stats` (ios, bytes, total and max latency, errors per
+`(device, op, cgroup)`; 4,096 keys, a full map counts a drop rather than growing) and, at 5 ms or
+more, pushes an extent event (sector, size, latency, error, pid, comm) to `atlas_native_slow`.
+
+`GET /io/native` (`atlasctl io native`) returns the tracked names and pids, the aggregates with
+device names, the last 256 slow requests, and `dropped`; `/metrics` adds
+`atlas_io_native_{tracked_pids,ios,bytes,errors,max_us,dropped}`. It answers 503 when the native
+maps are not loaded (fake builds without `bpf`, failed attach).
+
+The three maps are pinned under `--native-pin-dir` (`ATLAS_IO_NATIVE_PIN_DIR`, default
+`/sys/fs/bpf/atlas/native`; empty disables pinning) so `bpftool map dump pinned …` can read them,
+and unpinned when the agent stops (SIGTERM/SIGINT). Container runtimes' default AppArmor profiles
+refuse writes under `/sys/fs/bpf`, so mount the host bpffs elsewhere (`/host-bpf`) and point the
+pin dir there; a pin failure is logged and the view still works. Pids only match in the host pid
+namespace, so a containerised agent needs `hostPID: true` for this view.
+
 Attribution is the task that *issued* the request: plugged or writeback I/O shows as a `kworker`
 in cgroup 1, direct I/O as the application (`dd`, `qemu`, …) in its own cgroup.
 
-**Verified (2026-10-03, `212.8.248.187`, Ubuntu 26.04, kernel 7.0):** both programs pass the
+**Verified (2026-10-03, second lab host, Ubuntu 26.04, kernel 7.0):** both programs pass the
 verifier and attach (CO-RE relocated `trace_event_raw_block_rq{,_completion}` against the kernel
 BTF); a 64 MiB `oflag=direct` write showed up as `sda` write histograms (`/io/histograms`,
 `/metrics`) and as a `dd` workload with its pid and cgroup id, alongside the host's own `llama-server`
@@ -63,6 +94,21 @@ and kworker traffic; ~5,000 events in a few seconds with no drops; the programs 
 agent stops. The `Dockerfile.io` image does the same with only `CAP_BPF` + `CAP_PERFMON`,
 `seccomp=unconfined` and the tracefs mount; with the default seccomp profile it reports the
 programs missing (`perf_event_open … Operation not permitted`) and keeps serving.
+
+**Verified (2026-10-06, same host, kernel 7.0):** the `Dockerfile.io` image with `--pid=host`,
+`CAP_BPF` + `CAP_PERFMON`, `seccomp=unconfined`, tracefs and the host bpffs at `/host-bpf`. All
+three programs passed the verifier. A real six-process native cluster (three metadata, three data
+`atlas-native-node`s, `file` backend on the host's `sda`) started after the agent; the next rescan
+put all six tgids in `atlas_native_pids` (`bpftool map dump pinned` showed them). 32 × 1 MiB writes
+through the leader (read back byte-identical) showed up in `/io/native` as one `sda` / write /
+cgroup row: 231 I/Os, 236.5 MiB (three replicas plus the metadata log), avg 59.6 ms, max 309 ms, 0
+errors, `dropped` 0 — the host was busy (load ≈ 10), so every one of them also arrived as a slow
+event, with pid and the truncated comm `atlas-native-no`. `/metrics` carried the same numbers.
+Queue time showed up for the scheduler-backed disks (`sda` writes ≈ 13 µs, `sdb` reads ≈ 12 ms on
+the loaded disk) and stayed absent for `loop`/`rbd` devices. After the native processes exited the
+PID set emptied on the next rescan, and `podman stop` removed the three pins. Under
+`/sys/fs/bpf` itself the pin failed with `Permission denied` (AppArmor), which is why the pin dir
+is configurable.
 
 ## Non-goals
 

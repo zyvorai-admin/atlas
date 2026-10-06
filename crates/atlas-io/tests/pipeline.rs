@@ -25,7 +25,9 @@ async fn http_histograms_and_rca() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(v.as_array().unwrap().len() >= 2);
 
@@ -39,14 +41,19 @@ async fn http_histograms_and_rca() {
         )
         .await
         .unwrap();
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let found = v
         .as_array()
         .unwrap()
         .iter()
         .any(|r| r["verdict"] == "critical_latency");
-    assert!(found, "expected critical write tail on vol_vm_web01, got {v}");
+    assert!(
+        found,
+        "expected critical write tail on vol_vm_web01, got {v}"
+    );
 
     let res = app
         .clone()
@@ -58,7 +65,9 @@ async fn http_histograms_and_rca() {
         )
         .await
         .unwrap();
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("atlas_io_events_seen"));
     assert!(text.contains("atlas_io_hist_p99_us"));
@@ -93,11 +102,71 @@ async fn lease_grant_and_list() {
         )
         .await
         .unwrap();
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 1);
     assert_eq!(v[0]["device"], "rbd0");
     assert_eq!(v[0]["action"], "write_freeze");
+}
+
+#[tokio::test]
+async fn native_view_resolves_devices_and_exports_metrics() {
+    let c = Collector::new(Box::new(FakeSource::demo()), DeviceMap::lab());
+    let app = router(c);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/io/native")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["tracked_pids"][0], 3100);
+    assert_eq!(v["slow_threshold_us"], 5000);
+    assert_eq!(v["stats"][0]["device"], "8:48");
+    assert_eq!(v["stats"][0]["op"], "write");
+    assert_eq!(v["slow"][0]["latency_us"], 7400);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("atlas_io_native_tracked_pids 1"));
+    assert!(text.contains(r#"atlas_io_native_ios{device="8:48",op="write",cgroup_id="4004"} 1200"#));
+}
+
+#[tokio::test]
+async fn live_mode_without_bpf_has_no_native_view() {
+    use atlas_io::source::LiveSource;
+    let app = router(Collector::new(Box::new(LiveSource), DeviceMap::new()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/io/native")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -108,4 +177,5 @@ async fn live_mode_reports_missing_programs() {
     assert_eq!(h.mode, "live");
     assert!(h.programs_loaded.is_empty());
     assert!(h.programs_missing.contains(&"atlas_bio".into()));
+    assert!(h.programs_missing.contains(&"atlas_native".into()));
 }

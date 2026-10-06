@@ -4,14 +4,19 @@
 //! LiveSource is the honest stand-in when that is unavailable; FakeSource is the CI
 //! and demo path.
 
-use atlas_api_types::{BioEvent, IoOp, IoSensorHealth};
+use atlas_api_types::{BioEvent, IoNative, IoNativeSlow, IoNativeStat, IoOp, IoSensorHealth};
 
-use crate::{CARDINALITY_CAP, PIN_DIR};
+use crate::{CARDINALITY_CAP, NATIVE_SLOW_US, PIN_DIR};
 
 pub trait IoSource: Send + Sync {
     fn mode(&self) -> &'static str;
     fn poll_events(&mut self) -> Vec<BioEvent>;
     fn health(&self, seen: u64, dropped: u64, cardinality: u64) -> IoSensorHealth;
+    /// Atlas Native I/O, or `None` when the native maps are not loaded. Device names are
+    /// left empty for the collector to fill from its device map.
+    fn native(&self) -> Option<IoNative> {
+        None
+    }
 }
 
 /// Deterministic in-process source used by tests and `ATLAS_IO_MODE=fake`.
@@ -26,6 +31,7 @@ impl FakeSource {
             scripted,
             loaded: vec![
                 "atlas_bio".into(),
+                "atlas_native".into(),
                 "atlas_cgroup".into(),
                 "atlas_nfs".into(),
                 "atlas_zfs".into(),
@@ -59,17 +65,30 @@ impl IoSource for FakeSource {
             cardinality_cap: CARDINALITY_CAP,
         }
     }
+
+    fn native(&self) -> Option<IoNative> {
+        Some(demo_native())
+    }
 }
 
 /// The attached block-layer BPF source, or why it could not be attached (built without
 /// the `bpf` feature, not Linux, missing CAP_BPF/CAP_PERFMON, no tracefs, …).
-pub fn live() -> anyhow::Result<Box<dyn IoSource>> {
+/// `native_processes` names the Atlas Native binaries whose I/O is aggregated kernel-side;
+/// the native maps are pinned under `pin_dir` when given.
+pub fn live(
+    native_processes: &[String],
+    pin_dir: Option<&std::path::Path>,
+) -> anyhow::Result<Box<dyn IoSource>> {
     #[cfg(all(feature = "bpf", target_os = "linux"))]
     {
-        Ok(Box::new(crate::bpf::BpfSource::attach()?))
+        Ok(Box::new(crate::bpf::BpfSource::attach(
+            native_processes,
+            pin_dir,
+        )?))
     }
     #[cfg(not(all(feature = "bpf", target_os = "linux")))]
     {
+        let _ = (native_processes, pin_dir);
         anyhow::bail!("atlas-io was built without the `bpf` feature (Linux only)")
     }
 }
@@ -94,6 +113,7 @@ impl IoSource for LiveSource {
             programs_loaded: Vec::new(),
             programs_missing: vec![
                 "atlas_bio".into(),
+                "atlas_native".into(),
                 "atlas_cgroup".into(),
                 "atlas_nfs".into(),
                 "atlas_zfs".into(),
@@ -165,6 +185,56 @@ pub fn demo_events() -> Vec<BioEvent> {
         comm: "z_wr_iss".into(),
     });
     evs
+}
+
+/// Scripted native view: an atlas-native-node data server writing chunks to its data disk.
+pub fn demo_native() -> IoNative {
+    IoNative {
+        process_names: vec!["atlas-native-node".into()],
+        tracked_pids: vec![3100],
+        pinned: None,
+        slow_threshold_us: NATIVE_SLOW_US,
+        stats: vec![
+            IoNativeStat {
+                device: String::new(),
+                major: 8,
+                minor: 48,
+                op: IoOp::Write,
+                cgroup_id: 4004,
+                ios: 1200,
+                bytes: 1200 * 1024 * 1024,
+                avg_us: 900,
+                max_us: 7_400,
+                errors: 0,
+            },
+            IoNativeStat {
+                device: String::new(),
+                major: 8,
+                minor: 48,
+                op: IoOp::Flush,
+                cgroup_id: 4004,
+                ios: 300,
+                bytes: 0,
+                avg_us: 2_100,
+                max_us: 6_100,
+                errors: 0,
+            },
+        ],
+        slow: vec![IoNativeSlow {
+            device: String::new(),
+            major: 8,
+            minor: 48,
+            op: IoOp::Write,
+            pid: 3100,
+            comm: "atlas-native-no".into(),
+            cgroup_id: 4004,
+            sector: 2_097_152,
+            bytes: 1024 * 1024,
+            latency_us: 7_400,
+            error: 0,
+        }],
+        dropped: 0,
+    }
 }
 
 #[cfg(test)]

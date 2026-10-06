@@ -8,7 +8,11 @@ const P99_WARN_US: u64 = 2_000;
 const P99_CRIT_US: u64 = 10_000;
 const QUEUE_HEAVY_RATIO: u64 = 4; // unused placeholder kept for future queue-split
 
-pub fn explain(hists: &[IoHistogram], workloads: &[IoWorkload], volume: Option<&str>) -> Vec<IoRca> {
+pub fn explain(
+    hists: &[IoHistogram],
+    workloads: &[IoWorkload],
+    volume: Option<&str>,
+) -> Vec<IoRca> {
     let _ = QUEUE_HEAVY_RATIO;
     let mut out = Vec::new();
     for h in hists {
@@ -48,7 +52,9 @@ pub fn explain(hists: &[IoHistogram], workloads: &[IoWorkload], volume: Option<&
             notes.push(format!("hottest issuer on {} is {comm}", h.device));
         }
         if p99 >= P99_WARN_US && p99 > p50.saturating_mul(8) {
-            notes.push("long tail vs median — check OSD/device saturation or a clone/discard job".into());
+            notes.push(
+                "long tail vs median — check OSD/device saturation or a clone/discard job".into(),
+            );
         }
         out.push(IoRca {
             volume_id: h.volume_id.clone(),
@@ -80,6 +86,8 @@ mod tests {
             count: 20,
             sum_us: 20 * 16_000,
             bytes: 20 * 128 * 1024,
+            queued: 0,
+            queue_sum_us: 0,
         };
         let rca = explain(&[h], &[], None);
         assert_eq!(rca[0].verdict, "critical_latency");

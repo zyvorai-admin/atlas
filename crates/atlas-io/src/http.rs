@@ -28,6 +28,7 @@ pub fn router(collector: Arc<Collector>) -> Router {
         .route("/io/rca", get(rca))
         .route("/io/leases", get(leases).post(grant_lease))
         .route("/io/coverage", get(coverage))
+        .route("/io/native", get(native))
         .route("/metrics", get(prom))
         .route("/io/poll", post(poll))
         .with_state(AppState { collector })
@@ -90,10 +91,7 @@ fn default_reason() -> String {
     "operator".into()
 }
 
-async fn grant_lease(
-    State(st): State<AppState>,
-    Json(body): Json<GrantBody>,
-) -> impl IntoResponse {
+async fn grant_lease(State(st): State<AppState>, Json(body): Json<GrantBody>) -> impl IntoResponse {
     match st
         .collector
         .grant_lease(body.device, body.volume_id, body.ttl_secs, body.reason)
@@ -121,6 +119,18 @@ async fn coverage(State(st): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+async fn native(State(st): State<AppState>) -> impl IntoResponse {
+    st.collector.poll();
+    match st.collector.native() {
+        Some(n) => Json(serde_json::to_value(n).expect("IoNative is serializable")).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "atlas_native maps not loaded" })),
+        )
+            .into_response(),
+    }
+}
+
 async fn poll(State(st): State<AppState>) -> impl IntoResponse {
     st.collector.poll();
     Json(serde_json::json!({ "seen": st.collector.seen() }))
@@ -144,6 +154,42 @@ async fn prom(State(st): State<AppState>) -> impl IntoResponse {
             h.op.as_str(),
             h.p99_us()
         ));
+        if let Some(avg) = h.queue_sum_us.checked_div(h.queued) {
+            out.push_str(&format!(
+                "atlas_io_hist_queue_avg_us{{device=\"{}\",op=\"{}\"}} {}\n",
+                h.device,
+                h.op.as_str(),
+                avg
+            ));
+        }
+    }
+    if let Some(n) = st.collector.native() {
+        out.push_str("# HELP atlas_io_native_tracked_pids Atlas Native processes in the kernel PID set\n# TYPE atlas_io_native_tracked_pids gauge\n");
+        out.push_str(&format!(
+            "atlas_io_native_tracked_pids {}\n",
+            n.tracked_pids.len()
+        ));
+        out.push_str("# HELP atlas_io_native_ios Atlas Native block I/Os per (device,op,cgroup)\n# TYPE atlas_io_native_ios counter\n");
+        for s in &n.stats {
+            let labels = format!(
+                "device=\"{}\",op=\"{}\",cgroup_id=\"{}\"",
+                s.device,
+                s.op.as_str(),
+                s.cgroup_id
+            );
+            out.push_str(&format!("atlas_io_native_ios{{{labels}}} {}\n", s.ios));
+            out.push_str(&format!("atlas_io_native_bytes{{{labels}}} {}\n", s.bytes));
+            out.push_str(&format!(
+                "atlas_io_native_errors{{{labels}}} {}\n",
+                s.errors
+            ));
+            out.push_str(&format!(
+                "atlas_io_native_max_us{{{labels}}} {}\n",
+                s.max_us
+            ));
+        }
+        out.push_str("# HELP atlas_io_native_dropped Native completions not aggregated or slow events not delivered\n# TYPE atlas_io_native_dropped counter\n");
+        out.push_str(&format!("atlas_io_native_dropped {}\n", n.dropped));
     }
     (
         [(

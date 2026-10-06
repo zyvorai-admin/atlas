@@ -10,6 +10,11 @@
 #   volumeMounts: [{ name: tracefs, mountPath: /sys/kernel/tracing, readOnly: true }]
 #   volumes:      [{ name: tracefs, hostPath: { path: /sys/kernel/tracing } }]
 # Without them the agent still serves, reporting the programs missing.
+# The Atlas Native view (/io/native) also needs hostPID: true (it matches host tgids), and to pin
+# its maps the host bpffs mounted outside /sys (RuntimeDefault AppArmor refuses writes there):
+#   volumeMounts: [{ name: bpffs, mountPath: /host-bpf }]
+#   volumes:      [{ name: bpffs, hostPath: { path: /sys/fs/bpf } }]
+#   env:          [{ name: ATLAS_IO_NATIVE_PIN_DIR, value: /host-bpf/atlas/native }]
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

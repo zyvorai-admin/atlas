@@ -93,7 +93,12 @@ leased write-freezes are all live-verified over HTTP/`/metrics` and `atlasctl io
 block-layer attach** (`bpf` feature: `crates/atlas-io/bpf/atlas_bio.bpf.c`, CO-RE, loaded with
 `aya`; built into `Dockerfile.io`) is verified live on kernel 7.0 — real per-device latency and
 pid/cgroup attribution; if attach fails, live mode reports the programs missing rather than
-fabricating data. NFS/ZFS/io_uring programs are still contracts only.
+fabricating data. The same object measures scheduler queue time (`block_rq_insert`) and loads the
+**Atlas Native maps** (`atlas_native_io.bpf.c` ABI): a userspace-filled PID set of the native
+binaries, per-(device, op, cgroup) kernel aggregates and a ≥5 ms slow-I/O ring buffer, pinned under
+`/sys/fs/bpf/atlas/native` (`/io/native`, `atlasctl io native`) — verified live against a real
+six-process native cluster. NFS/ZFS/io_uring programs and the cgroup→volume map are still
+contracts only.
 
 **atlas-native filesystems** (`docs/NATIVE_FS.md`): POSIX files and directories in the native
 cluster's replicated catalog (inodes, hard links, rename, setattr/truncate, symlinks, special files, extended attributes; per-filesystem extent grid),
