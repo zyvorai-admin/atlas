@@ -83,7 +83,8 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
 5. **Protocols:** NFS, SMB and S3 front ends over the same namespace; ACLs, quotas, `O_DIRECT`;
    an IO500 submission. Per-filesystem byte and inode quotas, POSIX ACLs, `O_DIRECT`, an NFS gateway
    (`docs/NATIVE_NFS.md`), an S3 gateway (`docs/NATIVE_S3.md`) and an SMB gateway
-   (`docs/NATIVE_SMB.md`) are done; IO500 is not.
+   (`docs/NATIVE_SMB.md`) are done. An IO500 harness runs the full suite (`docs/IO500.md`), but
+   there is no submission: that waits for NVMe benchmark hardware.
 
 Status of each step is tracked in `docs/NATIVE_STORAGE.md`. Until a phase's benchmark is
 published, treat atlas-native as behind WEKA on that axis.

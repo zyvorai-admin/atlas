@@ -95,6 +95,18 @@ Idempotent helpers the script owns (do not do these by hand first):
 **Prereq:** Rook Ceph Ready **and** CSI drivers installed (`zyvor-rbd-prod` must bind). See
 `deploy/rook-ceph-lab/up.sh --single-node` and [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md).
 
+## `io500-native-remote.sh` — IO500 on an atlas-native release
+
+Builds `Dockerfile.io500` on a remote k3s host, creates a scratch filesystem in an existing
+`atlas-native` Helm release, runs IO500 in one privileged pod against it, copies the results to
+`./io500-results/<timestamp>/` and deletes the pod and the filesystem.
+
+```bash
+scripts/io500-native-remote.sh <host> <user> --namespace atlas-native --np 16
+```
+
+Defaults are IO500's (stonewall 300 s, full-size phases); see [docs/IO500.md](../docs/IO500.md).
+
 ## `demo/record-atlas-demo.mjs` + `demo/upload-atlas-demo.py` — client demo reel
 Playwright drives a real Chromium session against a live gateway (login → Command Deck → Volumes →
 DataBridge → Observatory → Ceph), burns in a caption/subtitle bar per scene, and `recordVideo` +
