@@ -467,9 +467,23 @@ pub(crate) async fn disable_mirror(
 #[derive(Debug, Deserialize)]
 pub(crate) struct PromoteQuery {
     /// Split-brain / non-clean failover: pass to `rbd mirror image promote --force`.
+    #[serde(default, deserialize_with = "query_flag")]
     force: Option<bool>,
     /// Journal mode: the operator checked that the peer reports `journal_peers_replayed: true`.
+    #[serde(default, deserialize_with = "query_flag")]
     peer_replayed: Option<bool>,
+}
+
+/// A query-string boolean written `0`/`1` or `false`/`true`.
+fn query_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    match Option::<String>::deserialize(d)?.as_deref() {
+        None => Ok(None),
+        Some("1" | "true") => Ok(Some(true)),
+        Some("0" | "false") => Ok(Some(false)),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected 0, 1, true or false, got '{other}'"
+        ))),
+    }
 }
 
 /// `POST /dr/mirrors/{id}/promote?force=0|1` — failover: promote this cluster's copy to primary.

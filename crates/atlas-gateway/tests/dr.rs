@@ -184,11 +184,21 @@ async fn dr_peer_mirror_and_failover() {
     );
 
     assert_eq!(
-        c.post(format!("{base}/dr/mirrors/{mirror_id}/promote"))
+        c.post(format!("{base}/dr/mirrors/{mirror_id}/promote?force=yes"))
             .send()
             .await
             .unwrap()
             .status(),
+        400
+    );
+    assert_eq!(
+        c.post(format!(
+            "{base}/dr/mirrors/{mirror_id}/promote?force=0&peer_replayed=1"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .status(),
         202
     );
     assert_eq!(mirror(&c).await["role"], "primary");
@@ -213,7 +223,7 @@ async fn dr_peer_mirror_and_failover() {
     );
     // Force promote allowed for split-brain drills.
     assert_eq!(
-        c.post(format!("{base}/dr/mirrors/{mirror_id}/promote?force=true"))
+        c.post(format!("{base}/dr/mirrors/{mirror_id}/promote?force=1"))
             .send()
             .await
             .unwrap()
