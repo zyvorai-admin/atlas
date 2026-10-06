@@ -16,19 +16,19 @@ type FeatureItem = {
 const FeatureList: FeatureItem[] = [
   {
     eyebrow: 'Control plane',
-    title: 'Intent → storage',
+    title: 'Intent → any backend',
     description:
-      'Volumes, snapshots, clones, CephFS RWX, and RGW buckets through stable REST and gRPC — products never speak Ceph directly.',
+      'Volumes, snapshots, clones, CephFS RWX and buckets over REST and gRPC, mapped to Ceph, NFS, ZFS and Longhorn by one StorageDriver trait. A fake driver runs the whole console with no cluster.',
     to: '/docs/core-concepts/architecture',
     cta: 'Architecture',
   },
   {
-    eyebrow: 'Drivers',
-    title: 'One trait. Three backends.',
+    eyebrow: 'Atlas Native',
+    title: 'A filesystem of its own.',
     description:
-      'Real Ceph first, plus NFS and ZFS behind StorageDriver — and a fake driver for zero-cluster local demo.',
-    to: '/docs/core-concepts/architecture',
-    cta: 'How drivers work',
+      'Striped, checksummed extents with sharded Raft metadata, erasure coding and rebuild, S3 tiering, and NFS, SMB, S3 and CSI over the same files. Lab-verified; NVMe and RDMA benchmarks pending.',
+    to: 'https://github.com/zyvorai/zyvor-atlas/blob/main/docs/NATIVE_STORAGE.md',
+    cta: 'Native roadmap status',
   },
   {
     eyebrow: 'DataBridge',
@@ -39,10 +39,10 @@ const FeatureList: FeatureItem[] = [
     cta: 'Quickstart',
   },
   {
-    eyebrow: 'Day-2',
-    title: 'Operate without leaving the shop.',
+    eyebrow: 'Day-2 and DR',
+    title: 'Fail over. Fail back cleanly.',
     description:
-      'Alerts, maintenance, governance, quotas, orphan GC, upgrade preflight, and DR scaffolding in one console.',
+      'Alerts, maintenance, quotas, upgrade preflight, two-way RBD mirroring with a guarded failback, and native replication to a second site.',
     to: '/gallery',
     cta: 'See the console',
   },

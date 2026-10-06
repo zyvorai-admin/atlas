@@ -16,14 +16,14 @@ title: API Reference
 > `ListAlerts`, `GetMetricsSummary`, `ListBuckets`. Auth: HS256 JWT in `authorization` metadata when
 > `ATLAS_AUTH_REQUIRED=1`, with the same role hierarchy as REST. Server reflection is enabled, so:
 > `grpcurl -plaintext <host>:5111 list` and `grpcurl -plaintext <host>:5111 atlas.v1.AtlasStorage/ListPools`.
-> The proto is at `crates/atlas-gateway/proto/atlas.proto`. Product ownership conventions: [PRODUCTS.md](https://github.com/zyvorai/atlas/blob/main/docs/PRODUCTS.md).
+> The proto is at `crates/atlas-gateway/proto/atlas.proto`. Product ownership conventions: [PRODUCTS.md](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/PRODUCTS.md).
 > In-console curated map: **API Docs** page (`/api-docs`).
 
 Base path: `/api/atlas/v1`. All responses are JSON. Errors use
 `{ "error": { "code": "...", "message": "..." } }` with an appropriate HTTP status.
 
 MVP covers the full control plane: inventory, async write path, day-2 ops, DR scaffolding,
-DataBridge, and the embedded console. See [ROADMAP.md](https://github.com/zyvorai/atlas/blob/main/docs/ROADMAP.md) for deferred items.
+DataBridge, and the embedded console. See [ROADMAP.md](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/ROADMAP.md) for deferred items.
 
 Auth: when `ATLAS_AUTH_REQUIRED=1`, send `Authorization: Bearer <HS256 JWT>`.
 When `0` (dev default), routes are open and the actor is `anonymous`.
@@ -195,7 +195,7 @@ Run the alert rules on demand (also runs every `ATLAS_MONITOR_INTERVAL_SECS`).
 
 ### Cross-cluster DR (RBD mirroring, admin, day-2)
 > Control-plane catalog + hardened failover API. One-way and two-way (`rx-tx`) `rbd mirror` with
-> clean failback were verified live between two Rook clusters (see [DR.md](https://github.com/zyvorai/atlas/blob/main/docs/DR.md)). Fake mode skips
+> clean failback were verified live between two Rook clusters (see [DR.md](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/DR.md)). Fake mode skips
 > the CLI so drills succeed.
 - `POST /api/atlas/v1/dr/peers` · `GET /dr/peers` · `DELETE /dr/peers/{id}` — peer catalog (`secret_ref` only).
 - `POST /api/atlas/v1/volumes/{id}/mirror?mode=snapshot&peer=<id>` · `DELETE .../mirror` — enable / disable (peer required).
@@ -414,7 +414,7 @@ is used. The signature binds to the host, so the client must connect to the endp
 
 Migrate managed cloud databases to edge databases on Ceph RBD. Source kinds:
 `postgres` · `mysql` · `mariadb` · `oracle` · `sqlserver` · `mongodb` (homogeneous or
-heterogeneous per [DATABRIDGE.md](https://github.com/zyvorai/atlas/blob/main/docs/DATABRIDGE.md)). Stage triggers return `202 + job id`
+heterogeneous per [DATABRIDGE.md](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/DATABRIDGE.md)). Stage triggers return `202 + job id`
 (track via `/jobs/{id}/watch`); reads return inventory rows.
 
 ### Sources
@@ -634,7 +634,7 @@ Built with the `mcp` Cargo feature (default-off — `cargo build -p atlas-gatewa
 Atlas exposes a read-only/advisory MCP server at `POST /api/atlas/v1/mcp` (streamable-HTTP
 transport), behind the same bearer-JWT `auth_middleware` as the rest of this API — no separate
 port or auth mechanism. Any MCP host (e.g.
-[Hermes Agent](https://github.com/zyvorai/atlas/blob/main/docs/HERMES_AGENT.md), Claude) can
+[Hermes Agent](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/HERMES_AGENT.md), Claude) can
 connect and call:
 
 | Tool | Mirrors |
@@ -650,9 +650,9 @@ connect and call:
 
 No write/action tools are exposed — same `can_execute: false` advisory-only posture as the Ops
 Advisor (see
-[docs/AI_ADVISOR.md](https://github.com/zyvorai/atlas/blob/main/docs/AI_ADVISOR.md)). Use the
+[docs/AI_ADVISOR.md](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/AI_ADVISOR.md)). Use the
 REST/gRPC API above for anything that mutates storage. See
-[docs/HERMES_AGENT.md](https://github.com/zyvorai/atlas/blob/main/docs/HERMES_AGENT.md) for a
+[docs/HERMES_AGENT.md](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/HERMES_AGENT.md) for a
 concrete client setup walkthrough (token minting + `~/.hermes/config.yaml`).
 
 ## HTTP status codes
@@ -669,7 +669,7 @@ concrete client setup walkthrough (token minting + `~/.hermes/config.yaml`).
 ## `atlasctl` equivalents
 
 Thin REST client (`ATLAS_BASE_URL`, `ATLAS_TOKEN`). Full list: `atlasctl --help` and
-[crates/atlasctl/README.md](https://github.com/zyvorai/atlas/blob/main/crates/atlasctl/README.md).
+[crates/atlasctl/README.md](https://github.com/zyvorai/zyvor-atlas/blob/main/crates/atlasctl/README.md).
 
 ```bash
 # Meta / inventory

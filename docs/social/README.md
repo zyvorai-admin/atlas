@@ -2,13 +2,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Social assets
 
-The README hero and the GitHub social preview. Two variants, one palette.
+The README hero, the GitHub social preview, the LinkedIn/X card and the share cards.
 
 | File | What it is |
 |---|---|
-| `atlas-share-card.svg` / `.png` / `@2x.png` | Light card, 1200x630 (and 2400x1260). The README hero and the file to upload as the GitHub social preview |
-| `atlas-share-card-dark.svg` / `.png` / `@2x.png` | Dark card for GitHub's dark theme, swapped in by the README `<picture>` block |
-| `build-share-cards.py` | Generates both SVGs from one palette |
+| `atlas-hero-dark.html` / `.jpg` | Dark hero, 1200x630 rendered at 2x (2400x1260). The README hero, the docs-site `og:image` (`website/static/img/atlas-social.jpg`) and **the file to upload as the GitHub social preview**. Built by `build-hero-dark.sh` |
+| `atlas-social-card.html` / `.jpg` | 1600x900 card for LinkedIn and X: headline, the five-step story, a line from the DR drill. Built by `build-social-card.sh` |
+| `atlas-share-card.svg` / `.png` / `@2x.png` | Light 1200x630 card (and 2400x1260), for slides and light backgrounds |
+| `atlas-share-card-dark.svg` / `.png` / `@2x.png` | Dark variant of the share card |
+| `build-share-cards.py` | Generates both share-card SVGs from one palette |
+
+The README cards (capabilities, native, DR, how it works, vs) live in `docs/ux/readme-*.html` and are
+rendered by `docs/ux/build-readme-cards.sh`.
 
 ## Palette
 
@@ -25,6 +30,8 @@ Type is Helvetica Neue and Menlo.
 ## Rebuild
 
 ```bash
+./docs/social/build-hero-dark.sh && cp docs/social/atlas-hero-dark.jpg website/static/img/atlas-social.jpg
+./docs/social/build-social-card.sh
 python3 docs/social/build-share-cards.py docs/social
 for v in "" "-dark"; do
   rsvg-convert -w 1200 docs/social/atlas-share-card$v.svg -o docs/social/atlas-share-card$v.png
@@ -32,10 +39,10 @@ for v in "" "-dark"; do
 done
 ```
 
-Needs `rsvg-convert` (librsvg) and Python 3. Edit the stats or the backend list in `build-share-cards.py`;
+The HTML cards need Google Chrome and macOS `sips`. The share cards need `rsvg-convert` (librsvg) and Python 3. Edit the stats or the backend list in `build-share-cards.py`;
 the numbers must match the code (see the README) and the licence line must match `LICENSE`.
 
 ## GitHub social preview
 
 The repository's Social preview image cannot be set through the GitHub API or `gh`. After changing the card,
-upload `atlas-share-card.png` by hand under Settings > General > Social preview.
+upload `atlas-hero-dark.jpg` (under GitHub's 1 MB limit) by hand under Settings > General > Social preview.

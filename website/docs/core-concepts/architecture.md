@@ -26,6 +26,6 @@ stable REST / gRPC APIs; Atlas talks to backends through pluggable
 ```
 
 Design authority:
-[`Zyvor_Ceph_Integration_Developer_Implementation_Plan.pdf`](https://github.com/zyvorai/atlas)
+[`Zyvor_Ceph_Integration_Developer_Implementation_Plan.pdf`](https://github.com/zyvorai/zyvor-atlas)
 (v1.0 engineering draft). Full operator docs live in the repository under
 `docs/ARCHITECTURE.md`.

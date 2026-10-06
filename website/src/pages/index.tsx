@@ -19,11 +19,13 @@ function HomepageHeader() {
       <div className="container">
         <p className={styles.brandMark}>Atlas</p>
         <Heading as="h1" className="hero__title">
-          The world of storage, under one command.
+          One API for the storage you have. A filesystem for the storage you
+          need.
         </Heading>
         <p className="hero__subtitle">
-          Zyvor&apos;s control plane maps intent to Ceph, NFS, and ZFS — with an
-          Apple Shop console for operators.
+          A control plane that maps intent to Ceph, NFS, ZFS and Longhorn, plus
+          Atlas Native: erasure-coded, Raft-backed, NFS, SMB and S3, with
+          replication and clean DR failback. Apache-2.0.
         </p>
         <div className={styles.buttons}>
           <Link
@@ -36,7 +38,7 @@ function HomepageHeader() {
               'button button--outline button--lg button--secondary',
               styles.pill,
             )}
-            to="https://github.com/zyvorai/atlas">
+            to="https://github.com/zyvorai/zyvor-atlas">
             View on GitHub
           </Link>
         </div>
@@ -63,9 +65,10 @@ function ProblemStatement() {
             Intent in. Backend details out.
           </Heading>
           <p className={styles.lede}>
-            Products request production block storage — not pool names or CSI
-            quirks. Atlas owns inventory, ownership, audit, and the async job
-            engine so the suite stays decoupled from Ceph.
+            Products request production storage, not pool names or CSI quirks.
+            Atlas owns inventory, ownership, audit and the async job engine, and
+            when you need a filesystem of your own, Atlas Native runs it on your
+            nodes.
           </p>
         </Reveal>
       </div>
@@ -90,7 +93,7 @@ function TrustBand() {
           </div>
           <div className={styles.trustBadges}>
             <img
-              src="https://github.com/zyvorai/atlas/actions/workflows/ci.yml/badge.svg"
+              src="https://github.com/zyvorai/zyvor-atlas/actions/workflows/ci.yml/badge.svg"
               alt="CI status"
             />
             <img
@@ -130,8 +133,8 @@ function EnterpriseCTA() {
 export default function Home(): ReactNode {
   return (
     <Layout
-      title="Atlas — Zyvor storage control plane"
-      description="Central storage control plane for the Zyvor suite — Ceph-first, pluggable drivers, Apple Shop console.">
+      title="Atlas — one API for your storage, and a filesystem of its own"
+      description="Apache-2.0 storage platform: an intent API over Ceph, NFS, ZFS and Longhorn, plus Atlas Native, a distributed filesystem with erasure coding, NFS, SMB, S3, replication and clean DR failback.">
       <HomepageHeader />
       <main>
         <ProblemStatement />
