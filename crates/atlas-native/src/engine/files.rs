@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use super::{now_ns, NativeEngine, NativeError, Target};
 use crate::{
     metadata::{Catalog, MetaCommand, MetaError, SnapshotId},
-    namespace::{FsId, FsMeta, FsOp, FsQuota, Inode, InodeKind, NodeType, SetAttr, XattrMode},
+    namespace::{
+        FsId, FsMeta, FsOp, FsQuota, Inode, InodeKind, NodeType, ReplicaState, SetAttr, XattrMode,
+    },
 };
 
 /// File extent grid for new filesystems: a 4 KiB write rewrites at most this much.
@@ -105,6 +107,9 @@ pub struct FsInfo {
     pub source_snapshot: Option<SnapshotId>,
     /// File extent grid: the most a small write rewrites.
     pub extent_bytes: u64,
+    /// Set on a replica ([`ReplicaState`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica: Option<ReplicaState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +258,7 @@ impl NativeEngine {
                     bytes: f.usage.unwrap_or_default().file_bytes,
                     source_snapshot: f.source_snapshot.clone(),
                     extent_bytes: f.extent_bytes.unwrap_or(self.cfg.extent_bytes as u64),
+                    replica: f.replica.clone(),
                 })
                 .collect()
         })
@@ -473,7 +479,11 @@ impl NativeEngine {
             .lock()
             .map_err(|_| NativeError::Poisoned("write"))?;
         if let Some(size) = attr.size {
-            let target = Target::File { fs, ino };
+            let target = Target::File {
+                fs,
+                ino,
+                replica: false,
+            };
             let grid = self.with_catalog(|c| target.grid(c, self.cfg.extent_bytes))??;
             let cell = size - size % grid;
             if size > cell {
@@ -504,11 +514,34 @@ impl NativeEngine {
         offset: u64,
         data: &[u8],
     ) -> Result<Attr, NativeError> {
+        self.write_file_as(fs, ino, offset, data, false)
+    }
+
+    /// [`Self::write_file`] of replication data into a replica: the inode's times stay as the
+    /// increment set them.
+    pub fn replica_write(
+        &self,
+        fs: &str,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Attr, NativeError> {
+        self.write_file_as(fs, ino, offset, data, true)
+    }
+
+    fn write_file_as(
+        &self,
+        fs: &str,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+        replica: bool,
+    ) -> Result<Attr, NativeError> {
         writable(fs)?;
         offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| NativeError::Invalid("write offset overflows".into()))?;
-        let target = Target::File { fs, ino };
+        let target = Target::File { fs, ino, replica };
         if data.is_empty() {
             self.with_catalog(|c| target.extent_at(c, 0))??;
         } else if !self.write_aligned(&target, offset, data, |c| {

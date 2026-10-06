@@ -19,6 +19,10 @@ path = "src/bin/atlas-native-nfs.rs"
 name = "atlas-native-smb"
 path = "src/bin/atlas-native-smb.rs"
 
+[[bin]]
+name = "atlas-native-replicate"
+path = "src/bin/atlas-native-replicate.rs"
+
 [features]
 # The kernel FUSE adapter (Linux only); without it the binary only reports how it was built.
 fuse = ["dep:fuser"]

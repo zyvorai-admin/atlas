@@ -27,7 +27,7 @@ use crate::{
     leases::Leases,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
-    namespace::{FsId, FsMeta, FsQuota, FsUsage, Inode, InodeKind},
+    namespace::{FsId, FsMeta, FsQuota, FsUsage, Inode, InodeKind, ReplicaState},
     tracked::Tracked,
 };
 
@@ -79,6 +79,8 @@ struct FsHeader {
     inodes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quota: Option<FsQuota>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replica: Option<ReplicaState>,
 }
 
 /// redb's own page cache; the operating system's page cache sits behind it.
@@ -240,6 +242,7 @@ impl CatalogStore {
                 extent_bytes: h.extent_bytes,
                 usage: h.usage,
                 quota: h.quota,
+                replica: h.replica,
             };
             filesystems.insert(h.id, fs);
         }
@@ -421,6 +424,7 @@ fn write_filesystems(
             usage: f.usage,
             inodes: Some(f.inodes.len()),
             quota: f.quota,
+            replica: f.replica.clone(),
         })?;
         headers.insert(fs, header.as_slice()).map_err(err)?;
         let all;
@@ -795,6 +799,7 @@ mod tests {
             extent: extent("e1", 0),
             size: 4096,
             now_ns: 6,
+            replica: false,
         });
         h.check();
         assert!(h.catalog.filesystems["f"].inodes.get(a).unwrap().is_none());
@@ -1082,6 +1087,7 @@ mod tests {
             extent: extent("e1", 0),
             size: 4000,
             now_ns: 3,
+            replica: false,
         });
         let kept = h.catalog.filesystems["f"].usage;
         assert_eq!(

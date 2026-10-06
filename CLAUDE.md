@@ -168,7 +168,13 @@ integrations beyond the gRPC surface.
   Verified on the lab k3s; see `docs/NATIVE_SMB.md`. IO500 harness: `Dockerfile.io500` (IO500
   sc26 + Open MPI + `atlas-native-mount`, entry `deploy/io500/io500-run.sh`) and
   `scripts/io500-native-remote.sh`; full suite runs on the lab but no submission (needs NVMe
-  hardware; never set `IO500_DROP_CACHES=1` on the shared lab). See `docs/IO500.md`.
+  hardware; never set `IO500_DROP_CACHES=1` on the shared lab). See `docs/IO500.md`. Also bin
+  `atlas-native-replicate` (`replicate.rs`, `Dockerfile.native-replicate`, chart
+  `replication.jobs`): stateless async filesystem replication to a replica on another cluster
+  (snapshot diff per inode, only changed grid cells; replica state `base`/`local`/`pending` in the
+  catalog, `namespace/replica.rs` + `engine/replica.rs`; promote/demote for failover/failback).
+  Replica snapshot ids = source ids, so source and target must be separate clusters. Verified
+  live between two clusters on the lab k3s; see `docs/NATIVE_REPLICATION.md`.
 - `crates/atlas-native-s3` — S3 gateway (bin `atlas-native-s3`, `Dockerfile.native-s3`, chart
   `s3.enabled`) on s3s over the native cluster API (no FUSE, unprivileged): bucket = filesystem or
   snapshot, object = file, temp-file + rename PUTs, ETag/headers in xattr `user.atlas.s3`, multipart
