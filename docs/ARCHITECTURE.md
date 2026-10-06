@@ -66,9 +66,10 @@ Jobs, CDC health). It calls Atlas to provision Ceph-backed storage for the edge 
 
 **`atlas-io`** is a separate, optional node agent (`atlas-io-agent`) — deliberately *not* a crate the
 gateway depends on, so the control plane never needs `CAP_BPF`/`CAP_PERFMON`. It runs its own HTTP API
-(`/io/{health,summary,histograms,workloads,rca,leases,coverage,poll}`, `/metrics`) that the gateway or
-an operator can poll; fake bio source by default, real CO-RE `block_rq_*` attach not yet wired up (live
-mode reports missing programs rather than fabricating data). See [IO_EBPF.md](IO_EBPF.md).
+(`/io/{health,summary,histograms,workloads,rca,leases,coverage,native,poll}`, `/metrics`) that the
+gateway or an operator can poll; fake bio source by default, real CO-RE `block_rq_*` attach behind the
+`bpf` feature (latency, queue time, pid/cgroup attribution, kernel-aggregated Atlas Native I/O; if
+attach fails, live mode reports missing programs rather than fabricating data). See [IO_EBPF.md](IO_EBPF.md).
 
 ## The driver contract
 

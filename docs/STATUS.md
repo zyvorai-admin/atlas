@@ -25,7 +25,7 @@ below is bank or enterprise GA.
 | Cross-cluster DR (RBD mirror) | yes, incl. the clean-failback promote guard | yes, two lab Rook clusters: one-way (2026-10-04) and two-way with clean failback (2026-10-06), `docs/DR.md`; `dataplane_verified` stays a per-deployment flag | no | journal-mode and pool-mode mirroring | |
 | Atlas Native filesystem (Raft metadata, EC, tiering, NFS/SMB/S3/CSI, replication, edge profile) | yes | yes, lab k3s and Rook Ceph (`docs/NATIVE_STORAGE.md`); no NVMe or RDMA benchmarks | no | yes | RDMA, GPUDirect Storage, IO500 submission |
 | Ops Advisor, incidents, what-if, anomalies, MCP | yes, read-only | console exercised on the lab gateway | no | | persisted findings; no execution |
-| eBPF storage I/O sensor (`atlas-io-agent`) | yes — fake source, histograms, attribution, RCA, fail-open leases, HTTP/Prom, `atlasctl io` | no | no | live attach (programs reported missing) | aya/CO-RE loader, NFS/ZFS/uring probes, Observatory heatmaps |
+| eBPF storage I/O sensor (`atlas-io-agent`) | yes — fake source, histograms, attribution, RCA, fail-open leases, HTTP/Prom, `atlasctl io` | yes — aya/CO-RE block-layer attach, queue time and the Atlas Native maps against a real native cluster, on a kernel 7.0 lab host (`docs/IO_EBPF.md`) | no | live mode (`bpf` feature) | NFS/ZFS/uring probes, cgroup→volume map, Observatory heatmaps |
 | Product integrations beyond gRPC `Owner` | gRPC owner surface yes | | no | | Transiva import, Veyron, GuestKit, PacketWolf, then a small SDK |
 
 Transiva's owner id on the wire remains `hyper2kvm`. v0.4.0 does not rename it.

@@ -10,9 +10,9 @@ not compile it: CI tests the userspace pipeline with `FakeSource`.
 
 | File | Attach | Purpose |
 |---|---|---|
-| `atlas_bio.bpf.c` | `block/block_rq_issue`, `block/block_rq_complete` | latency, size, op, and the issuing task's pid / comm / cgroup id |
+| `atlas_bio.bpf.c` | `block/block_rq_insert`, `block/block_rq_issue`, `block/block_rq_complete` | latency, scheduler queue time, size, op, and the issuing task's pid / comm / cgroup id; Atlas Native aggregation |
+| `atlas_native_io.bpf.c` | (included by `atlas_bio.bpf.c`) | Atlas Native map ABI: PID set, per-(device, op, cgroup) stats, ≥5 ms slow-I/O events; pinned under `/sys/fs/bpf/atlas/native` |
 | `atlas_cgroup.bpf.c` | — | contract for binding a cgroup id to an Atlas volume (not loaded) |
-| `atlas_native_io.bpf.c` | — | contract for atlas-native I/O (not loaded) |
 
 Observe-only: the programs never change or drop I/O. Write-freeze is a userspace lease that fails
 open. Only non-GPL helpers are used, so the object loads under its `Apache-2.0` license string.

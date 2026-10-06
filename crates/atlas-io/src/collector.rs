@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use atlas_api_types::{BioEvent, IoHistogram, IoRca, IoSensorHealth, IoWorkload};
+use atlas_api_types::{BioEvent, IoHistogram, IoNative, IoRca, IoSensorHealth, IoWorkload};
 
 use crate::devmap::DeviceMap;
 use crate::hist::HistSet;
@@ -123,6 +123,19 @@ impl Collector {
         )
     }
 
+    /// Atlas Native I/O with device names resolved; `None` when the native maps are not loaded.
+    pub fn native(&self) -> Option<IoNative> {
+        let g = self.inner.lock().expect("collector lock");
+        let mut n = g.source.native()?;
+        for s in &mut n.stats {
+            s.device = g.map.resolve(s.major, s.minor).name;
+        }
+        for s in &mut n.slow {
+            s.device = g.map.resolve(s.major, s.minor).name;
+        }
+        Some(n)
+    }
+
     pub fn rca(&self, volume: Option<&str>) -> Vec<IoRca> {
         let h = self.histograms();
         let w = self.workloads();
@@ -141,7 +154,11 @@ impl Collector {
     }
 
     pub fn leases(&self) -> Vec<atlas_api_types::IoLease> {
-        self.inner.lock().expect("collector lock").leases.active(None)
+        self.inner
+            .lock()
+            .expect("collector lock")
+            .leases
+            .active(None)
     }
 
     pub fn seen(&self) -> u64 {
@@ -160,8 +177,11 @@ mod tests {
         c.poll();
         assert_eq!(c.seen(), 101);
         let ws = c.workloads();
-        assert!(ws.iter().any(|w| w.comm == "qemu-system-x86"
-            && w.volume_id.as_deref() == Some("vol_vm_web01")));
+        assert!(
+            ws.iter()
+                .any(|w| w.comm == "qemu-system-x86"
+                    && w.volume_id.as_deref() == Some("vol_vm_web01"))
+        );
         let rca = c.rca(Some("vol_vm_web01"));
         assert!(rca.iter().any(|r| r.verdict == "critical_latency"));
     }

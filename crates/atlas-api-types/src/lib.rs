@@ -725,6 +725,12 @@ pub struct IoHistogram {
     pub count: u64,
     pub sum_us: u64,
     pub bytes: u64,
+    /// Requests that waited in an I/O scheduler queue before issue, and their total wait.
+    /// `sum_us` / the buckets are issue→complete only and exclude this wait.
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub queue_sum_us: u64,
 }
 
 impl IoHistogram {
@@ -776,6 +782,50 @@ pub struct IoSensorHealth {
     pub events_dropped: u64,
     pub map_cardinality: u64,
     pub cardinality_cap: u64,
+}
+
+/// Kernel-aggregated block I/O issued by Atlas Native processes, per (device, op, cgroup).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoNativeStat {
+    pub device: String,
+    pub major: u32,
+    pub minor: u32,
+    pub op: IoOp,
+    pub cgroup_id: u64,
+    pub ios: u64,
+    pub bytes: u64,
+    pub avg_us: u64,
+    pub max_us: u64,
+    pub errors: u64,
+}
+
+/// One Atlas Native request at or above the slow-I/O threshold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoNativeSlow {
+    pub device: String,
+    pub major: u32,
+    pub minor: u32,
+    pub op: IoOp,
+    pub pid: u32,
+    pub comm: String,
+    pub cgroup_id: u64,
+    pub sector: u64,
+    pub bytes: u32,
+    pub latency_us: u64,
+    pub error: i32,
+}
+
+/// Atlas Native I/O view: which processes are tracked, kernel stats, recent slow requests.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IoNative {
+    pub process_names: Vec<String>,
+    pub tracked_pids: Vec<u32>,
+    /// Where the native maps are pinned, if pinning succeeded.
+    pub pinned: Option<String>,
+    pub slow_threshold_us: u64,
+    pub stats: Vec<IoNativeStat>,
+    pub slow: Vec<IoNativeSlow>,
+    pub dropped: u64,
 }
 
 /// Read-only RCA hint produced from histograms + attribution.

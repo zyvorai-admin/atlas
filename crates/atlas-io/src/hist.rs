@@ -14,6 +14,8 @@ struct Acc {
     count: u64,
     sum_us: u64,
     bytes: u64,
+    queued: u64,
+    queue_sum_us: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -46,6 +48,10 @@ impl HistSet {
         a.count += 1;
         a.sum_us += ev.latency_us();
         a.bytes += ev.bytes as u64;
+        if ev.queued_ns > 0 {
+            a.queued += 1;
+            a.queue_sum_us += ev.queue_us();
+        }
     }
 
     pub fn dropped(&self) -> u64 {
@@ -73,9 +79,15 @@ impl HistSet {
                 count: a.count,
                 sum_us: a.sum_us,
                 bytes: a.bytes,
+                queued: a.queued,
+                queue_sum_us: a.queue_sum_us,
             });
         }
-        out.sort_by(|a, b| a.device.cmp(&b.device).then(a.op.as_str().cmp(b.op.as_str())));
+        out.sort_by(|a, b| {
+            a.device
+                .cmp(&b.device)
+                .then(a.op.as_str().cmp(b.op.as_str()))
+        });
         out
     }
 }
@@ -89,7 +101,7 @@ mod tests {
         BioEvent {
             issued_ns: 0,
             completed_ns: us * 1_000,
-            queued_ns: 0,
+            queued_ns: us * 500,
             bytes: 4096,
             op,
             major: 8,
@@ -109,6 +121,8 @@ mod tests {
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].count, 2);
         assert!(snaps[0].buckets.iter().sum::<u64>() == 2);
+        // 0.5µs rounds down to 0; 4µs of queue wait for the 8µs request.
+        assert_eq!((snaps[0].queued, snaps[0].queue_sum_us), (2, 4));
     }
 
     #[test]
