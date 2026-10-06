@@ -24,7 +24,7 @@ clusters instead: [`NATIVE_REPLICATION.md`](NATIVE_REPLICATION.md).
 | Secondary-site registration (`role=secondary`) + `resync` | **Verified** (2026-10-04) |
 | Two-way (`rx-tx`) replication, clean failback | **Verified** (2026-10-06) |
 | Clean-failback guard on non-forced promote (`GET /dr/mirrors/{id}/status`) | **Verified** (2026-10-06) |
-| Journal-mode mirroring (`mode=journal`) | **Verified** (2026-10-06): enable, replay, demote, catch-up |
+| Journal-mode mirroring (`mode=journal`) | **Verified** (2026-10-06): enable, replay, failover and clean failback with the `peer_replayed` guard |
 | Pool-mode mirroring (`PUT /dr/pools/{pool}/mirroring`) | **Verified** (2026-10-06) on a Rook pool-mode pool |
 | Multi-image consistency groups (`/volume-groups`) | **Verified locally** (2026-10-06); not replicated cross-site, see below |
 
@@ -110,6 +110,21 @@ position, including the demotion tag. Atlas exposes that as `live.journal_peers_
 `GET /dr/mirrors/{id}/status`. A non-forced journal-mode promote needs the local daemon `up`, the
 peer non-primary, **and** `peer_replayed=1` (query flag on promote, field on `/dr/failover`). That
 flag is the operator confirming they saw `journal_peers_replayed: true` on the peer.
+
+The journal failover and failback drill, through the gateways on both sites:
+
+1. A (demoted) reported `journal_peers_replayed: true`. On B, a promote without the flag returned
+   409 with the journal-mode blocker. With `peer_replayed`, the non-forced promote succeeded
+   (`force_promoted: false`), and 8 MiB was written on B.
+2. B was demoted straight away, but A's `rbd-mirror` was down. Rook was rescheduling it after the
+   host's evicted pods filled the pod limit. B's `journal_peers_replayed` stayed `false` for
+   10 minutes, because A's client had committed entry 209 of 515. A promote on A with
+   `peer_replayed` was still refused (`down+stopped`). This is the stale case that status text
+   alone couldn't show.
+3. Once A's daemon was back, it replayed the rest, and B flipped to `true` 4 minutes later. A
+   non-forced promote on A with `peer_replayed` succeeded. A's checksum equalled B's
+   after-write checksum, so none of B's writes were lost.
+4. 8 MiB written on A replayed to B (`entries_behind_primary: 0`), and the checksums matched.
 
 **Pool mode.** `PUT /dr/pools/{pool}/mirroring {"mode":"pool"}` runs `rbd mirror pool enable`.
 `GET` reads the live mode and peers from `rbd mirror pool info`. It returns site names and
