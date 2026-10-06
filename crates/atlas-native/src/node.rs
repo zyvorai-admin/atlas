@@ -989,6 +989,7 @@ fn error_response(e: NativeError) -> Response {
                 MetaError::Unsupported(_) => "unsupported",
                 MetaError::Locked(_) => "locked",
                 MetaError::Quota(_) => "quota",
+                MetaError::ReadOnly(_) => "read_only",
                 _ => "invalid",
             },
             None,

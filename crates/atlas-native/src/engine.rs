@@ -38,6 +38,7 @@ mod inflight;
 mod leases;
 mod locality;
 mod rebuild;
+mod replica;
 mod tier;
 pub use export::{check_export_name, ExportExtent, ExportInfo, ExportManifest, ExportStats};
 pub use files::{
@@ -47,6 +48,7 @@ pub use files::{
 pub use leases::{now_ms, LockRequest, LockTable};
 pub use locality::{HostLocality, Locality, NodeLocality, PinReport};
 pub use rebuild::Degraded;
+pub use replica::{DiffInode, DiffPage, DEFAULT_DIFF_LIMIT};
 pub use tier::{TierPolicy, TierStats};
 
 /// Extents fetched concurrently by one read.
@@ -57,7 +59,12 @@ const WRITE_PARALLELISM: usize = 4;
 /// What a data write lands in.
 enum Target<'a> {
     Volume(&'a str),
-    File { fs: &'a str, ino: u64 },
+    /// `replica`: replication data for a replica filesystem ([`FsOp::InstallFileExtent`]).
+    File {
+        fs: &'a str,
+        ino: u64,
+        replica: bool,
+    },
 }
 
 impl Target<'_> {
@@ -76,7 +83,7 @@ impl Target<'_> {
                 .volumes
                 .get(*v)
                 .and_then(|v| v.extents.get(&cell).cloned()),
-            Target::File { fs, ino } => match &c.filesystem(fs)?.inode(*ino)?.kind {
+            Target::File { fs, ino, .. } => match &c.filesystem(fs)?.inode(*ino)?.kind {
                 InodeKind::File { extents, .. } => extents.get(&cell).cloned(),
                 _ => {
                     return Err(
@@ -658,13 +665,14 @@ impl NativeEngine {
                 volume_id: volume_id.to_string(),
                 extents: placed_all,
             },
-            Target::File { fs, ino } => MetaCommand::Fs {
+            Target::File { fs, ino, replica } => MetaCommand::Fs {
                 op: FsOp::InstallFileExtents {
                     fs: fs.to_string(),
                     ino: *ino,
                     extents: placed_all,
                     size: end,
                     now_ns: now_ns(),
+                    replica: *replica,
                 },
             },
         };
@@ -840,7 +848,7 @@ impl NativeEngine {
                 logical_offset: logical,
                 extent,
             },
-            Target::File { fs, ino } => MetaCommand::Fs {
+            Target::File { fs, ino, replica } => MetaCommand::Fs {
                 op: FsOp::InstallFileExtent {
                     fs: fs.to_string(),
                     ino: *ino,
@@ -848,6 +856,7 @@ impl NativeEngine {
                     size: logical + len as u64,
                     extent,
                     now_ns: now_ns(),
+                    replica: *replica,
                 },
             },
         };

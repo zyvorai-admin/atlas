@@ -92,6 +92,11 @@ impl DirEntries {
         self.stored
     }
 
+    /// The entries in memory: every entry unless [`Self::is_stored`].
+    pub(crate) fn in_memory(&self) -> impl Iterator<Item = (&String, &u64)> + '_ {
+        self.map.iter()
+    }
+
     /// What memory knows about `name`: `Some(None)` if it is certainly absent, `None` if only the
     /// store can tell.
     fn known(&self, name: &str) -> Option<Option<u64>> {

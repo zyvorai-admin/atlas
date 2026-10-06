@@ -15,10 +15,10 @@ use super::{
     body_json, cache_leases::Change, client_id, query_u64, read_range, MetaGroup, NodeShared,
 };
 use crate::{
-    engine::{LockRequest, NativeEngine, NativeError, NewNode, ObjectKind},
+    engine::{LockRequest, NativeEngine, NativeError, NewNode, ObjectKind, DEFAULT_DIFF_LIMIT},
     http::{Request, Response},
     leases::{LockKind, Session},
-    namespace::{FsQuota, SetAttr, XattrMode},
+    namespace::{FsQuota, ReplicaInode, SetAttr, XattrMode},
     raft::Role,
 };
 
@@ -88,6 +88,15 @@ pub(super) fn route(sh: &NodeShared, req: &Request, segs: &[&str]) -> Routed {
             };
             let e = &sh.route(ObjectKind::Filesystem, &id)?.1.engine;
             gate(req, e)?;
+            if body["replica"].as_bool().unwrap_or(false) {
+                let grid = extent_bytes.ok_or_else(|| {
+                    NativeError::Invalid("a replica needs the source's extent_bytes".into())
+                })?;
+                return Ok(Response::json(
+                    201,
+                    &json!({ "id": e.create_replica(id, name, grid)? }),
+                ));
+            }
             Ok(Response::json(
                 201,
                 &json!({ "id": e.create_fs_with(id, name, extent_bytes)? }),
@@ -123,6 +132,25 @@ fn snapshot_route(
         ("DELETE", ["v1", "fs-snapshots", id]) => {
             e.delete_fs_snapshot(id)?;
             Ok(Response::text(204, ""))
+        }
+        ("GET", ["v1", "fs-snapshots", id, "diff"]) => {
+            let after = match req.query.get("after") {
+                Some(a) => a.parse().map_err(|_| {
+                    NativeError::Invalid("query parameter after must be an integer".into())
+                })?,
+                None => 0,
+            };
+            let limit = match req.query.get("limit") {
+                Some(l) => l.parse().map_err(|_| {
+                    NativeError::Invalid("query parameter limit must be an integer".into())
+                })?,
+                None => DEFAULT_DIFF_LIMIT,
+            };
+            let from = req.query.get("from").map(|f| pct_decode(f)).transpose()?;
+            Ok(Response::json(
+                200,
+                &json!(e.fs_diff(id, from.as_deref(), after, limit)?),
+            ))
         }
         ("POST", ["v1", "fs-snapshots", id, "clone"]) => {
             let body = parse(req)?;
@@ -267,6 +295,49 @@ fn fs_route(
                 201,
                 &json!({ "id": e.snapshot_fs_as(id, fs, name)? }),
             ))
+        }
+        ("POST", ["v1", "fs", fs, "replica", "apply"]) => {
+            let part: ReplicaPart = serde_json::from_slice(&req.body)
+                .map_err(|err| NativeError::Invalid(format!("invalid increment: {err}")))?;
+            let mut inos: Vec<u64> = part.inodes.iter().map(|i| i.ino).collect();
+            inos.extend(&part.removed);
+            let _change = change(g, req, fs, &inos)?;
+            e.replica_apply(fs, part.from, part.to, part.inodes, part.removed)?;
+            Ok(Response::text(204, ""))
+        }
+        ("PUT", ["v1", "fs", fs, "replica", "inodes", ino, "data"]) => {
+            let ino: u64 = ino
+                .parse()
+                .map_err(|_| NativeError::Invalid(format!("inode {ino:?} is not a number")))?;
+            let offset = match query_u64(req, "offset") {
+                Ok(o) => o,
+                Err(r) => return Ok(r),
+            };
+            let _change = change(g, req, fs, &[ino])?;
+            e.replica_write(fs, ino, offset, &req.body)?;
+            Ok(Response::text(204, ""))
+        }
+        ("POST", ["v1", "fs", fs, "replica", "commit"]) => {
+            let c: ReplicaCommit = serde_json::from_slice(&req.body)
+                .map_err(|err| NativeError::Invalid(format!("invalid commit: {err}")))?;
+            // The replica's snapshot shares its extents, so it lives in the filesystem's group.
+            sh.claim(ObjectKind::FsSnapshot, &c.snapshot, group)?;
+            e.replica_commit(fs, c.from, c.to, c.snapshot, c.next_ino)?;
+            Ok(Response::text(204, ""))
+        }
+        ("POST", ["v1", "fs", fs, "promote"]) => {
+            let force = body_or_empty(req)?["force"].as_bool().unwrap_or(false);
+            e.replica_promote(fs, force)?;
+            Ok(Response::text(204, ""))
+        }
+        ("POST", ["v1", "fs", fs, "demote"]) => {
+            let body = parse(req)?;
+            e.replica_demote(
+                fs,
+                str_field(&body, "snapshot")?.into(),
+                str_field(&body, "base")?.into(),
+            )?;
+            Ok(Response::text(204, ""))
         }
         (method, ["v1", "fs", fs, "inodes", ino, rest @ ..]) => {
             let ino: u64 = ino
@@ -540,6 +611,36 @@ fn lock_range(field: impl Fn(&str) -> Option<u64>) -> Result<(u64, u64), NativeE
         field("start").unwrap_or(0),
         field("end").unwrap_or(u64::MAX),
     ))
+}
+
+/// Body of `POST /v1/fs/{fs}/replica/apply`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaPart {
+    from: Option<String>,
+    to: String,
+    #[serde(default)]
+    inodes: Vec<ReplicaInode>,
+    #[serde(default)]
+    removed: Vec<u64>,
+}
+
+/// Body of `POST /v1/fs/{fs}/replica/commit`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaCommit {
+    from: Option<String>,
+    to: String,
+    snapshot: String,
+    next_ino: u64,
+}
+
+/// A JSON body, or an empty object when there is none.
+fn body_or_empty(req: &Request) -> Result<serde_json::Value, NativeError> {
+    if req.body.is_empty() {
+        return Ok(json!({}));
+    }
+    parse(req)
 }
 
 fn bad(r: Response) -> NativeError {

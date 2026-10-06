@@ -7,6 +7,9 @@ Atlas exposes a control-plane catalog and failover API for Ceph RBD mirroring. T
 2026-10-04 (see below). Fake mode (`ATLAS_CEPH_DRIVER_MODE=fake` / `make run`) exercises the full
 API and catalog without calling `rbd`.
 
+For atlas-native filesystems, cross-cluster DR is asynchronous replication between two native
+clusters instead: [`NATIVE_REPLICATION.md`](NATIVE_REPLICATION.md).
+
 ## Status
 
 | Layer | State |

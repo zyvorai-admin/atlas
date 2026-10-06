@@ -1,0 +1,18 @@
+# Copyright (c) 2026 ZyvorAI Labs Private Limited.
+# SPDX-License-Identifier: Apache-2.0
+# atlas-native-replicate: asynchronous filesystem replication between two native clusters
+# (docs/NATIVE_REPLICATION.md). Talks to both clusters over their HTTP APIs: no FUSE, no privileges.
+# ---- builder ----
+FROM docker.io/library/rust:1.99-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release --locked -p atlas-native-fuse --bin atlas-native-replicate
+
+# ---- runtime ----
+FROM docker.io/library/debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 atlas-native-replicate
+COPY --from=builder /build/target/release/atlas-native-replicate /usr/local/bin/atlas-native-replicate
+USER atlas-native-replicate
+ENTRYPOINT ["/usr/local/bin/atlas-native-replicate"]

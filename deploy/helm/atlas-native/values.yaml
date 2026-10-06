@@ -289,3 +289,35 @@ s3:
     limits: { memory: 1Gi }
   nodeSelector: {}
   tolerations: []
+
+# Asynchronous replication (docs/NATIVE_REPLICATION.md): each job snapshots a filesystem of this
+# cluster every intervalSecs and sends the changes to a read-only replica on another cluster.
+# Unprivileged; stateless (the replica records where to continue).
+replication:
+  enabled: false
+  image:
+    repository: ghcr.io/zyvorai/atlas-native-replicate
+    tag: ""          # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  # The other cluster: its metadata API endpoints, a Secret holding its API token and, for
+  # HTTPS with a private CA, a Secret holding that CA.
+  target:
+    endpoints: []
+    #  - https://dr-atlas-native-api.example.net:7480
+    tokenSecret: ""
+    tokenKey: token
+    caSecret: ""
+    caKey: ca.crt
+  intervalSecs: 300
+  # Replicated snapshots kept on the target (the latest is always kept).
+  keep: 24
+  # One replicator per filesystem; targetFs defaults to fs, intervalSecs and keep to the above.
+  jobs: []
+  #  - fs: team-share
+  #    targetFs: team-share
+  #    intervalSecs: 60
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 512Mi }
+  nodeSelector: {}
+  tolerations: []

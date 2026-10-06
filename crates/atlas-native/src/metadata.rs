@@ -244,6 +244,8 @@ pub enum MetaError {
     Locked(String),
     #[error("quota exceeded: {0}")]
     Quota(String),
+    #[error("read-only: {0}")]
+    ReadOnly(String),
     /// Session ids are never echoed: one lets its holder renew the session or drop its locks.
     #[error("no such session (expired or closed)")]
     NoSession,

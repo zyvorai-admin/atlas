@@ -16,6 +16,8 @@ use crate::{
     metadata::{Catalog, ExtentId, ExtentRef, MetaError, SnapshotId},
 };
 
+mod replica;
+
 pub type FsId = String;
 
 pub const ROOT_INO: u64 = 1;
@@ -43,6 +45,61 @@ pub struct FsMeta {
     pub usage: Option<FsUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<FsQuota>,
+    /// Set while the filesystem receives another one's changes ([`FsOp::ReplicaApply`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica: Option<ReplicaState>,
+}
+
+/// Where a replica filesystem stands. Clients can read a replica but not change it until it is
+/// promoted ([`FsOp::ReplicaPromote`]); only increments of the source's snapshots change it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaState {
+    /// The source snapshot the last complete increment brought this filesystem to; `None` until
+    /// the first one completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<SnapshotId>,
+    /// This filesystem's own snapshot of that state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<SnapshotId>,
+    /// The source snapshot of an increment partly applied since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<SnapshotId>,
+}
+
+/// One inode of a replication increment as the source snapshot has it. Inode numbers are the
+/// source's, so a replica's tree matches its source's inode for inode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaInode {
+    pub ino: u64,
+    pub node_type: NodeType,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    /// Every extended attribute (replacing the replica's).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub xattrs: BTreeMap<String, Vec<u8>>,
+    /// File size.
+    #[serde(default)]
+    pub size: u64,
+    /// File grid cells to clear: the source no longer backs them, or their new data follows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holes: Vec<u64>,
+    /// Directory: its parent.
+    #[serde(default)]
+    pub parent: u64,
+    /// Directory entries set (`Some`) or removed (`None`) since the increment's base.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<(String, Option<u64>)>,
+    /// Symlink target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Device number of a character or block device node.
+    #[serde(default)]
+    pub rdev: u64,
 }
 
 /// Limits a filesystem's growth: a change that would take `used_bytes` above `max_bytes`, or
@@ -252,6 +309,9 @@ pub enum FsOp {
         extent: ExtentRef,
         size: u64,
         now_ns: i64,
+        /// Replication data for a replica filesystem: leaves the inode's times alone.
+        #[serde(default, skip_serializing_if = "is_false")]
+        replica: bool,
     },
     /// [`FsOp::InstallFileExtent`] for several extents of one write (each at its own
     /// `logical_offset`), committed as one entry.
@@ -261,6 +321,9 @@ pub enum FsOp {
         extents: Vec<ExtentRef>,
         size: u64,
         now_ns: i64,
+        /// As [`FsOp::InstallFileExtent`]'s.
+        #[serde(default, skip_serializing_if = "is_false")]
+        replica: bool,
     },
     /// Freezes the whole inode table; shares every file extent.
     SnapshotFs {
@@ -286,6 +349,88 @@ pub enum FsOp {
         #[serde(default)]
         max_inodes: Option<u64>,
     },
+    /// An empty filesystem that receives replication ([`ReplicaState`]), on the source's grid.
+    CreateReplica {
+        fs: FsId,
+        name: String,
+        now_ns: i64,
+        extent_bytes: u64,
+    },
+    /// Part of the increment from source snapshot `from` (`None`: from nothing) to `to`: upserts
+    /// `inodes`, then removes `removed`. The first part of an increment must start at the
+    /// replica's base; further parts of the same `to` may follow in any number.
+    ReplicaApply {
+        fs: FsId,
+        from: Option<SnapshotId>,
+        to: SnapshotId,
+        #[serde(default)]
+        inodes: Vec<ReplicaInode>,
+        #[serde(default)]
+        removed: Vec<u64>,
+    },
+    /// Completes increment `to` (which may have had no parts): snapshots the replica as
+    /// `snapshot` and makes `to` its base.
+    ReplicaCommit {
+        fs: FsId,
+        from: Option<SnapshotId>,
+        to: SnapshotId,
+        snapshot: SnapshotId,
+        name: String,
+        /// The source's next inode number, so a promoted replica never reuses one.
+        next_ino: u64,
+        now_ns: i64,
+    },
+    /// Makes a replica writable as of its last complete increment, discarding a partial one.
+    /// With no complete increment yet, `force` keeps whatever arrived.
+    ReplicaPromote {
+        fs: FsId,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Reverts writable `fs` to its snapshot `snapshot` and makes it a replica whose base is
+    /// `base`, the same state on the new source (failback).
+    ReplicaDemote {
+        fs: FsId,
+        snapshot: SnapshotId,
+        base: SnapshotId,
+    },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl FsOp {
+    /// The filesystem a client change applies to; replicas refuse these.
+    fn client_change(&self) -> Option<&str> {
+        match self {
+            FsOp::Mknode { fs, .. }
+            | FsOp::Link { fs, .. }
+            | FsOp::Unlink { fs, .. }
+            | FsOp::Rmdir { fs, .. }
+            | FsOp::Rename { fs, .. }
+            | FsOp::SetAttr { fs, .. }
+            | FsOp::SetXattr { fs, .. }
+            | FsOp::RemoveXattr { fs, .. }
+            | FsOp::InstallFileExtent {
+                fs, replica: false, ..
+            }
+            | FsOp::InstallFileExtents {
+                fs, replica: false, ..
+            } => Some(fs),
+            _ => None,
+        }
+    }
+}
+
+/// The file type an inode has.
+pub fn node_type(i: &Inode) -> NodeType {
+    match i.kind {
+        InodeKind::Dir { .. } => NodeType::Dir,
+        InodeKind::File { .. } => NodeType::File,
+        InodeKind::Symlink { .. } => NodeType::Symlink,
+        InodeKind::Special { node_type, .. } => node_type,
+    }
 }
 
 impl Inode {
@@ -632,6 +777,30 @@ impl Catalog {
     }
 
     pub(crate) fn apply_fs(&mut self, op: &FsOp, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
+        if let Some(fs) = op.client_change() {
+            if self
+                .filesystems
+                .get(fs)
+                .is_some_and(|f| f.replica.is_some())
+            {
+                return Err(MetaError::ReadOnly(format!(
+                    "filesystem {fs} is a replica; promote it to change it"
+                )));
+            }
+        }
+        if let FsOp::InstallFileExtent {
+            fs, replica: true, ..
+        }
+        | FsOp::InstallFileExtents {
+            fs, replica: true, ..
+        } = op
+        {
+            if self.filesystem(fs)?.replica.is_none() {
+                return Err(MetaError::Invalid(format!(
+                    "filesystem {fs} is not a replica"
+                )));
+            }
+        }
         match op {
             FsOp::CreateFs {
                 fs,
@@ -670,6 +839,7 @@ impl Catalog {
                         extent_bytes: *extent_bytes,
                         usage: Some(FsUsage::default()),
                         quota: None,
+                        replica: None,
                     },
                 );
             }
@@ -1014,6 +1184,7 @@ impl Catalog {
                 extent,
                 size: at_least,
                 now_ns,
+                replica,
             } => {
                 extent.check()?;
                 self.check_byte_quota(fs, *ino, &[(*logical_offset, extent.len as u64)])?;
@@ -1027,7 +1198,9 @@ impl Catalog {
                 let old_size = *size;
                 *size = (*size).max(*at_least);
                 let grown = *size - old_size;
-                i.touch(*now_ns);
+                if !replica {
+                    i.touch(*now_ns);
+                }
                 self.add_extent_ref(extent);
                 let old_len = old.as_ref().map_or(0, |o| self.extent_len(o));
                 if let Some(u) = self.usage_mut(fs) {
@@ -1044,6 +1217,7 @@ impl Catalog {
                 extents: new,
                 size: at_least,
                 now_ns,
+                replica,
             } => {
                 for e in new {
                     e.check()?;
@@ -1066,7 +1240,9 @@ impl Catalog {
                 let old_size = *size;
                 *size = (*size).max(*at_least);
                 let grown = *size - old_size;
-                i.touch(*now_ns);
+                if !replica {
+                    i.touch(*now_ns);
+                }
                 for e in new {
                     self.add_extent_ref(e);
                 }
@@ -1085,31 +1261,18 @@ impl Catalog {
                 fs,
                 name,
                 now_ns,
-            } => {
-                if let Some(s) = self.fs_snapshots.get(id) {
-                    if s.fs_id == *fs && s.name == *name {
-                        return Ok(());
-                    }
-                    return Err(MetaError::Exists(format!("filesystem snapshot {id}")));
-                }
-                let f = self.filesystem(fs)?;
-                let tree = FsMeta {
-                    inodes: f.inodes.detached()?,
-                    ..f.clone()
-                };
-                self.share_extents(&tree.inodes)?;
-                self.fs_snapshots.insert(
-                    id.clone(),
-                    FsSnapshotMeta {
-                        id: id.clone(),
-                        fs_id: fs.clone(),
-                        name: name.clone(),
-                        created_ns: *now_ns,
-                        tree,
-                    },
-                );
-            }
+            } => self.snapshot_tree(id, fs, name, *now_ns)?,
             FsOp::DeleteFsSnapshot { id } => {
+                if let Some(f) = self.filesystems.values().find(|f| {
+                    f.replica
+                        .as_ref()
+                        .is_some_and(|r| r.local.as_ref() == Some(id))
+                }) {
+                    return Err(MetaError::Invalid(format!(
+                        "filesystem snapshot {id} is the base of replica {}",
+                        f.id
+                    )));
+                }
                 let s = self
                     .fs_snapshots
                     .remove(id)
@@ -1137,6 +1300,7 @@ impl Catalog {
                 tree.id = id.clone();
                 tree.name = name.clone();
                 tree.source_snapshot = Some(snapshot_id.clone());
+                tree.replica = None;
                 self.filesystems.insert(id.clone(), tree);
             }
             FsOp::SetQuota {
@@ -1150,7 +1314,76 @@ impl Catalog {
                 };
                 self.fs_mut(fs)?.quota = (quota != FsQuota::default()).then_some(quota);
             }
+            FsOp::CreateReplica {
+                fs,
+                name,
+                now_ns,
+                extent_bytes,
+            } => self.create_replica(fs, name, *now_ns, *extent_bytes)?,
+            FsOp::ReplicaApply {
+                fs,
+                from,
+                to,
+                inodes,
+                removed,
+            } => self.replica_apply(fs, from.as_ref(), to, inodes, removed, gc)?,
+            FsOp::ReplicaCommit {
+                fs,
+                from,
+                to,
+                snapshot,
+                name,
+                next_ino,
+                now_ns,
+            } => self.replica_commit(
+                fs,
+                from.as_ref(),
+                to,
+                snapshot,
+                name,
+                *next_ino,
+                *now_ns,
+                gc,
+            )?,
+            FsOp::ReplicaPromote { fs, force } => self.replica_promote(fs, *force, gc)?,
+            FsOp::ReplicaDemote { fs, snapshot, base } => {
+                self.replica_demote(fs, snapshot, base, gc)?
+            }
         }
+        Ok(())
+    }
+
+    /// Freezes `fs` as snapshot `id` (idempotent for the same filesystem and name).
+    fn snapshot_tree(
+        &mut self,
+        id: &SnapshotId,
+        fs: &str,
+        name: &str,
+        now_ns: i64,
+    ) -> Result<(), MetaError> {
+        if let Some(s) = self.fs_snapshots.get(id) {
+            if s.fs_id == fs && s.name == name {
+                return Ok(());
+            }
+            return Err(MetaError::Exists(format!("filesystem snapshot {id}")));
+        }
+        let f = self.filesystem(fs)?;
+        let tree = FsMeta {
+            inodes: f.inodes.detached()?,
+            replica: None,
+            ..f.clone()
+        };
+        self.share_extents(&tree.inodes)?;
+        self.fs_snapshots.insert(
+            id.clone(),
+            FsSnapshotMeta {
+                id: id.clone(),
+                fs_id: fs.to_string(),
+                name: name.to_string(),
+                created_ns: now_ns,
+                tree,
+            },
+        );
         Ok(())
     }
 }
@@ -1243,6 +1476,7 @@ mod tests {
             },
             size: off + len as u64,
             now_ns: 5,
+            replica: false,
         }
     }
 

@@ -349,6 +349,12 @@ The chart's SMB gateway runs Samba over `--allow-other` FUSE mounts, one per sha
 Unix accounts with configured uids and gids, so the mount's permission checks apply to them. See
 [`NATIVE_SMB.md`](NATIVE_SMB.md).
 
+## Replication
+
+`atlas-native-replicate` keeps a read-only replica of a filesystem on another cluster from
+snapshot increments that carry only changed grid cells, with promote and demote for failover and
+failback. See [`NATIVE_REPLICATION.md`](NATIVE_REPLICATION.md).
+
 ## Limits and performance
 
 Each filesystem lives in one Raft group's catalog (`metadata.groups` spreads filesystems across
