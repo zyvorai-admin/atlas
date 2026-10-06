@@ -27,5 +27,5 @@ Default console login is `admin` with the gateway password for your deployment
 ```
 
 See the repo [`README`](https://github.com/zyvorai/atlas#readme) and
-[`docs/DEPLOYMENT.md`](https://github.com/zyvorai/atlas/blob/main/docs/DEPLOYMENT.md)
+[`docs/DEPLOYMENT.md`](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/DEPLOYMENT.md)
 for Rook Ceph and real-Ceph gateway paths.

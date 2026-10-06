@@ -6,7 +6,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Atlas',
-  tagline: 'Survey the cluster. Provision with intent. Operate day-2.',
+  tagline: 'One API for the storage you have. A filesystem for the storage you need.',
   favicon: 'img/favicon.svg',
 
   future: {
@@ -51,6 +51,7 @@ const config: Config = {
   ],
 
   themeConfig: {
+    image: 'img/atlas-social.jpg',
     colorMode: {
       defaultMode: 'dark',
       respectPrefersColorScheme: false,

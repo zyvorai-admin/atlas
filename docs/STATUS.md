@@ -22,7 +22,8 @@ below is bank or enterprise GA.
 | DataBridge MongoDB | yes | yes, through cutover | no | | change-stream edge cases, repeatable verification |
 | DataBridge MySQL | yes | CDC live for `DATETIME` only | no | `TIMESTAMP` CDC | cutover; `TIMESTAMP` SMT |
 | DataBridge SQL Server and Oracle | discovery yes | discovery live | no | | full-load, CDC, validate, cutover, rollback; Oracle TCPS |
-| Cross-cluster DR (RBD mirror) | control plane yes; `dataplane_verified` is false | no | no | yes | two-site promote/demote drill |
+| Cross-cluster DR (RBD mirror) | yes, incl. the clean-failback promote guard | yes, two lab Rook clusters: one-way (2026-10-04) and two-way with clean failback (2026-10-06), `docs/DR.md`; `dataplane_verified` stays a per-deployment flag | no | journal-mode and pool-mode mirroring | |
+| Atlas Native filesystem (Raft metadata, EC, tiering, NFS/SMB/S3/CSI, replication, edge profile) | yes | yes, lab k3s and Rook Ceph (`docs/NATIVE_STORAGE.md`); no NVMe or RDMA benchmarks | no | yes | RDMA, GPUDirect Storage, IO500 submission |
 | Ops Advisor, incidents, what-if, anomalies, MCP | yes, read-only | console exercised on the lab gateway | no | | persisted findings; no execution |
 | eBPF storage I/O sensor (`atlas-io-agent`) | yes — fake source, histograms, attribution, RCA, fail-open leases, HTTP/Prom, `atlasctl io` | no | no | live attach (programs reported missing) | aya/CO-RE loader, NFS/ZFS/uring probes, Observatory heatmaps |
 | Product integrations beyond gRPC `Owner` | gRPC owner surface yes | | no | | Transiva import, Veyron, GuestKit, PacketWolf, then a small SDK |

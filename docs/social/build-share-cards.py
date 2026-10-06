@@ -22,7 +22,7 @@ DARK = dict(
 SANS = "'Helvetica Neue',Helvetica,Arial,sans-serif"
 MONO = "'Menlo','JetBrains Mono',monospace"
 
-TAGLINE = ("The world of storage,", "under one command.")
+TAGLINE = ("One API for your storage.", "A filesystem of its own.")
 
 # (name, detail); Ceph is the primary backend and carries the single orange dot. Object storage
 # defaults to Ceph RGW (no separate first-party object backend since RustFS was removed).
@@ -31,10 +31,11 @@ BACKENDS = [
     ("NFS", "file shares"),
     ("ZFS", "pools"),
     ("Longhorn", "Kubernetes volumes"),
+    ("Native", "EC · NFS · SMB · S3"),
 ]
-STATS = [("4", "storage backends"), ("6", "database engines"),
-         ("80+", "REST endpoints"), ("3", "access surfaces")]
-NEW_BADGE = "NEW · atlas-io: eBPF I/O sensor"
+STATS = [("4", "storage backends"), ("5", "native access paths"),
+         ("6", "database engines"), ("150+", "REST endpoints")]
+NEW_BADGE = "NEW · two-way DR, clean failback"
 
 
 def svg(p, label):
@@ -114,7 +115,7 @@ def svg(p, label):
   <text x="72" y="316" font-family="{SANS}" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">{TAGLINE[0]}</text>
   <text x="72" y="362" font-family="{SANS}" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">{TAGLINE[1]}</text>
 
-  <!-- new: eBPF I/O sensor badge -->
+  <!-- new: badge -->
   <rect x="72" y="398" width="330" height="34" rx="17" fill="{p['wash']}" fill-opacity="{p['wash_op']}" stroke="{p['card_hi']}" stroke-opacity="0.4"/>
   <text x="87" y="420" font-family="{MONO}" font-size="15" font-weight="700" fill="{p['card_hi']}">{NEW_BADGE}</text>
 
@@ -140,7 +141,7 @@ def svg(p, label):
 
   <!-- footer -->
   <line x1="72" y1="560" x2="1128" y2="560" stroke="{p['hair']}" stroke-width="1"/>
-  <text x="72" y="596" font-family="{MONO}" font-size="16" fill="{p['sec']}">github.com/zyvorai/atlas</text>
+  <text x="72" y="596" font-family="{MONO}" font-size="16" fill="{p['sec']}">github.com/zyvorai/zyvor-atlas</text>
   <text x="1128" y="596" text-anchor="end" font-family="{SANS}" font-size="16" fill="{p['sec']}">v0.4.0 · Apache License 2.0</text>
 </svg>
 '''
@@ -149,6 +150,6 @@ def svg(p, label):
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "docs/social"
     label = (f"Atlas — {TAGLINE[0]} {TAGLINE[1]} One API in front of Ceph, NFS, ZFS and Longhorn, "
-              "plus atlas-io: an observe-first eBPF I/O sensor.")
+              "plus Atlas Native, a distributed filesystem with NFS, SMB and S3.")
     open(f"{out}/atlas-share-card.svg", "w").write(svg(LIGHT, label))
     open(f"{out}/atlas-share-card-dark.svg", "w").write(svg(DARK, label))
