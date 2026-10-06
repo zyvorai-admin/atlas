@@ -241,9 +241,9 @@ and what is lab-verified only.
 > From [docs/STATUS.md](docs/STATUS.md) for 0.4.0: *Lab verification is not production support. Nothing
 > below is bank or enterprise GA.* The Ceph / Rook control plane and Ceph RGW are verified on a single-node
 > Rook lab; two-way RBD mirroring is verified between two lab clusters; Atlas Native is lab-verified on k3s
-> without NVMe or RDMA benchmarks; DataBridge Postgres, MariaDB and MongoDB are verified through cutover;
-> MySQL CDC is live for `DATETIME` only; SQL Server and Oracle are discovery-only; the live eBPF attach is
-> experimental.
+> without NVMe or RDMA benchmarks; DataBridge is verified through cutover for all six source engines
+> (Postgres, MySQL incl. `TIMESTAMP` columns, MariaDB, MongoDB, and SQL Server and Oracle into Postgres);
+> the live eBPF attach is experimental.
 
 ---
 

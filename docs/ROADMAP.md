@@ -251,10 +251,11 @@ to open engines at the edge on Ceph-backed storage.
 - **MySQL, MariaDB, MongoDB verified through provision → real full-load (data physically copied
   source→edge) → validate** (row/document-count parity) against a lightweight edge.
 - **MariaDB + MongoDB CDC + cutover verified live** (2026-09-01) on the Rook Ceph lab with
-  Strimzi/Debezium; MySQL CDC live for DATETIME (cutover still pending).
+  Strimzi/Debezium; MySQL (incl. `TIMESTAMP` columns), SQL Server and Oracle followed on
+  2026-10-04 (`docs/DATABRIDGE.md`).
 - Fake-first: the entire pipeline runs with no cloud/k8s (`make run-databridge`), CI-locked by
   `tests/databridge_pipeline.rs`.
-- Follow-ups: MySQL cutover; Oracle / SQL Server heterogeneous CDC end-to-end; TLS for cloud SSL sources.
+- Follow-ups: TLS for cloud SSL sources; a rollback drill for the heterogeneous engines.
 
 See [DATABRIDGE.md](DATABRIDGE.md).
 
@@ -657,12 +658,10 @@ no model required for the default path. See [AI_ADVISOR.md](AI_ADVISOR.md).
   against real (lab) infra (`deploy/siem-lab/`, `deploy/vault-lab/` — see below); a real deployment
   still needs the bank's actual SIEM/Vault swapped in for the lab ones. None of these block a
   non-production pilot; all are gates before a production go-live.
-- **Non-Postgres DataBridge streaming CDC + cutover**: Postgres, MariaDB, and MongoDB are
-  verified live through cutover (see `docs/DATABRIDGE.md`). MySQL streaming CDC is live for
-  `DATETIME` columns only; Debezium encodes `TIMESTAMP` columns as ISO-8601 strings the JDBC
-  sink can't bind, and MySQL cutover has not been driven live (see `docs/DATABRIDGE.md`). SQL
-  Server and Oracle are verified through discovery only. Cutover for MySQL, SQL Server, and
-  Oracle has not been driven live.
+- ✅ **Non-Postgres DataBridge streaming CDC + cutover**: all six source engines are verified live
+  through cutover (`docs/DATABRIDGE.md`). MySQL `TIMESTAMP` columns work since the edges moved to
+  the Debezium JDBC sink (2026-10-03); MySQL, SQL Server and Oracle cutover were driven in-cluster
+  on the Rook Ceph lab on 2026-10-04. Heterogeneous (SQL Server / Oracle) validate stays advisory.
 - ✅ **NFS/ZFS drivers now have a real mode, not just fixtures**: `ATLAS_NFS_DRIVER_MODE`/
   `ATLAS_ZFS_DRIVER_MODE` (`fake`, the default — unchanged demo/test behavior — or `real`; Helm
   chart: `nfs.driverMode`/`zfs.driverMode`) select `RealNfsDriver`/`RealZfsDriver`
