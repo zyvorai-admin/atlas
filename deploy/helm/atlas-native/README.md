@@ -38,6 +38,13 @@ kubectl -n atlas-native get secret atlas-native-api -o jsonpath='{.data.token}' 
 | `smb.encrypt`, `smb.mountArgs` | desired, `[--cache-leases]` | SMB 3 encryption (`desired`, `required`, `off`); `atlas-native-mount` options for every share. |
 | `s3.enabled` | false | S3 gateway ([`docs/NATIVE_S3.md`](../../../docs/NATIVE_S3.md)): Deployment of `s3.replicas` unprivileged pods and a Service on `s3.service.port`, serving `s3.buckets` (filesystem or snapshot per bucket). Needs `s3.credentials.existingSecret` (key `credentials.json`) or inline `s3.credentials.keys`. Not compatible with `httpTls.requireClientCert` yet. |
 | `s3.tls.existingSecret`, `s3.domains`, `s3.uid`, `s3.gid` | empty, [], 0, 0 | HTTPS for the S3 endpoint; virtual-hosted-style domains; owner of files S3 writes create. |
+| `replication.enabled`, `replication.target.*`, `replication.jobs` | false | Asynchronous replication of filesystems to a replica on another cluster ([`docs/NATIVE_REPLICATION.md`](../../../docs/NATIVE_REPLICATION.md)): one unprivileged `atlas-native-replicate` Deployment per job. Not compatible with `httpTls.requireClientCert` yet. |
+| `node.cacheInodes`, `node.storeCacheBytes` | 262144, 64 MiB | Memory bounds per metadata group: unchanged inodes kept in memory and the catalog store's page cache (node config `cache_inodes`, `store_cache_bytes`). |
+| `node.mallocArenaMax` | 0 | Sets `MALLOC_ARENA_MAX` in the node pods; 0 keeps glibc's default. |
+
+`values-edge.yaml` is a single-node, low-memory profile for edge sites (one pod, one copy per
+extent, small caches, a 256 MiB limit): `helm install edge deploy/helm/atlas-native -f
+deploy/helm/atlas-native/values-edge.yaml`. See [`docs/NATIVE_EDGE.md`](../../../docs/NATIVE_EDGE.md).
 
 Pods roll only when the rendered config or the pod template changes (`checksum/config`), so an
 unchanged `helm upgrade` is a no-op. `deploy/native/helm-live-check.sh` installs the chart with

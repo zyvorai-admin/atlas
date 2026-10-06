@@ -78,6 +78,9 @@ spec:
             - name: POD_NAME
               valueFrom:
                 fieldRef: { fieldPath: metadata.name }
+            {{- with .Values.node.mallocArenaMax }}
+            - { name: MALLOC_ARENA_MAX, value: {{ . | quote }} }
+            {{- end }}
           {{- if and .Values.tiering.enabled (eq (include "atlas-native.tierSecret" .) (printf "%s-tier" $full)) }}
           # BUCKET_HOST, BUCKET_PORT, BUCKET_NAME of the ObjectBucketClaim.
           envFrom:

@@ -104,7 +104,9 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
     "rebuild_bytes_per_sec" (.Values.node.rebuildBytesPerSec | int64)
     "scrub_bytes_per_sec" (.Values.node.scrubBytesPerSec | int64)
     "gc_interval_secs" (.Values.node.gcIntervalSecs | int)
-    "groups" (.Values.node.metadataGroups | int)) -}}
+    "groups" (.Values.node.metadataGroups | int)
+    "cache_inodes" (.Values.node.cacheInodes | int64)
+    "store_cache_bytes" (.Values.node.storeCacheBytes | int64)) -}}
 {{- if .Values.tiering.enabled -}}
 {{- $t := .Values.tiering -}}
 {{- $byo := and $t.endpoint $t.bucket $t.existingSecret -}}

@@ -35,7 +35,7 @@ columns state only what has been measured or verified in this repository.
 | Mixed backends under one API | Ceph, NFS, ZFS, Longhorn, S3, native | (same gateway) | WEKA only |
 | Cloud-to-edge DB migration | DataBridge: six engines, CDC, cutover | (same gateway) | Not in scope |
 | Operations | AI Ops Advisor, anomaly detection, MCP tools, eBPF I/O RCA (`atlas-io`) | (same gateway) | Own management GUI and monitoring |
-| Edge footprint | Single-node Rook lab profile | Single node or three | Multi-node clusters on qualified hardware |
+| Edge footprint | Single-node Rook lab profile | Single-node low-memory profile (`values-edge.yaml`): one pod, catalog memory capped at ~26 MB however many files, 61 MB peak in a 50k-file lab run (`docs/NATIVE_EDGE.md`) | Multi-node clusters on qualified hardware |
 | Licence | Apache-2.0, no key | Apache-2.0, no key | Commercial |
 
 ## WEKA as an Atlas backend
@@ -86,9 +86,9 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
    (`docs/NATIVE_SMB.md`) are done. An IO500 harness runs the full suite (`docs/IO500.md`), but
    there is no submission: that waits for NVMe benchmark hardware.
 6. **Edge and DR:** asynchronous filesystem replication with failover and failback, a
-   single-node low-memory edge profile, two-way RBD mirroring on the Ceph side. Filesystem
-   replication is done (`docs/NATIVE_REPLICATION.md`); the edge profile and two-way RBD
-   mirroring are not.
+   single-node low-memory edge profile, two-way RBD    mirroring on the Ceph side. Filesystem
+   replication (`docs/NATIVE_REPLICATION.md`) and the edge profile (`docs/NATIVE_EDGE.md`) are
+   done; two-way RBD mirroring is not.
 
 Status of each step is tracked in `docs/NATIVE_STORAGE.md`. Until a phase's benchmark is
 published, treat atlas-native as behind WEKA on that axis.

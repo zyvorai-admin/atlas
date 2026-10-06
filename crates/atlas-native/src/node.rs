@@ -156,6 +156,13 @@ pub struct MetadataRole {
     /// lowering it would strand the objects of the groups dropped.
     #[serde(default = "default_groups")]
     pub groups: u32,
+    /// Unchanged inodes each group keeps in memory (at least 64); the rest are read from its
+    /// catalog store when needed.
+    #[serde(default = "default_cache_inodes")]
+    pub cache_inodes: usize,
+    /// Page cache of each group's catalog store (at least 1 MiB).
+    #[serde(default = "default_store_cache_bytes")]
+    pub store_cache_bytes: usize,
     /// Move cold extents to object storage (`docs/NATIVE_NODE.md`, "Tiering").
     #[serde(default)]
     pub tiering: Option<TieringConfig>,
@@ -273,6 +280,12 @@ fn default_devices() -> usize {
 }
 fn default_groups() -> u32 {
     1
+}
+fn default_cache_inodes() -> usize {
+    crate::store::DEFAULT_CACHE_INODES
+}
+fn default_store_cache_bytes() -> usize {
+    crate::store::DEFAULT_STORE_CACHE_BYTES
 }
 /// Upper bound on `metadata.groups`: each group runs its own Raft log and engine.
 pub const MAX_GROUPS: u32 = 64;
@@ -603,6 +616,8 @@ impl NativeNode {
                         group_dir(&cfg.data_dir, "raft", g),
                     );
                     rcfg.bootstrap = m.bootstrap.clone();
+                    rcfg.catalog_cache_inodes = m.cache_inodes;
+                    rcfg.catalog_cache_bytes = m.store_cache_bytes;
                     let server = Arc::new(RaftServer::start_in(
                         &mux,
                         g,
@@ -637,6 +652,8 @@ impl NativeNode {
                     ecfg.extent_bytes = m.extent_bytes;
                     ecfg.erasure = m.erasure;
                     ecfg.erasure_min_bytes = m.erasure_min_bytes;
+                    ecfg.catalog_cache_inodes = m.cache_inodes;
+                    ecfg.catalog_cache_bytes = m.store_cache_bytes;
                     if let (Some(store), Some(t)) = (&objects, &m.tiering) {
                         ecfg.objects = Some(store.clone());
                         ecfg.object_prefix = format!("{}g{g}/", t.prefix);
