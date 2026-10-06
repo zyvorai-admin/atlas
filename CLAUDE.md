@@ -121,8 +121,13 @@ Production License v1.0 at the maintainer's explicit request — history in
 [`CLA.md`](CLA.md), [`DCO.md`](DCO.md), or [`NOTICE`](NOTICE) without an explicit human
 request. There is **no** runtime license-key or trial/JWT gate.
 
-Deferred: journal-mode and pool-mode RBD mirroring, per-product integrations beyond the gRPC
-surface.
+DR also covers journal-mode and pool-mode mirroring and local multi-image consistency groups
+(`/volume-groups`, `rbd group` snapshots + rollback job), verified on the two-site lab 2026-10-06.
+Journal-mode non-forced promote needs `peer_replayed=1` because a caught-up and a stale copy report
+the same status (`docs/DR.md`).
+
+Deferred: cross-site group mirroring (no released Ceph has `rbd mirror group`), per-product
+integrations beyond the gRPC surface.
 
 ## Layout
 - `crates/atlas-common` — config, error, tracing, id helpers.

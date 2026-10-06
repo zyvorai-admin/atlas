@@ -252,6 +252,14 @@ pub enum JobSpec {
         image: String,
         snap: String,
     },
+    /// Roll every member of an RBD consistency group back to a group snapshot
+    /// (`rbd group snap rollback`). Destructive; the members must not be in use.
+    #[serde(rename = "rbd.group_rollback")]
+    RbdGroupRollback {
+        pool: String,
+        group: String,
+        snap: String,
+    },
     /// Delete a raw RBD image's snapshot (unprotect, then `rbd snap rm`). Without this, a
     /// snapshot created through the UI has no path back except deleting the whole parent image.
     #[serde(rename = "rbd.snap_delete")]
@@ -489,6 +497,7 @@ impl JobSpec {
             JobSpec::RbdMirror { .. } => "rbd.mirror",
             JobSpec::RbdSnapshot { .. } => "rbd.snapshot",
             JobSpec::RbdRollback { .. } => "rbd.rollback",
+            JobSpec::RbdGroupRollback { .. } => "rbd.group_rollback",
             JobSpec::RbdSnapDelete { .. } => "rbd.snap_delete",
             JobSpec::SourceDiscover { .. } => "databridge.source.discover",
             JobSpec::MigrationAssess { .. } => "databridge.assess",

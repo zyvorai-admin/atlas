@@ -24,6 +24,9 @@ clusters instead: [`NATIVE_REPLICATION.md`](NATIVE_REPLICATION.md).
 | Secondary-site registration (`role=secondary`) + `resync` | **Verified** (2026-10-04) |
 | Two-way (`rx-tx`) replication, clean failback | **Verified** (2026-10-06) |
 | Clean-failback guard on non-forced promote (`GET /dr/mirrors/{id}/status`) | **Verified** (2026-10-06) |
+| Journal-mode mirroring (`mode=journal`) | **Verified** (2026-10-06): enable, replay, failover and clean failback with the `peer_replayed` guard |
+| Pool-mode mirroring (`PUT /dr/pools/{pool}/mirroring`) | **Verified** (2026-10-06) on a Rook pool-mode pool |
+| Multi-image consistency groups (`/volume-groups`) | **Verified locally** (2026-10-06); not replicated cross-site, see below |
 
 `GET /dr/status` and `GET /dr/preflight` both expose `control_plane_ready` (catalog coherent) and
 `dataplane_verified`. The latter used to be a hard-coded `false`; it's now `Config::
@@ -83,8 +86,80 @@ status alone which copy is newer. The recovery that worked:
 
 The drill ended with A primary, B `up+replaying`, and identical checksums.
 
-Not covered: journal-mode and pool-mode mirroring, multi-image consistency groups, and RPO under
-sustained load. Both OSDs are 40 GB loop files on shared HDDs.
+Not covered: RPO under sustained load. Both OSDs are 40 GB loop files on shared HDDs. Journal and
+pool modes and consistency groups were run the same day; see the next section.
+
+### Journal mode, pool mode and consistency groups (2026-10-06)
+
+Same two clusters and gateways as the two-way drill.
+
+**Journal mode.** `POST /volumes/{id}/mirror?mode=journal` runs `rbd mirror image enable … journal`,
+which also turns on the image's `journaling` feature. Site B went `up+replaying` and showed
+`entries_behind_primary` while it caught up. Replay on this lab is slow (0.2–7 entries/s, depending on
+host load), so 4K random writes take minutes to drain, while 4 MiB sequential writes drain in about
+two minutes per 16 MiB. B's `rbd-mirror` pod was restarted by Rook mid-replay, about 268 entries
+behind, and it resumed and caught up. After A demoted and B drained, both checksums matched.
+
+Finding: in journal mode the caught-up copy reports `up+unknown`, "remote image is not primary".
+Snapshot mode reports "remote image demoted" at that point. The 2026-10-06 drill above saw the same
+"remote image is not primary" in the stale case too, where a copy did *not* replay the peer's
+writes. So in journal mode this site's status can't prove it is current. The proof is on the
+peer, the site that wrote the journal. `rbd journal status` there lists each peer `rbd-mirror`
+client's commit position, and once the peer has replayed everything it equals the local client's
+position, including the demotion tag. Atlas exposes that as `live.journal_peers_replayed` in
+`GET /dr/mirrors/{id}/status`. A non-forced journal-mode promote needs the local daemon `up`, the
+peer non-primary, **and** `peer_replayed=1` (query flag on promote, field on `/dr/failover`). That
+flag is the operator confirming they saw `journal_peers_replayed: true` on the peer.
+
+The journal failover and failback drill, through the gateways on both sites:
+
+1. A (demoted) reported `journal_peers_replayed: true`. On B, a promote without the flag returned
+   409 with the journal-mode blocker. With `peer_replayed`, the non-forced promote succeeded
+   (`force_promoted: false`), and 8 MiB was written on B.
+2. B was demoted straight away, but A's `rbd-mirror` was down. Rook was rescheduling it after the
+   host's evicted pods filled the pod limit. B's `journal_peers_replayed` stayed `false` for
+   10 minutes, because A's client had committed entry 209 of 515. A promote on A with
+   `peer_replayed` was still refused (`down+stopped`). This is the stale case that status text
+   alone couldn't show.
+3. Once A's daemon was back, it replayed the rest, and B flipped to `true` 4 minutes later. A
+   non-forced promote on A with `peer_replayed` succeeded. A's checksum equalled B's
+   after-write checksum, so none of B's writes were lost.
+4. 8 MiB written on A replayed to B (`entries_behind_primary: 0`), and the checksums matched.
+
+**Pool mode.** `PUT /dr/pools/{pool}/mirroring {"mode":"pool"}` runs `rbd mirror pool enable`.
+`GET` reads the live mode and peers from `rbd mirror pool info`. It returns site names and
+directions only, never the peer's key or `mon_host`. The drill used a separate CephBlockPool
+`atlas-dr-pool-mode` with `mirroring.mode: pool` on both sites, peered through one Rook
+`peers.secretNames` import (`rx-tx`). In a pool-mode pool, Ceph mirrors every image that has
+journaling, so Atlas:
+
+- refuses `mode=snapshot` with 400,
+- maps `mode=journal` to "join the pool" (`rbd feature enable … journaling`),
+- maps disable to "leave the pool" (`feature disable journaling`), because `rbd mirror image
+  disable` is rejected in pool mode.
+
+A 256 MiB image `pm-1` was created through `POST /rbd-images`. A snapshot-mode enable returned 400,
+and a journal-mode enable made it `mirroring mode: journal, primary: true`. 16 MiB written on A
+replicated to B (`up+replaying`, `entries_behind_primary: 0`), and the SHA-256 checksums matched.
+
+**Consistency groups.** `POST /volume-groups` creates an `rbd group` and adds the member images. All
+members must be in one pool, and a volume can be in only one group. `POST
+/volume-groups/{id}/snapshots` takes a crash-consistent `rbd group snap create` across every member.
+The drill used two 64 MiB images `ga` and `gb`:
+
+1. Wrote 8 MiB to each and took group snapshot `cp1`.
+2. Overwrote both with 4 MiB of random 4K writes; both checksums changed.
+3. `POST …/snapshots/cp1/rollback` without `confirm: true` returned 400.
+4. With `confirm: true`, the rollback job succeeded, and both images were back to their `cp1`
+   checksums.
+
+**Groups are local to one cluster.** Cross-site group mirroring (`rbd mirror group enable`) is not
+in any released Ceph. Squid 19.2.3 and Tentacle 20.2.4 (`quay.io/ceph/ceph:v20`) both answer
+"unknown option 'mirror group enable'". Snapshot-mode `rbd-mirror` mirrors the member images one by
+one but does not carry group snapshots: after a group snap on A, B's members had only
+`.mirror.non_primary` snapshots and no `cp1`. Mirroring each member still works, but the members'
+mirror snapshots are taken independently, so the peer's copies are not mutually consistent at one
+point in time. Atlas doesn't claim cross-site group consistency until Ceph ships group mirroring.
 
 ### 2026-10-04 live two-site drill: verified
 
@@ -180,17 +255,23 @@ actually completed it.
 | `POST` | `/dr/peers` | Register peer (`secret_ref` = k8s Secret name, never the token) |
 | `GET` | `/dr/peers` | List peers |
 | `DELETE` | `/dr/peers/{id}` | Remove peer (+ dependent mirrors) |
-| `POST` | `/volumes/{id}/mirror?mode=snapshot&peer=` | Enable (requires a registered peer; 409 on the peer's non-primary copy) |
+| `POST` | `/volumes/{id}/mirror?mode=snapshot\|journal&peer=` | Enable (requires a registered peer; 409 on the peer's non-primary copy or a disabled pool; only `journal` in a pool-mode pool) |
 | `POST` | `/volumes/{id}/mirror?role=secondary&peer=` | Register this site's non-primary copy (checked with `rbd info`; no CLI write) |
 | `DELETE` | `/volumes/{id}/mirror` | Disable |
 | `GET` | `/dr/mirrors` · `/dr/status` | Catalog + posture (`verified: false` until live) |
 | `GET` | `/dr/preflight` | Checklist before failover |
 | `POST` | `/dr/mirrors/{id}/demote` | Primary → secondary |
-| `GET` | `/dr/mirrors/{id}/status` | Live `rbd mirror image status` + `promote_ready` / `promote_blocker` |
-| `POST` | `/dr/mirrors/{id}/promote?force=0\|1` | Secondary → primary; non-forced needs `promote_ready` in real mode (`force` = split-brain) |
+| `GET` | `/dr/mirrors/{id}/status` | Live `rbd mirror image status` + `promote_ready` / `promote_blocker`; journal mode adds `journal_peers_replayed` |
+| `POST` | `/dr/mirrors/{id}/promote?force=0\|1&peer_replayed=0\|1` | Secondary → primary; non-forced needs `promote_ready` in real mode, plus `peer_replayed=1` in journal mode (`force` = split-brain) |
 | `POST` | `/dr/mirrors/{id}/resync` | Discard this secondary copy and re-pull from the peer's primary |
-| `POST` | `/dr/failover` | `{ mirror_id, confirm: true, force? }` runbook |
+| `POST` | `/dr/failover` | `{ mirror_id, confirm: true, force?, peer_replayed? }` runbook |
 | `POST` | `/dr/mirrors/{id}/rpo` | `{ rpo_seconds }` observed RPO |
+| `GET` · `PUT` | `/dr/pools/{pool}/mirroring` | Pool mirroring mode `image` / `pool` / `disabled` (live `rbd mirror pool info` in real mode) |
+| `POST` · `GET` | `/volume-groups` | `{ name, volume_ids }` consistency group (`rbd group`, one pool) |
+| `GET` · `DELETE` | `/volume-groups/{id}` | Group detail / remove the group (member images are kept) |
+| `POST` · `GET` | `/volume-groups/{id}/snapshots` | `{ name }` crash-consistent group snapshot |
+| `DELETE` | `/volume-groups/{id}/snapshots/{snap}` | Remove a group snapshot |
+| `POST` | `/volume-groups/{id}/snapshots/{snap}/rollback` | `{ confirm: true }` job; rolls every member back (admin) |
 
 Guards: promote of an already-primary mirror is **409** unless `?force=1`; demote of an already-secondary
 is **409**; resync of a primary is **409**; disabled mirrors cannot be promoted/demoted/resynced; in

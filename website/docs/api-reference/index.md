@@ -205,6 +205,13 @@ Run the alert rules on demand (also runs every `ATLAS_MONITOR_INTERVAL_SECS`).
   non-forced promote is 409 until this site has replayed the peer's demotion.
 - `POST /api/atlas/v1/dr/failover` `{ mirror_id, confirm: true, force? }` — confirm-gated runbook.
 - `POST /api/atlas/v1/dr/mirrors/{id}/rpo` `{ rpo_seconds }` — record observed RPO.
+- `GET /api/atlas/v1/dr/pools/{pool}/mirroring` · `PUT ... {"mode":"image"|"pool"|"disabled"}` — pool mirroring mode
+  (live `rbd mirror pool info` in real mode). In a `pool`-mode pool only `mode=journal` image enables are accepted.
+- `POST /api/atlas/v1/volume-groups` `{ name, volume_ids }` · `GET /volume-groups` · `GET|DELETE /volume-groups/{id}` —
+  multi-image consistency groups (`rbd group`; all members in one pool, one group per volume).
+- `POST /api/atlas/v1/volume-groups/{id}/snapshots` `{ name }` · `GET .../snapshots` · `DELETE .../snapshots/{snap}` —
+  crash-consistent group snapshots. `POST .../snapshots/{snap}/rollback` `{ confirm: true }` is a job (admin).
+  Group snapshots are local to one cluster: rbd-mirror does not replicate them (see DR.md).
 
 ## Write path (async jobs) — slice 2
 

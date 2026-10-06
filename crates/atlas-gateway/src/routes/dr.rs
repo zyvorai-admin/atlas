@@ -141,6 +141,130 @@ pub(crate) async fn rbd_of_volume(s: &AppState, volume_id: &str) -> AppResult<(S
     Ok((pool.to_string(), image.to_string()))
 }
 
+fn real_ceph(s: &AppState) -> bool {
+    matches!(
+        s.config.ceph_driver_mode,
+        atlas_common::config::CephDriverMode::Real
+    )
+}
+
+fn valid_pool_name(pool: &str) -> bool {
+    !pool.is_empty()
+        && pool.len() <= 128
+        && pool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A pool's mirroring mode: live from `rbd mirror pool info` in real mode, else what Atlas last
+/// recorded (default `image`, the mode Rook's CephBlockPool mirroring usually sets).
+async fn pool_mirror_mode(s: &AppState, rbd_pool: &str) -> AppResult<String> {
+    if real_ceph(s) {
+        let info = atlas_driver_ceph::rbd_mirror_pool_info(rbd_pool)
+            .await
+            .map_err(|e| AppError::Unavailable(format!("rbd mirror pool info {rbd_pool}: {e}")))?;
+        return Ok(info
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("disabled")
+            .to_string());
+    }
+    Ok(atlas_inventory::dr::pool_mode(&s.pool, rbd_pool)
+        .await?
+        .unwrap_or_else(|| "image".into()))
+}
+
+/// `GET /dr/pools/{pool}/mirroring` — the pool's mirroring mode and peers (operator).
+pub(crate) async fn get_pool_mirroring(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(rbd_pool): Path<String>,
+) -> AppResult<Json<Value>> {
+    crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_OPERATOR)?;
+    if !valid_pool_name(&rbd_pool) {
+        return Err(AppError::Validation("invalid pool name".into()));
+    }
+    let live = if real_ceph(&s) {
+        Some(
+            atlas_driver_ceph::rbd_mirror_pool_info(&rbd_pool)
+                .await
+                .map_err(|e| {
+                    AppError::Unavailable(format!("rbd mirror pool info {rbd_pool}: {e}"))
+                })?,
+        )
+    } else {
+        None
+    };
+    let mode = match &live {
+        Some(info) => info
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("disabled")
+            .to_string(),
+        None => pool_mirror_mode(&s, &rbd_pool).await?,
+    };
+    let peers = live
+        .as_ref()
+        .and_then(|i| i.get("peers"))
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .map(
+                    |p| json!({ "site_name": p.get("site_name"), "direction": p.get("direction") }),
+                )
+                .collect::<Vec<_>>()
+        });
+    Ok(Json(json!({
+        "pool": rbd_pool, "mode": mode, "peers": peers,
+        "recorded_mode": atlas_inventory::dr::pool_mode(&s.pool, &rbd_pool).await?,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PoolMirroringBody {
+    mode: String,
+}
+
+/// `PUT /dr/pools/{pool}/mirroring` `{"mode":"image"|"pool"}` — set the pool's mirroring mode
+/// (admin). In `pool` mode every image with the `journaling` feature is mirrored, with no
+/// per-image enable. On Rook, set the CephBlockPool's `spec.mirroring.mode` to match, or the
+/// operator puts its own value back on its next reconcile.
+pub(crate) async fn set_pool_mirroring(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(rbd_pool): Path<String>,
+    Json(body): Json<PoolMirroringBody>,
+) -> AppResult<Json<Value>> {
+    crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_ADMIN)?;
+    if !valid_pool_name(&rbd_pool) {
+        return Err(AppError::Validation("invalid pool name".into()));
+    }
+    if !matches!(body.mode.as_str(), "image" | "pool") {
+        return Err(AppError::Validation("mode must be image or pool".into()));
+    }
+    if real_ceph(&s) {
+        atlas_driver_ceph::rbd_mirror_pool_enable(&rbd_pool, &body.mode)
+            .await
+            .map_err(|e| {
+                AppError::Unavailable(format!("rbd mirror pool enable {rbd_pool}: {e}"))
+            })?;
+    }
+    atlas_inventory::dr::set_pool_mode(&s.pool, &rbd_pool, &body.mode).await?;
+    let _ = atlas_inventory::audit::record(
+        &s.pool,
+        None,
+        &actor.id,
+        "dr.pool.mirroring",
+        "rbd_pool",
+        &rbd_pool,
+        "ok",
+        Some(json!({ "mode": body.mode })),
+        None,
+    )
+    .await;
+    Ok(Json(json!({ "pool": rbd_pool, "mode": body.mode })))
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct MirrorQuery {
     mode: Option<String>,
@@ -189,10 +313,28 @@ pub(crate) async fn enable_mirror(
         ));
     }
     let mirror_id = ids::stable_id("drm", &format!("{rbd_pool}/{image}"));
-    let real = matches!(
-        s.config.ceph_driver_mode,
-        atlas_common::config::CephDriverMode::Real
-    );
+    let real = real_ceph(&s);
+    // In a pool-mode pool `rbd mirror image enable` is refused: an image is mirrored by having
+    // the journaling feature, so the enable job turns that on instead.
+    let pool_mode = pool_mirror_mode(&s, &rbd_pool).await?;
+    match pool_mode.as_str() {
+        "disabled" => {
+            return Err(AppError::Conflict(format!(
+                "mirroring is disabled on pool {rbd_pool} — PUT /dr/pools/{rbd_pool}/mirroring first"
+            )))
+        }
+        "pool" if mode != "journal" => {
+            return Err(AppError::Validation(format!(
+                "pool {rbd_pool} is in pool mirroring mode, which mirrors journaling images only — use mode=journal"
+            )))
+        }
+        _ => {}
+    }
+    let enable_action = if pool_mode == "pool" {
+        "join-pool"
+    } else {
+        "enable"
+    };
     let primary_here = if real {
         atlas_driver_ceph::rbd_mirror_primary(&rbd_pool, &image)
             .await
@@ -263,7 +405,7 @@ pub(crate) async fn enable_mirror(
         mirror_id: mirror_id.clone(),
         pool: rbd_pool.clone(),
         image: image.clone(),
-        action: "enable".into(),
+        action: enable_action.into(),
         mode: mode.to_string(),
         force: false,
     };
@@ -273,7 +415,10 @@ pub(crate) async fn enable_mirror(
         .await?;
     Ok(accepted(
         &job,
-        json!({ "mirror_id": mirror_id, "rbd": format!("{rbd_pool}/{image}"), "state": state }),
+        json!({
+            "mirror_id": mirror_id, "rbd": format!("{rbd_pool}/{image}"), "state": state,
+            "pool_mode": pool_mode,
+        }),
     ))
 }
 
@@ -286,10 +431,13 @@ pub(crate) async fn disable_mirror(
     crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_ADMIN)?;
     let (rbd_pool, image) = rbd_of_volume(&s, &volume_id).await?;
     let mirror_id = ids::stable_id("drm", &format!("{rbd_pool}/{image}"));
-    let real = matches!(
-        s.config.ceph_driver_mode,
-        atlas_common::config::CephDriverMode::Real
-    );
+    let real = real_ceph(&s);
+    // A pool-mode pool refuses `rbd mirror image disable`; dropping journaling takes the image out.
+    let action = if pool_mirror_mode(&s, &rbd_pool).await? == "pool" {
+        "leave-pool"
+    } else {
+        "disable"
+    };
     atlas_inventory::dr::set_mirror(
         &s.pool,
         &mirror_id,
@@ -302,7 +450,7 @@ pub(crate) async fn disable_mirror(
         mirror_id: mirror_id.clone(),
         pool: rbd_pool.clone(),
         image: image.clone(),
-        action: "disable".into(),
+        action: action.into(),
         mode: "snapshot".into(),
         force: false,
     };
@@ -319,7 +467,23 @@ pub(crate) async fn disable_mirror(
 #[derive(Debug, Deserialize)]
 pub(crate) struct PromoteQuery {
     /// Split-brain / non-clean failover: pass to `rbd mirror image promote --force`.
+    #[serde(default, deserialize_with = "query_flag")]
     force: Option<bool>,
+    /// Journal mode: the operator checked that the peer reports `journal_peers_replayed: true`.
+    #[serde(default, deserialize_with = "query_flag")]
+    peer_replayed: Option<bool>,
+}
+
+/// A query-string boolean written `0`/`1` or `false`/`true`.
+fn query_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    match Option::<String>::deserialize(d)?.as_deref() {
+        None => Ok(None),
+        Some("1" | "true") => Ok(Some(true)),
+        Some("0" | "false") => Ok(Some(false)),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected 0, 1, true or false, got '{other}'"
+        ))),
+    }
 }
 
 /// `POST /dr/mirrors/{id}/promote?force=0|1` — failover: promote this cluster's copy to primary.
@@ -329,7 +493,15 @@ pub(crate) async fn promote_mirror(
     Path(id): Path<String>,
     Query(q): Query<PromoteQuery>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
-    mirror_role_op(&s, &actor, &id, "promote", q.force.unwrap_or(false)).await
+    mirror_role_op(
+        &s,
+        &actor,
+        &id,
+        "promote",
+        q.force.unwrap_or(false),
+        q.peer_replayed.unwrap_or(false),
+    )
+    .await
 }
 
 /// `GET /dr/mirrors/{id}/status` — live `rbd mirror image status` of this site's copy and whether a
@@ -353,12 +525,27 @@ pub(crate) async fn mirror_status(
             .map_err(|e| {
                 AppError::Unavailable(format!("rbd mirror image status {rbd_pool}/{image}: {e}"))
             })?;
-        let blocker = atlas_driver_ceph::mirror_promote_blocker(&status);
+        let mode = atlas_driver_ceph::rbd_mirror_mode(&rbd_pool, &image)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let journal_peers_replayed = if mode == "journal" {
+            atlas_driver_ceph::rbd_journal_peers_replayed(&rbd_pool, &image)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let blocker = atlas_driver_ceph::mirror_promote_blocker(&status, &mode, false);
         let live = json!({
+            "mode": mode,
             "state": status.get("state"),
             "description": status.get("description"),
             "last_update": status.get("last_update"),
             "peer_sites": status.get("peer_sites"),
+            "journal_peers_replayed": journal_peers_replayed,
         });
         (Some(live), blocker)
     } else {
@@ -382,7 +569,7 @@ pub(crate) async fn demote_mirror(
     Extension(actor): Extension<Actor>,
     Path(id): Path<String>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
-    mirror_role_op(&s, &actor, &id, "demote", false).await
+    mirror_role_op(&s, &actor, &id, "demote", false, false).await
 }
 
 /// `POST /dr/mirrors/{id}/resync` — discard this cluster's non-primary copy and pull a full copy
@@ -392,7 +579,7 @@ pub(crate) async fn resync_mirror(
     Extension(actor): Extension<Actor>,
     Path(id): Path<String>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
-    mirror_role_op(&s, &actor, &id, "resync", false).await
+    mirror_role_op(&s, &actor, &id, "resync", false, false).await
 }
 
 pub(crate) async fn mirror_role_op(
@@ -401,6 +588,7 @@ pub(crate) async fn mirror_role_op(
     id: &str,
     action: &str,
     force: bool,
+    peer_replayed: bool,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     crate::auth::require_role(s.config.auth_required, actor, crate::auth::ROLE_ADMIN)?;
     let (rbd_pool, image, role, state) = atlas_inventory::dr::mirror_detail(&s.pool, id)
@@ -444,7 +632,13 @@ pub(crate) async fn mirror_role_op(
             .map_err(|e| {
                 AppError::Unavailable(format!("rbd mirror image status {rbd_pool}/{image}: {e}"))
             })?;
-        if let Some(blocker) = atlas_driver_ceph::mirror_promote_blocker(&status) {
+        let mode = atlas_driver_ceph::rbd_mirror_mode(&rbd_pool, &image)
+            .await
+            .map_err(|e| AppError::Unavailable(format!("rbd info {rbd_pool}/{image}: {e}")))?
+            .unwrap_or_default();
+        if let Some(blocker) =
+            atlas_driver_ceph::mirror_promote_blocker(&status, &mode, peer_replayed)
+        {
             return Err(AppError::Conflict(format!(
                 "promoting {rbd_pool}/{image} would not be a clean failback: {blocker}; demote \
                  the peer and wait for GET /dr/mirrors/{id}/status to report promote_ready, or \
@@ -507,6 +701,8 @@ pub(crate) struct FailoverBody {
     confirm: bool,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    peer_replayed: bool,
 }
 
 /// `POST /dr/failover` — one-click failover runbook: promote a secondary (admin, confirm required).
@@ -528,7 +724,15 @@ pub(crate) async fn dr_failover(
             pre["blockers"]
         )));
     }
-    let result = mirror_role_op(&s, &actor, &body.mirror_id, "promote", body.force).await?;
+    let result = mirror_role_op(
+        &s,
+        &actor,
+        &body.mirror_id,
+        "promote",
+        body.force,
+        body.peer_replayed,
+    )
+    .await?;
     let _ = atlas_inventory::audit::record(
         &s.pool,
         None,

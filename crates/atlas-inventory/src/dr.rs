@@ -71,6 +71,32 @@ pub async fn list_peers(pool: &AnyPool) -> Result<Vec<serde_json::Value>> {
         .collect())
 }
 
+// ---- pool mirroring mode ----
+
+/// Record the mirroring mode Atlas applied to a pool (`image` or `pool`).
+pub async fn set_pool_mode(pool: &AnyPool, rbd_pool: &str, mode: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO dr_pool_mirroring (pool, mode, updated_at) VALUES ($1, $2, $3)
+         ON CONFLICT(pool) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at",
+    )
+    .bind(rbd_pool)
+    .bind(mode)
+    .bind(now_rfc3339(chrono::Utc::now()))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The mode last recorded for a pool, if any.
+pub async fn pool_mode(pool: &AnyPool, rbd_pool: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT mode FROM dr_pool_mirroring WHERE pool=$1")
+            .bind(rbd_pool)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 // ---- mirrors ----
 
 /// Record (or update) a mirrored image. Keyed uniquely by `(pool, image)`.

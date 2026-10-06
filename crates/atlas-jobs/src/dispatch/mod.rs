@@ -36,6 +36,7 @@ pub(crate) async fn dispatch(
         | JobSpec::RbdMirror { .. }
         | JobSpec::RbdSnapshot { .. }
         | JobSpec::RbdRollback { .. }
+        | JobSpec::RbdGroupRollback { .. }
         | JobSpec::RbdSnapDelete { .. } => rbd::dispatch_rbd(pool, k8s, tenant_id, spec).await,
         JobSpec::VolumeCreate { .. }
         | JobSpec::VolumeDelete { .. }
