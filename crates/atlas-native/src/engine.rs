@@ -27,6 +27,7 @@ use crate::{
     raft_server::RaftServer,
     store::{
         load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE, DEFAULT_CACHE_INODES,
+        DEFAULT_STORE_CACHE_BYTES,
     },
     telemetry::NativeIoCounters,
     wal::{Wal, WalError, WalRecord},
@@ -159,6 +160,8 @@ pub struct EngineConfig {
     pub node_retry_after: Duration,
     /// Unchanged inodes the catalog keeps in memory; the rest stay in the catalog store.
     pub catalog_cache_inodes: usize,
+    /// The catalog store's page cache (with [`MetaBackend::Local`]; Raft's store has its own).
+    pub catalog_cache_bytes: usize,
     /// Erasure-code new extents of at least `erasure_min_bytes` under this scheme instead of
     /// replicating them (`placement.replicas` still applies to smaller ones).
     pub erasure: Option<EcScheme>,
@@ -186,6 +189,7 @@ impl EngineConfig {
             wal_compact_after: 1024,
             node_retry_after: Duration::from_secs(5),
             catalog_cache_inodes: DEFAULT_CACHE_INODES,
+            catalog_cache_bytes: DEFAULT_STORE_CACHE_BYTES,
             erasure: None,
             erasure_min_bytes: DEFAULT_ERASURE_MIN_BYTES,
             objects: None,
@@ -368,8 +372,11 @@ impl NativeEngine {
             .collect();
         let meta = match meta {
             MetaBackend::Local => {
-                let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?
-                    .with_cache_inodes(cfg.catalog_cache_inodes);
+                let store = CatalogStore::open_with_cache(
+                    cfg.root.join(CATALOG_STORE),
+                    cfg.catalog_cache_bytes,
+                )?
+                .with_cache_inodes(cfg.catalog_cache_inodes);
                 let (catalog, wal) = load_local(&cfg.root, &store)?;
                 Meta::Local {
                     store,

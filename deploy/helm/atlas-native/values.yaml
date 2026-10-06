@@ -43,6 +43,13 @@ node:
   metadataGroups: 1
   # Placement capacity hint per data node (bytes); defaults to the PVC size.
   freeBytes: 0
+  # Memory bounds per metadata group: unchanged inodes kept in memory (the rest are read from
+  # the catalog store when needed) and the catalog store's page cache. values-edge.yaml lowers
+  # both for small nodes.
+  cacheInodes: 262144
+  storeCacheBytes: 67108864
+  # glibc malloc arenas (MALLOC_ARENA_MAX); 0 leaves glibc's default (8 per core).
+  mallocArenaMax: 0
 
 # Move extents nobody has written or read for coldAfterSecs to object storage, freeing their
 # space on the data nodes (docs/NATIVE_NODE.md, "Tiering").

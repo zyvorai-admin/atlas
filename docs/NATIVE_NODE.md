@@ -78,6 +78,8 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `metadata.rebuild_bytes_per_sec` | 256 MiB | Rebuild traffic cap (bytes read plus written per second, per group); 0 is unlimited. |
 | `metadata.scrub_bytes_per_sec` | 64 MiB | Scrub traffic cap, likewise. |
 | `metadata.gc_interval_secs` | 60 | Leader-only GC loop; 0 disables. |
+| `metadata.cache_inodes` | 262144 | Unchanged inodes each group keeps in memory (at least 64); the rest are read from its catalog store when needed. See [`NATIVE_EDGE.md`](NATIVE_EDGE.md) for what it costs. |
+| `metadata.store_cache_bytes` | 67108864 | Page cache of each group's catalog store (at least 1 MiB). |
 | `metadata.tiering` | unset | Move cold extents to object storage; see [Tiering](#tiering). |
 | `metadata.groups` | 1 | Raft groups the namespace is sharded across (1–64), all on `metadata.listen`; see [Metadata groups](#metadata-groups). Every metadata node must use the same value. It can be raised later but never lowered. |
 | `data_nodes[].host` / `rack` / `zone` | `id` / `id` / empty | Failure domains for placement; replicas always land on distinct hosts. |

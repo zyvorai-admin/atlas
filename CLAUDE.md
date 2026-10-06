@@ -174,7 +174,9 @@ integrations beyond the gRPC surface.
   (snapshot diff per inode, only changed grid cells; replica state `base`/`local`/`pending` in the
   catalog, `namespace/replica.rs` + `engine/replica.rs`; promote/demote for failover/failback).
   Replica snapshot ids = source ids, so source and target must be separate clusters. Verified
-  live between two clusters on the lab k3s; see `docs/NATIVE_REPLICATION.md`.
+  live between two clusters on the lab k3s; see `docs/NATIVE_REPLICATION.md`. Edge profile:
+  `deploy/helm/atlas-native/values-edge.yaml` (single pod, RF 1, `metadata.cache_inodes` /
+  `store_cache_bytes` capped, `MALLOC_ARENA_MAX=2`); see `docs/NATIVE_EDGE.md`.
 - `crates/atlas-native-s3` — S3 gateway (bin `atlas-native-s3`, `Dockerfile.native-s3`, chart
   `s3.enabled`) on s3s over the native cluster API (no FUSE, unprivileged): bucket = filesystem or
   snapshot, object = file, temp-file + rename PUTs, ETag/headers in xattr `user.atlas.s3`, multipart

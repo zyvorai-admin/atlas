@@ -149,6 +149,8 @@ fn start_node(root: &Path, server: &(String, String), client_ca: &str) -> Native
             repair_interval_secs: 0,
             gc_interval_secs: 0,
             groups: 1,
+            cache_inodes: atlas_native::store::DEFAULT_CACHE_INODES,
+            store_cache_bytes: atlas_native::store::DEFAULT_STORE_CACHE_BYTES,
         }),
         max_request_bytes: 1 << 20,
     };

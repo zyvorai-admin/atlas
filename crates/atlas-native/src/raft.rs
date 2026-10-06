@@ -38,6 +38,7 @@ use crate::{
     raft_snapshot::{remove_staging, Incoming, Outgoing, SnapshotChunk},
     store::{
         load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE, DEFAULT_CACHE_INODES,
+        DEFAULT_STORE_CACHE_BYTES,
     },
     wal::{Wal, WalError, WalRecord},
 };
@@ -93,6 +94,8 @@ pub struct RaftConfig {
     pub compact_after: u64,
     /// Unchanged inodes the catalog keeps in memory; the rest stay in the catalog store.
     pub catalog_cache_inodes: usize,
+    /// The catalog store's page cache.
+    pub catalog_cache_bytes: usize,
 }
 
 impl RaftConfig {
@@ -107,6 +110,7 @@ impl RaftConfig {
             max_batch: 64,
             compact_after: 1024,
             catalog_cache_inodes: DEFAULT_CACHE_INODES,
+            catalog_cache_bytes: DEFAULT_STORE_CACHE_BYTES,
         }
     }
 }
@@ -364,8 +368,9 @@ impl RaftNode {
         } else {
             HardState::default()
         };
-        let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?
-            .with_cache_inodes(cfg.catalog_cache_inodes);
+        let store =
+            CatalogStore::open_with_cache(cfg.root.join(CATALOG_STORE), cfg.catalog_cache_bytes)?
+                .with_cache_inodes(cfg.catalog_cache_inodes);
         let mut catalog = load_checkpoint(&cfg.root, &store)?;
         if !catalog.in_store {
             store.checkpoint(&mut catalog)?;
@@ -1143,7 +1148,8 @@ impl RaftNode {
         let path = self.cfg.root.join(CATALOG_STORE);
         fs::rename(&staged, &path)?;
         durable::sync_dir(&self.cfg.root)?;
-        self.store = CatalogStore::open(&path)?.with_cache_inodes(self.cfg.catalog_cache_inodes);
+        self.store = CatalogStore::open_with_cache(&path, self.cfg.catalog_cache_bytes)?
+            .with_cache_inodes(self.cfg.catalog_cache_inodes);
         let snap = load_checkpoint(&self.cfg.root, &self.store)?;
         self.adopt_snapshot(snap)
     }

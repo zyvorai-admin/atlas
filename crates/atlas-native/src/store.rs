@@ -83,8 +83,9 @@ struct FsHeader {
     replica: Option<ReplicaState>,
 }
 
-/// redb's own page cache; the operating system's page cache sits behind it.
-const STORE_CACHE_BYTES: usize = 64 << 20;
+/// redb's own page cache, unless configured otherwise; the operating system's page cache sits
+/// behind it.
+pub const DEFAULT_STORE_CACHE_BYTES: usize = 64 << 20;
 
 /// Inodes the paged tables kept in memory after a checkpoint, unless configured otherwise.
 pub const DEFAULT_CACHE_INODES: usize = 256 * 1024;
@@ -146,13 +147,18 @@ impl std::fmt::Debug for CatalogStore {
 impl CatalogStore {
     /// Opens or creates the store. Only one process may hold it open.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_cache(path, DEFAULT_STORE_CACHE_BYTES)
+    }
+
+    /// [`Self::open`] with a page cache of `cache_bytes` (at least 1 MiB).
+    pub fn open_with_cache(path: impl AsRef<Path>, cache_bytes: usize) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
         Ok(Self {
             db: redb::Builder::new()
-                .set_cache_size(STORE_CACHE_BYTES)
+                .set_cache_size(cache_bytes.max(1 << 20))
                 .create(&path)
                 .map_err(err)?,
             path,
@@ -1196,19 +1202,25 @@ mod bench {
             .unwrap_or_default()
     }
 
-    /// Peak memory of a paged catalog with a small cache, files in one directory or spread
-    /// over `BENCH_DIRS` of them.
+    /// Peak memory of a paged catalog, files in one directory or spread over `BENCH_DIRS` of
+    /// them, with `BENCH_CACHE_INODES` (default 4096) and `BENCH_STORE_CACHE` bytes of cache.
     #[test]
     #[ignore]
     fn memory_of_a_paged_catalog() {
+        let env = |k: &str, default: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
         let td = tempfile::tempdir().unwrap();
-        let store = CatalogStore::open(td.path().join(CATALOG_STORE))
-            .unwrap()
-            .with_cache_inodes(4096);
-        let dirs: u64 = std::env::var("BENCH_DIRS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+        let store = CatalogStore::open_with_cache(
+            td.path().join(CATALOG_STORE),
+            env("BENCH_STORE_CACHE", DEFAULT_STORE_CACHE_BYTES as u64) as usize,
+        )
+        .unwrap()
+        .with_cache_inodes(env("BENCH_CACHE_INODES", 4096) as usize);
+        let dirs = env("BENCH_DIRS", 1);
         let mut c = Catalog::default();
         let mut index = 0;
         let mut apply = |c: &mut Catalog, op: FsOp| {

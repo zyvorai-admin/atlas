@@ -120,6 +120,8 @@ impl Cluster {
                     repair_interval_secs: 0,
                     gc_interval_secs: 0,
                     groups: 1,
+                    cache_inodes: atlas_native::store::DEFAULT_CACHE_INODES,
+                    store_cache_bytes: atlas_native::store::DEFAULT_STORE_CACHE_BYTES,
                 });
                 let listeners = Listeners {
                     http: Some(bind()),
