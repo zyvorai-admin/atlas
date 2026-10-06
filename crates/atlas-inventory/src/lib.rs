@@ -35,6 +35,7 @@ pub mod snapshots;
 pub mod tenants;
 pub mod tokens;
 pub mod users;
+pub mod volume_groups;
 
 /// True when `database_url` is a `postgres://`/`postgresql://` URL; false (SQLite) otherwise.
 /// The one place backend detection happens — everything else (`connect`, `migrate`, the state

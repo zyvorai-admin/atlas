@@ -398,3 +398,216 @@ async fn mirror_role(c: &reqwest::Client, base: &str, id: &str) -> (String, Stri
         m["state"].as_str().unwrap().into(),
     )
 }
+
+async fn insert_rbd_volume(pool: &sqlx::AnyPool, id: &str, native: &str) {
+    sqlx::query(
+        "INSERT INTO storage_volumes (id, tenant_id, backend_id, name, kind, size_bytes, state, backend_native_id)
+         VALUES ($1, 't', 'bkd_ceph_lab', $1, 'block', 1073741824, 'bound', $2)",
+    )
+    .bind(id)
+    .bind(native)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pool_mode_mirroring_requires_journal() {
+    let (addr, pool) = spawn().await;
+    let base = format!("http://{addr}/api/atlas/v1");
+    let c = reqwest::Client::new();
+    let peer = c
+        .post(format!("{base}/dr/peers"))
+        .json(&json!({ "name": "dc2" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(peer.status(), 201);
+    insert_rbd_volume(&pool, "pv1", "rbd:nvme/pimg").await;
+
+    let get: Value = c
+        .get(format!("{base}/dr/pools/nvme/mirroring"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(get["mode"], "image");
+
+    let bad = c
+        .put(format!("{base}/dr/pools/nvme/mirroring"))
+        .json(&json!({ "mode": "everything" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let set = c
+        .put(format!("{base}/dr/pools/nvme/mirroring"))
+        .json(&json!({ "mode": "pool" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 200);
+    let get: Value = c
+        .get(format!("{base}/dr/pools/nvme/mirroring"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(get["mode"], "pool");
+
+    // Pool mode mirrors journaling images only.
+    let snap = c
+        .post(format!("{base}/volumes/pv1/mirror?mode=snapshot"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 400);
+    let en = c
+        .post(format!("{base}/volumes/pv1/mirror?mode=journal"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(en.status(), 202);
+    let body: Value = en.json().await.unwrap();
+    assert_eq!(body["resource"]["pool_mode"], "pool");
+    let job: Value = c
+        .get(format!("{base}/jobs/{}", body["job_id"].as_str().unwrap()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["job_type"], "rbd.mirror");
+    let mirrors: Value = c
+        .get(format!("{base}/dr/mirrors"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mirrors[0]["mode"], "journal");
+}
+
+#[tokio::test]
+async fn volume_group_snapshot_and_rollback() {
+    let (addr, pool) = spawn().await;
+    let base = format!("http://{addr}/api/atlas/v1");
+    let c = reqwest::Client::new();
+    insert_rbd_volume(&pool, "g1", "rbd:nvme/db-data").await;
+    insert_rbd_volume(&pool, "g2", "rbd:nvme/db-wal").await;
+    insert_rbd_volume(&pool, "g3", "pvc:ns/claim").await;
+
+    let bad = c
+        .post(format!("{base}/volume-groups"))
+        .json(&json!({ "name": "db/1", "volume_ids": ["g1"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let not_rbd = c
+        .post(format!("{base}/volume-groups"))
+        .json(&json!({ "name": "db", "volume_ids": ["g1", "g3"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(not_rbd.status(), 400);
+
+    let created = c
+        .post(format!("{base}/volume-groups"))
+        .json(&json!({ "name": "db", "volume_ids": ["g1", "g2"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let g: Value = created.json().await.unwrap();
+    let gid = g["id"].as_str().unwrap().to_string();
+    assert_eq!(g["pool"], "nvme");
+
+    let again = c
+        .post(format!("{base}/volume-groups"))
+        .json(&json!({ "name": "other", "volume_ids": ["g2"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 409, "an image can be in one group");
+
+    let snap = c
+        .post(format!("{base}/volume-groups/{gid}/snapshots"))
+        .json(&json!({ "name": "cp1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 201);
+    let dup = c
+        .post(format!("{base}/volume-groups/{gid}/snapshots"))
+        .json(&json!({ "name": "cp1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dup.status(), 409);
+
+    let detail: Value = c
+        .get(format!("{base}/volume-groups/{gid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["members"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["members"][0]["rbd"], "nvme/db-data");
+    assert_eq!(detail["snapshots"][0]["name"], "cp1");
+
+    let unconfirmed = c
+        .post(format!("{base}/volume-groups/{gid}/snapshots/cp1/rollback"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unconfirmed.status(), 400);
+    let rb = c
+        .post(format!("{base}/volume-groups/{gid}/snapshots/cp1/rollback"))
+        .json(&json!({ "confirm": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rb.status(), 202);
+    let rb: Value = rb.json().await.unwrap();
+    let job: Value = c
+        .get(format!("{base}/jobs/{}", rb["job_id"].as_str().unwrap()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["job_type"], "rbd.group_rollback");
+
+    let del = c
+        .delete(format!("{base}/volume-groups/{gid}/snapshots/cp1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 200);
+    let del = c
+        .delete(format!("{base}/volume-groups/{gid}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 200);
+    let list: Value = c
+        .get(format!("{base}/volume-groups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.as_array().unwrap().is_empty());
+}

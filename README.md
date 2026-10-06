@@ -106,7 +106,7 @@ Everything below ran on real infrastructure in the Atlas lab. Lab verification i
 | DataBridge | Postgres, MariaDB and MongoDB through CDC and cutover on Rook Ceph ([DATABRIDGE.md](docs/DATABRIDGE.md)) |
 | Raw disk provisioning | ZFS pool created on a real disk through the console ([DISKS.md](docs/DISKS.md)) |
 
-**Not yet:** NVMe and RDMA benchmark numbers, an IO500 submission, GPUDirect Storage, and journal-mode RBD mirroring. They wait on benchmark hardware or are on the roadmap ([COMPARISON.md](docs/COMPARISON.md)).
+**Not yet:** NVMe and RDMA benchmark numbers, an IO500 submission, GPUDirect Storage, and cross-site mirroring of RBD consistency groups (not in any released Ceph). They wait on benchmark hardware or are on the roadmap ([COMPARISON.md](docs/COMPARISON.md)).
 
 ---
 

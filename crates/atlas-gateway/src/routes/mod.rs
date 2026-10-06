@@ -20,6 +20,7 @@ mod protection;
 mod rbd;
 mod rook;
 pub(crate) mod util;
+mod volume_groups;
 mod volumes;
 mod zfs;
 
@@ -47,6 +48,7 @@ use oidc::*;
 use protection::*;
 use rbd::*;
 use rook::*;
+use volume_groups::*;
 use volumes::*;
 use zfs::*;
 
@@ -86,6 +88,30 @@ pub fn router(state: AppState) -> Router {
         .route("/dr/mirrors/{id}/resync", post(resync_mirror))
         .route("/dr/mirrors/{id}/rpo", post(set_mirror_rpo))
         .route("/dr/failover", post(dr_failover))
+        .route(
+            "/dr/pools/{pool}/mirroring",
+            get(get_pool_mirroring).put(set_pool_mirroring),
+        )
+        .route(
+            "/volume-groups",
+            get(list_volume_groups).post(create_volume_group),
+        )
+        .route(
+            "/volume-groups/{id}",
+            get(get_volume_group).delete(delete_volume_group),
+        )
+        .route(
+            "/volume-groups/{id}/snapshots",
+            get(list_group_snapshots).post(create_group_snapshot),
+        )
+        .route(
+            "/volume-groups/{id}/snapshots/{snap}",
+            delete(delete_group_snapshot),
+        )
+        .route(
+            "/volume-groups/{id}/snapshots/{snap}/rollback",
+            post(rollback_group_snapshot),
+        )
         .route("/protection-status", get(list_protection_status))
         .route(
             "/volumes/{id}/mirror",

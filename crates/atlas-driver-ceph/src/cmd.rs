@@ -55,7 +55,8 @@ pub async fn rbd_snap_create(pool: &str, image: &str, snap: &str) -> Result<(), 
 }
 
 /// Day-2 cross-cluster DR: per-image RBD mirroring op — `rbd mirror image enable <pool>/<image>
-/// <mode>` / `disable` / `promote` [`--force`] / `demote` / `resync`. Real ops need a live second Ceph cluster
+/// <mode>` / `disable` / `promote` [`--force`] / `demote` / `resync`, or `join-pool` /
+/// `leave-pool` (enable / disable journaling, which is what mirrors an image in a pool-mode pool). Real ops need a live second Ceph cluster
 /// (see `docs/DR.md`). `force` only applies to `promote` (split-brain / non-clean failover).
 pub async fn rbd_mirror_op(
     op: &str,
@@ -64,6 +65,19 @@ pub async fn rbd_mirror_op(
     mode: &str,
     force: bool,
 ) -> Result<(), DriverError> {
+    match op {
+        "join-pool" => return rbd_enable_journaling(pool, image).await,
+        "leave-pool" => {
+            return run_rbd(&[
+                "feature",
+                "disable",
+                &format!("{pool}/{image}"),
+                "journaling",
+            ])
+            .await
+        }
+        _ => {}
+    }
     let spec = format!("{pool}/{image}");
     let args: Vec<String> = match op {
         "enable" => vec![
@@ -436,14 +450,75 @@ pub async fn rbd_mirror_image_status(
     rbd_cmd(&["mirror", "image", "status", &spec]).await
 }
 
+/// Mirroring mode of an RBD image (`journal` / `snapshot`) from `rbd info`, `None` when mirroring
+/// is not enabled on it.
+pub async fn rbd_mirror_mode(pool: &str, image: &str) -> Result<Option<String>, DriverError> {
+    let spec = format!("{pool}/{image}");
+    let v = rbd_cmd(&["info", &spec]).await?;
+    Ok(v.get("mirroring")
+        .filter(|m| m.get("state").and_then(|s| s.as_str()) == Some("enabled"))
+        .and_then(|m| m.get("mode"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string))
+}
+
+/// Whether every peer `rbd-mirror` client registered on this image's local journal has committed
+/// up to the local client's position (`rbd journal status`). Meaningful on the site that wrote the
+/// journal, i.e. the primary or the copy just demoted: `Some(true)` there means the peer replayed
+/// everything, including the demotion. `None` when the journal is empty here or has no peer.
+pub async fn rbd_journal_peers_replayed(
+    pool: &str,
+    image: &str,
+) -> Result<Option<bool>, DriverError> {
+    let v = rbd_cmd(&["journal", "status", "--pool", pool, "--image", image]).await?;
+    Ok(journal_peers_replayed(&v))
+}
+
+/// [`rbd_journal_peers_replayed`] on an already-parsed `rbd journal status --format json`.
+pub fn journal_peers_replayed(status: &serde_json::Value) -> Option<bool> {
+    let clients = status.get("registered_clients")?.as_array()?;
+    let positions = |c: &serde_json::Value| -> Vec<(u64, u64, u64)> {
+        let mut p: Vec<(u64, u64, u64)> = c
+            .pointer("/commit_position/object_positions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|o| {
+                        let n = |k: &str| o.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                        (n("object_number"), n("tag_tid"), n("entry_tid"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        p.sort_unstable();
+        p
+    };
+    let is_local = |c: &&serde_json::Value| c.get("id").and_then(|i| i.as_str()) == Some("");
+    let local = positions(clients.iter().find(is_local)?);
+    if local.is_empty() {
+        return None;
+    }
+    let mut peers = clients.iter().filter(|c| !is_local(c)).peekable();
+    peers.peek()?;
+    Some(peers.all(|c| positions(c) == local))
+}
+
 /// Why a non-forced promote of this site's non-primary copy would not be a clean failback, given
-/// its `rbd mirror image status` JSON; `None` when it is safe.
+/// its `rbd mirror image status` JSON and mirroring mode; `None` when it is safe.
 ///
-/// Ceph accepts a non-forced promote whenever the newest local mirror snapshot is a demotion,
-/// including when this site never ran `rbd-mirror` and so never replayed the peer's later writes
-/// (one-way topologies). Only the local daemon reporting `up` and "remote image demoted" shows
-/// that it has caught up with the peer's demotion.
-pub fn mirror_promote_blocker(status: &serde_json::Value) -> Option<String> {
+/// Snapshot mode: Ceph accepts a non-forced promote whenever the newest local mirror snapshot is a
+/// demotion, including when this site never ran `rbd-mirror` and so never replayed the peer's later
+/// writes (one-way topologies). Only the local daemon reporting `up` and "remote image demoted"
+/// shows that it has caught up with the peer's demotion.
+///
+/// Journal mode: once the peer is demoted this site reports "remote image is not primary" whether or
+/// not it replayed the peer's journal, so the status can't prove it. `peer_replayed` is the
+/// operator's confirmation that the peer's [`rbd_journal_peers_replayed`] was `true`.
+pub fn mirror_promote_blocker(
+    status: &serde_json::Value,
+    mode: &str,
+    peer_replayed: bool,
+) -> Option<String> {
     let state = status.get("state").and_then(|s| s.as_str()).unwrap_or("");
     let description = status
         .get("description")
@@ -454,6 +529,25 @@ pub fn mirror_promote_blocker(status: &serde_json::Value) -> Option<String> {
             "no rbd-mirror daemon is replaying this image here (state '{state}'); this site may \
              be missing the peer's writes"
         ));
+    }
+    if mode == "journal" {
+        if !(description.contains("remote image is not primary")
+            || description.contains("remote image demoted"))
+        {
+            return Some(format!(
+                "the peer has not demoted its copy, or this site is still replaying its journal \
+                 (state '{state}', '{description}')"
+            ));
+        }
+        if !peer_replayed {
+            return Some(
+                "journal mode: this site's status can't show whether it replayed the peer's \
+                 journal; confirm the peer's GET /dr/mirrors/{id}/status reports \
+                 journal_peers_replayed: true, then promote with peer_replayed=1"
+                    .to_string(),
+            );
+        }
+        return None;
     }
     if !description.contains("remote image demoted") {
         return Some(format!(
@@ -686,6 +780,153 @@ pub async fn rbd_import_diff(pool: &str, image: &str, data: Vec<u8>) -> Result<(
     Ok(())
 }
 
+/// Run `rbd <args...>` for its side effect; stderr becomes the error.
+async fn run_rbd(args: &[&str]) -> Result<(), DriverError> {
+    let output = cmd("rbd")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| DriverError::Unreachable(format!("failed to spawn `rbd`: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(DriverError::Backend(format!(
+            "rbd {}: {stderr}",
+            args.join(" ")
+        )));
+    }
+    Ok(())
+}
+
+/// Pool-level mirroring configuration (`rbd mirror pool info <pool> --format json`): `mode` is
+/// `disabled`, `image` (per-image opt-in) or `pool` (every journaling image is mirrored).
+pub async fn rbd_mirror_pool_info(pool: &str) -> Result<serde_json::Value, DriverError> {
+    rbd_cmd(&["mirror", "pool", "info", pool]).await
+}
+
+/// Set a pool's mirroring mode: `rbd mirror pool enable <pool> image|pool`. On Rook the
+/// CephBlockPool's `spec.mirroring.mode` is the source of truth and is re-applied on reconcile.
+pub async fn rbd_mirror_pool_enable(pool: &str, mode: &str) -> Result<(), DriverError> {
+    if !matches!(mode, "image" | "pool") {
+        return Err(DriverError::Backend(format!(
+            "pool mirror mode must be image or pool, got {mode}"
+        )));
+    }
+    run_rbd(&["mirror", "pool", "enable", pool, mode]).await
+}
+
+/// Enable the `journaling` feature (which needs `exclusive-lock`) unless the image already has it.
+/// In a pool-mode pool this is what puts an image under mirroring.
+pub async fn rbd_enable_journaling(pool: &str, image: &str) -> Result<(), DriverError> {
+    let spec = format!("{pool}/{image}");
+    let info = rbd_cmd(&["info", &spec]).await?;
+    let has = |f: &str| {
+        info.get("features")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(f)))
+    };
+    if has("journaling") {
+        return Ok(());
+    }
+    if !has("exclusive-lock") {
+        run_rbd(&["feature", "enable", &spec, "exclusive-lock"]).await?;
+    }
+    run_rbd(&["feature", "enable", &spec, "journaling"]).await
+}
+
+/// Take a mirror snapshot of a snapshot-mode primary now (`rbd mirror image snapshot`), so the
+/// peer syncs everything up to this point, including user and group snapshots taken before it.
+pub async fn rbd_mirror_image_snapshot(pool: &str, image: &str) -> Result<(), DriverError> {
+    let spec = format!("{pool}/{image}");
+    run_rbd(&["mirror", "image", "snapshot", &spec]).await
+}
+
+/// `rbd group create <pool>/<group>`.
+pub async fn rbd_group_create(pool: &str, group: &str) -> Result<(), DriverError> {
+    run_rbd(&["group", "create", &format!("{pool}/{group}")]).await
+}
+
+/// `rbd group remove <pool>/<group>`: removes the group, never its images.
+pub async fn rbd_group_remove(pool: &str, group: &str) -> Result<(), DriverError> {
+    run_rbd(&["group", "remove", &format!("{pool}/{group}")]).await
+}
+
+/// `rbd group image add <pool>/<group> <image_pool>/<image>`.
+pub async fn rbd_group_image_add(
+    pool: &str,
+    group: &str,
+    image_pool: &str,
+    image: &str,
+) -> Result<(), DriverError> {
+    run_rbd(&[
+        "group",
+        "image",
+        "add",
+        &format!("{pool}/{group}"),
+        &format!("{image_pool}/{image}"),
+    ])
+    .await
+}
+
+/// `rbd group image remove <pool>/<group> <image_pool>/<image>`.
+pub async fn rbd_group_image_remove(
+    pool: &str,
+    group: &str,
+    image_pool: &str,
+    image: &str,
+) -> Result<(), DriverError> {
+    run_rbd(&[
+        "group",
+        "image",
+        "remove",
+        &format!("{pool}/{group}"),
+        &format!("{image_pool}/{image}"),
+    ])
+    .await
+}
+
+/// `rbd group snap create <pool>/<group>@<snap>`: one crash-consistent point across every member
+/// (librbd quiesces and blocks writes to all of them while the member snapshots are taken).
+pub async fn rbd_group_snap_create(pool: &str, group: &str, snap: &str) -> Result<(), DriverError> {
+    run_rbd(&["group", "snap", "create", &format!("{pool}/{group}@{snap}")]).await
+}
+
+/// `rbd group snap remove <pool>/<group>@<snap>`.
+pub async fn rbd_group_snap_remove(pool: &str, group: &str, snap: &str) -> Result<(), DriverError> {
+    run_rbd(&["group", "snap", "remove", &format!("{pool}/{group}@{snap}")]).await
+}
+
+/// `rbd group snap rollback <pool>/<group>@<snap>`: every member back to that point (destructive;
+/// the images must not be in use).
+pub async fn rbd_group_snap_rollback(
+    pool: &str,
+    group: &str,
+    snap: &str,
+) -> Result<(), DriverError> {
+    run_rbd(&[
+        "group",
+        "snap",
+        "rollback",
+        &format!("{pool}/{group}@{snap}"),
+    ])
+    .await
+}
+
+/// `rbd group snap list <pool>/<group> --format json`.
+pub async fn rbd_group_snap_list(
+    pool: &str,
+    group: &str,
+) -> Result<serde_json::Value, DriverError> {
+    rbd_cmd(&["group", "snap", "list", &format!("{pool}/{group}")]).await
+}
+
+/// `rbd group image list <pool>/<group> --format json`.
+pub async fn rbd_group_image_list(
+    pool: &str,
+    group: &str,
+) -> Result<serde_json::Value, DriverError> {
+    rbd_cmd(&["group", "image", "list", &format!("{pool}/{group}")]).await
+}
+
 async fn run_json(bin: &str, args: &[&str]) -> Result<serde_json::Value, DriverError> {
     let output = cmd(bin)
         .args(args)
@@ -712,24 +953,69 @@ async fn run_json(bin: &str, args: &[&str]) -> Result<serde_json::Value, DriverE
 
 #[cfg(test)]
 mod tests {
-    use super::mirror_promote_blocker;
+    use super::{journal_peers_replayed, mirror_promote_blocker};
     use serde_json::json;
 
     #[test]
     fn promote_is_clean_only_after_replaying_the_peer_demotion() {
         let ready = json!({ "state": "up+unknown", "description": "remote image demoted" });
-        assert_eq!(mirror_promote_blocker(&ready), None);
+        assert_eq!(mirror_promote_blocker(&ready, "snapshot", false), None);
 
         let replaying = json!({ "state": "up+replaying", "description": "replaying, {}" });
-        assert!(mirror_promote_blocker(&replaying)
+        assert!(mirror_promote_blocker(&replaying, "snapshot", false)
             .unwrap()
             .contains("not demoted"));
 
         let no_daemon = json!({ "state": "down+unknown", "description": "remote image demoted" });
-        assert!(mirror_promote_blocker(&no_daemon)
+        assert!(mirror_promote_blocker(&no_daemon, "snapshot", false)
             .unwrap()
             .contains("no rbd-mirror daemon"));
 
-        assert!(mirror_promote_blocker(&json!({})).is_some());
+        assert!(mirror_promote_blocker(&json!({}), "snapshot", false).is_some());
+
+        let not_primary =
+            json!({ "state": "up+unknown", "description": "remote image is not primary" });
+        assert!(mirror_promote_blocker(&not_primary, "snapshot", true).is_some());
+    }
+
+    #[test]
+    fn journal_promote_needs_the_peer_confirmation() {
+        let caught_up =
+            json!({ "state": "up+unknown", "description": "remote image is not primary" });
+        assert!(mirror_promote_blocker(&caught_up, "journal", false)
+            .unwrap()
+            .contains("peer_replayed=1"));
+        assert_eq!(mirror_promote_blocker(&caught_up, "journal", true), None);
+
+        let replaying = json!({ "state": "up+replaying", "description": "replaying, {}" });
+        assert!(mirror_promote_blocker(&replaying, "journal", true).is_some());
+        let down = json!({ "state": "down+stopped", "description": "remote image is not primary" });
+        assert!(mirror_promote_blocker(&down, "journal", true).is_some());
+    }
+
+    #[test]
+    fn journal_peers_replayed_compares_commit_positions() {
+        let pos = |e: u64| {
+            json!({ "object_positions": [
+                { "object_number": 0, "tag_tid": 5, "entry_tid": 0 },
+                { "object_number": 3, "tag_tid": 3, "entry_tid": e },
+            ]})
+        };
+        let status = |peer: u64| {
+            json!({ "registered_clients": [
+                { "id": "", "commit_position": pos(523) },
+                { "id": "612bd1f5", "commit_position": pos(peer) },
+            ]})
+        };
+        assert_eq!(journal_peers_replayed(&status(523)), Some(true));
+        assert_eq!(journal_peers_replayed(&status(111)), Some(false));
+
+        let empty = json!({ "registered_clients": [
+            { "id": "", "commit_position": { "object_positions": [] } },
+            { "id": "db204098", "commit_position": { "object_positions": [] } },
+        ]});
+        assert_eq!(journal_peers_replayed(&empty), None);
+        let no_peer = json!({ "registered_clients": [{ "id": "", "commit_position": pos(1) }] });
+        assert_eq!(journal_peers_replayed(&no_peer), None);
     }
 }

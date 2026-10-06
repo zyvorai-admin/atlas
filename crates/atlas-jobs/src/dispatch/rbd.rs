@@ -315,11 +315,11 @@ pub(crate) async fn dispatch_rbd(
                         atlas_inventory::dr::set_mirror(pool, &mirror_id, "secondary", "enabled")
                             .await?;
                     }
-                    "disable" => {
+                    "disable" | "leave-pool" => {
                         atlas_inventory::dr::set_mirror(pool, &mirror_id, "primary", "disabled")
                             .await?;
                     }
-                    "enable" => {
+                    "enable" | "join-pool" => {
                         atlas_inventory::dr::set_mirror_state(pool, &mirror_id, "enabled").await?;
                     }
                     _ => {}
@@ -343,6 +343,20 @@ pub(crate) async fn dispatch_rbd(
                     .with_context(|| format!("rbd snap create {rbd_pool}/{image}@{snap}"))?;
             }
             Ok(serde_json::json!({ "snapshot": format!("{rbd_pool}/{image}@{snap}") }))
+        }
+        JobSpec::RbdGroupRollback {
+            pool: rbd_pool,
+            group,
+            snap,
+        } => {
+            if !is_fake_ceph_mode() {
+                atlas_driver_ceph::rbd_group_snap_rollback(&rbd_pool, &group, &snap)
+                    .await
+                    .with_context(|| format!("rbd group snap rollback {rbd_pool}/{group}@{snap}"))?;
+            }
+            Ok(serde_json::json!({
+                "group": format!("{rbd_pool}/{group}"), "rolled_back_to": snap
+            }))
         }
         JobSpec::RbdRollback {
             pool: rbd_pool,

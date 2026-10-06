@@ -434,11 +434,36 @@ enum Command {
     DrMirrors,
     /// GET /api/atlas/v1/dr/mirrors/{id}/status — live rbd status and whether a promote is clean
     DrMirrorStatus { id: String },
-    /// POST /api/atlas/v1/dr/mirrors/{id}/promote [--force]
+    /// GET /api/atlas/v1/dr/pools/{pool}/mirroring — pool mirroring mode and peers
+    DrPoolMirroring { pool: String },
+    /// PUT /api/atlas/v1/dr/pools/{pool}/mirroring — set the pool mode (`image` or `pool`)
+    DrSetPoolMirroring { pool: String, mode: String },
+    /// GET /api/atlas/v1/volume-groups
+    VolumeGroups,
+    /// POST /api/atlas/v1/volume-groups — consistency group from direct-RBD volumes
+    VolumeGroupCreate {
+        name: String,
+        #[arg(required = true)]
+        volume_ids: Vec<String>,
+    },
+    /// GET /api/atlas/v1/volume-groups/{id}
+    VolumeGroup { id: String },
+    /// DELETE /api/atlas/v1/volume-groups/{id} (the volumes stay)
+    VolumeGroupDelete { id: String },
+    /// POST /api/atlas/v1/volume-groups/{id}/snapshots — crash-consistent snapshot of every member
+    VolumeGroupSnapshot { id: String, name: String },
+    /// DELETE /api/atlas/v1/volume-groups/{id}/snapshots/{name}
+    VolumeGroupSnapshotDelete { id: String, name: String },
+    /// POST /api/atlas/v1/volume-groups/{id}/snapshots/{name}/rollback — destructive
+    VolumeGroupRollback { id: String, name: String },
+    /// POST /api/atlas/v1/dr/mirrors/{id}/promote [--force] [--peer-replayed]
     DrPromote {
         id: String,
         #[arg(long)]
         force: bool,
+        /// Journal mode: the peer reported journal_peers_replayed: true
+        #[arg(long)]
+        peer_replayed: bool,
     },
     /// POST /api/atlas/v1/dr/mirrors/{id}/demote
     DrDemote { id: String },
@@ -447,6 +472,8 @@ enum Command {
         mirror_id: String,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        peer_replayed: bool,
     },
     /// POST /api/atlas/v1/dr/mirrors/{id}/rpo
     DrSetRpo {
@@ -999,9 +1026,50 @@ async fn main() -> Result<()> {
         Command::DrMirrorStatus { id } => {
             ("GET", format!("/api/atlas/v1/dr/mirrors/{id}/status"), None)
         }
-        Command::DrPromote { id, force } => (
+        Command::DrPoolMirroring { pool } => (
+            "GET",
+            format!("/api/atlas/v1/dr/pools/{pool}/mirroring"),
+            None,
+        ),
+        Command::DrSetPoolMirroring { pool, mode } => (
+            "PUT",
+            format!("/api/atlas/v1/dr/pools/{pool}/mirroring"),
+            Some(serde_json::json!({ "mode": mode })),
+        ),
+        Command::VolumeGroups => ("GET", "/api/atlas/v1/volume-groups".to_string(), None),
+        Command::VolumeGroupCreate { name, volume_ids } => (
             "POST",
-            format!("/api/atlas/v1/dr/mirrors/{id}/promote?force={force}"),
+            "/api/atlas/v1/volume-groups".to_string(),
+            Some(serde_json::json!({ "name": name, "volume_ids": volume_ids })),
+        ),
+        Command::VolumeGroup { id } => ("GET", format!("/api/atlas/v1/volume-groups/{id}"), None),
+        Command::VolumeGroupDelete { id } => {
+            ("DELETE", format!("/api/atlas/v1/volume-groups/{id}"), None)
+        }
+        Command::VolumeGroupSnapshot { id, name } => (
+            "POST",
+            format!("/api/atlas/v1/volume-groups/{id}/snapshots"),
+            Some(serde_json::json!({ "name": name })),
+        ),
+        Command::VolumeGroupSnapshotDelete { id, name } => (
+            "DELETE",
+            format!("/api/atlas/v1/volume-groups/{id}/snapshots/{name}"),
+            None,
+        ),
+        Command::VolumeGroupRollback { id, name } => (
+            "POST",
+            format!("/api/atlas/v1/volume-groups/{id}/snapshots/{name}/rollback"),
+            Some(serde_json::json!({ "confirm": true })),
+        ),
+        Command::DrPromote {
+            id,
+            force,
+            peer_replayed,
+        } => (
+            "POST",
+            format!(
+                "/api/atlas/v1/dr/mirrors/{id}/promote?force={force}&peer_replayed={peer_replayed}"
+            ),
             None,
         ),
         Command::DrDemote { id } => (
@@ -1009,11 +1077,16 @@ async fn main() -> Result<()> {
             format!("/api/atlas/v1/dr/mirrors/{id}/demote"),
             None,
         ),
-        Command::DrFailover { mirror_id, force } => (
+        Command::DrFailover {
+            mirror_id,
+            force,
+            peer_replayed,
+        } => (
             "POST",
             "/api/atlas/v1/dr/failover".to_string(),
             Some(serde_json::json!({
-                "mirror_id": mirror_id, "confirm": true, "force": force
+                "mirror_id": mirror_id, "confirm": true, "force": force,
+                "peer_replayed": peer_replayed
             })),
         ),
         Command::DrSetRpo { id, rpo_seconds } => (
