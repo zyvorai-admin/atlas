@@ -42,7 +42,7 @@ const FeatureList: FeatureItem[] = [
     eyebrow: 'Day-2 and DR',
     title: 'Fail over. Fail back cleanly.',
     description:
-      'Alerts, maintenance, quotas, upgrade preflight, two-way RBD mirroring with a guarded failback, and native replication to a second site.',
+      'Alerts, maintenance, quotas, upgrade preflight, two-way RBD mirroring (snapshot, journal and pool modes) with a guarded failback, RBD consistency groups, and native replication to a second site.',
     to: '/gallery',
     cta: 'See the console',
   },

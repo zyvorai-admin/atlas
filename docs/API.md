@@ -192,15 +192,17 @@ Run the alert rules on demand (also runs every `ATLAS_MONITOR_INTERVAL_SECS`).
 
 ### Cross-cluster DR (RBD mirroring, admin, day-2)
 > Control-plane catalog + hardened failover API. One-way and two-way (`rx-tx`) `rbd mirror` with
-> clean failback were verified live between two Rook clusters (see [DR.md](DR.md)). Fake mode skips
+> clean failback, journal and pool modes, and local consistency groups were verified live between two Rook clusters (see [DR.md](DR.md)). Fake mode skips
 > the CLI so drills succeed.
 - `POST /api/atlas/v1/dr/peers` · `GET /dr/peers` · `DELETE /dr/peers/{id}` — peer catalog (`secret_ref` only).
-- `POST /api/atlas/v1/volumes/{id}/mirror?mode=snapshot&peer=<id>` · `DELETE .../mirror` — enable / disable (peer required).
+- `POST /api/atlas/v1/volumes/{id}/mirror?mode=snapshot|journal&peer=<id>` · `DELETE .../mirror` — enable / disable (peer required).
 - `GET /api/atlas/v1/dr/mirrors` · `GET /dr/status` · `GET /dr/preflight` — catalog, posture, checklist.
-- `GET /api/atlas/v1/dr/mirrors/{id}/status` — live `rbd mirror image status`, `promote_ready`, `promote_blocker`.
-- `POST /api/atlas/v1/dr/mirrors/{id}/promote?force=0|1` · `/demote` · `/resync` — failover with role guards; in real mode a
-  non-forced promote is 409 until this site has replayed the peer's demotion.
-- `POST /api/atlas/v1/dr/failover` `{ mirror_id, confirm: true, force? }` — confirm-gated runbook.
+- `GET /api/atlas/v1/dr/mirrors/{id}/status` — live `rbd mirror image status`, `promote_ready`, `promote_blocker`;
+  journal mode adds `journal_peers_replayed` (read it on the demoted site).
+- `POST /api/atlas/v1/dr/mirrors/{id}/promote?force=0|1&peer_replayed=0|1` · `/demote` · `/resync` — failover with role guards;
+  in real mode a non-forced promote is 409 until this site has replayed the peer's demotion. In journal mode it also
+  needs `peer_replayed=1`, after the peer reports `journal_peers_replayed: true`.
+- `POST /api/atlas/v1/dr/failover` `{ mirror_id, confirm: true, force?, peer_replayed? }` — confirm-gated runbook.
 - `POST /api/atlas/v1/dr/mirrors/{id}/rpo` `{ rpo_seconds }` — record observed RPO.
 - `GET /api/atlas/v1/dr/pools/{pool}/mirroring` · `PUT ... {"mode":"image"|"pool"|"disabled"}` — pool mirroring mode
   (live `rbd mirror pool info` in real mode). In a `pool`-mode pool only `mode=journal` image enables are accepted.
