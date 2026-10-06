@@ -78,8 +78,11 @@ username/password, verified live against a throwaway Dex instance, `deploy/dex-l
 Vault-backed secrets resolution at startup, `docs/SECRETS.md`), volume lifecycle (orphan GC,
 QoS), DataBridge CDC self-heal, upgrade pre-flight + rollback, k6 load/performance testing
 (read-path + write-path), and cross-cluster DR (RBD-mirroring peers/mirrors/failover/resync API +
-jobs, **verified live between two Rook clusters** on 2026-10-04: one-way snapshot mirroring,
-planned failover, split-brain recovery — `docs/DR.md`, `deploy/rook-ceph-dr-lab/`).
+jobs, **verified live between two Rook clusters**: one-way snapshot mirroring, planned failover
+and split-brain recovery on 2026-10-04; two-way (`rx-tx`) mirroring with clean failback on
+2026-10-06, where a non-forced promote is refused until `rbd mirror image status` shows this site
+replayed the peer's demotion (`GET /dr/mirrors/{id}/status`) — `docs/DR.md`,
+`deploy/rook-ceph-dr-lab/`).
 
 **Observe-first storage I/O sensor** (`docs/IO_EBPF.md`): `atlas-io` is a separate, optional node
 agent (`atlas-io-agent`, own Dockerfile.io/DaemonSet, `deploy/k8s/atlas-io-agent.yaml`) — kept out of
@@ -113,8 +116,8 @@ Production License v1.0 at the maintainer's explicit request — history in
 [`CLA.md`](CLA.md), [`DCO.md`](DCO.md), or [`NOTICE`](NOTICE) without an explicit human
 request. There is **no** runtime license-key or trial/JWT gate.
 
-Deferred: two-way (`rx-tx`) RBD mirroring with clean failback (the DR lab is one-way), per-product
-integrations beyond the gRPC surface.
+Deferred: journal-mode and pool-mode RBD mirroring, per-product integrations beyond the gRPC
+surface.
 
 ## Layout
 - `crates/atlas-common` — config, error, tracing, id helpers.

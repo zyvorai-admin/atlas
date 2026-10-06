@@ -15,7 +15,7 @@ use super::util::accepted;
 use crate::auth::Actor;
 use crate::state::AppState;
 
-// ---- cross-cluster DR (RBD mirroring; scaffolding — real ops UNVERIFIED without a 2nd cluster) ----
+// ---- cross-cluster DR (RBD mirroring; real ops drilled two-way on a lab, see docs/DR.md) ----
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PeerBody {
@@ -332,6 +332,50 @@ pub(crate) async fn promote_mirror(
     mirror_role_op(&s, &actor, &id, "promote", q.force.unwrap_or(false)).await
 }
 
+/// `GET /dr/mirrors/{id}/status` — live `rbd mirror image status` of this site's copy and whether a
+/// non-forced promote would be a clean failback (operator).
+pub(crate) async fn mirror_status(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_OPERATOR)?;
+    let (rbd_pool, image, role, state) = atlas_inventory::dr::mirror_detail(&s.pool, &id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("mirror {id}")))?;
+    let real = matches!(
+        s.config.ceph_driver_mode,
+        atlas_common::config::CephDriverMode::Real
+    );
+    let (live, blocker) = if real {
+        let status = atlas_driver_ceph::rbd_mirror_image_status(&rbd_pool, &image)
+            .await
+            .map_err(|e| {
+                AppError::Unavailable(format!("rbd mirror image status {rbd_pool}/{image}: {e}"))
+            })?;
+        let blocker = atlas_driver_ceph::mirror_promote_blocker(&status);
+        let live = json!({
+            "state": status.get("state"),
+            "description": status.get("description"),
+            "last_update": status.get("last_update"),
+            "peer_sites": status.get("peer_sites"),
+        });
+        (Some(live), blocker)
+    } else {
+        (None, None)
+    };
+    let blocker = if role != "secondary" {
+        Some(format!("this site's copy is {role}"))
+    } else {
+        blocker
+    };
+    Ok(Json(json!({
+        "mirror_id": id, "rbd": format!("{rbd_pool}/{image}"),
+        "role": role, "state": state, "live": live,
+        "promote_ready": blocker.is_none(), "promote_blocker": blocker,
+    })))
+}
+
 /// `POST /dr/mirrors/{id}/demote` — demote this cluster's copy to secondary (admin).
 pub(crate) async fn demote_mirror(
     State(s): State<AppState>,
@@ -394,6 +438,20 @@ pub(crate) async fn mirror_role_op(
         s.config.ceph_driver_mode,
         atlas_common::config::CephDriverMode::Real
     );
+    if real && action == "promote" && !force {
+        let status = atlas_driver_ceph::rbd_mirror_image_status(&rbd_pool, &image)
+            .await
+            .map_err(|e| {
+                AppError::Unavailable(format!("rbd mirror image status {rbd_pool}/{image}: {e}"))
+            })?;
+        if let Some(blocker) = atlas_driver_ceph::mirror_promote_blocker(&status) {
+            return Err(AppError::Conflict(format!(
+                "promoting {rbd_pool}/{image} would not be a clean failback: {blocker}; demote \
+                 the peer and wait for GET /dr/mirrors/{id}/status to report promote_ready, or \
+                 pass ?force=1 and resync the peer afterwards"
+            )));
+        }
+    }
     if !real {
         let new_role = if action == "promote" {
             "primary"

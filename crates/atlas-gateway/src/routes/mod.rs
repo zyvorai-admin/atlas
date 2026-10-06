@@ -80,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         .route("/dr/mirrors", get(list_dr_mirrors))
         .route("/dr/status", get(dr_status))
         .route("/dr/preflight", get(dr_preflight))
+        .route("/dr/mirrors/{id}/status", get(mirror_status))
         .route("/dr/mirrors/{id}/promote", post(promote_mirror))
         .route("/dr/mirrors/{id}/demote", post(demote_mirror))
         .route("/dr/mirrors/{id}/resync", post(resync_mirror))
