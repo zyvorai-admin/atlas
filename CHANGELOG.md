@@ -14,10 +14,20 @@ before `0.2.0` were not tracked here — see `git log` for that history.
 - **Observe-first storage I/O sensor** (`crates/atlas-io`, binary `atlas-io-agent`):
   in-process bio pipeline (log2-µs histograms, cgroup/pid attribution, device→volume
   map, deterministic RCA, time-limited write-freeze leases that fail open). Default
-  `ATLAS_IO_MODE=fake` so CI never needs `CAP_BPF`. Live mode reports programs as
-  missing until a CO-RE loader ships. Contract C sources live in
+  `ATLAS_IO_MODE=fake` so CI never needs `CAP_BPF`. Contract C sources live in
   `crates/atlas-io/bpf/`. `atlasctl io health|summary|histograms|workloads|rca|coverage|leases`.
   Optional DaemonSet: `deploy/k8s/atlas-io-agent.yaml`. See [docs/IO_EBPF.md](docs/IO_EBPF.md).
+- **Live eBPF attach for `atlas-io`** (`bpf` feature, aya/CO-RE): block-layer tracepoints with
+  queue time and error codes, plus the Atlas Native eBPF maps (per-process stats and a slow-I/O ring
+  buffer), `GET /io/native`, `atlas_io_native_*` metrics and `atlasctl io native`. NFS, ZFS,
+  io_uring and per-cgroup programs are still reported missing. Verified on a lab host (kernel 7.0).
+- **Journal-mode and pool-mode RBD mirroring**: `mode=journal` enables and
+  `GET`/`PUT /dr/pools/{pool}/mirroring`. A non-forced journal-mode promote needs
+  `peer_replayed=1`, backed by `journal_peers_replayed` on the demoted site. Verified on the
+  two-site Rook lab (`docs/DR.md`).
+- **RBD consistency groups** (`/volume-groups`): crash-consistent group snapshots and a
+  confirm-gated rollback job; migration `0035`. Local to one cluster; no released Ceph mirrors
+  `rbd group`s across sites.
 
 ### Removed
 - First-party **RustFS** product integration: `atlas-driver-rustfs`, Storage → RustFS console,
@@ -32,6 +42,11 @@ before `0.2.0` were not tracked here — see `git log` for that history.
   (they are rejected with a clear error), plus the rejection of the `bkd_rustfs_lab` backend id.
 
 ### Fixed
+- `POST /dr/mirrors/{id}/promote?force=1` was rejected with a 400 even though the docs and the
+  guard's error message say to use it. `force` and `peer_replayed` now accept `0`, `1`, `false`
+  and `true`.
+- DataBridge docs and the console's engine table still called MySQL CDC-only and SQL Server and
+  Oracle discovery-only; all six engines were verified through cutover on 2026-10-04.
 - The Helm chart's `s3.caSecretName` (trust a private CA for a bring-your-own S3 endpoint) set
   `ATLAS_S3_CA_CERT`, but the code only read the legacy `ATLAS_RUSTFS_CA_CERT`, so the setting had no
   effect. The code now reads `ATLAS_S3_CA_CERT`. **If you set `ATLAS_RUSTFS_CA_CERT` directly, rename it.**
