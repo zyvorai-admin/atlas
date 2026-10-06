@@ -23,3 +23,6 @@ crates/atlas-gateway/ui/coverage/
 
 # cargo-llvm-cov output
 /lcov.info
+
+# IO500 runs (scripts/io500-native-remote.sh)
+/io500-results/
