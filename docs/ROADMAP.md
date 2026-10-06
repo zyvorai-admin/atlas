@@ -619,10 +619,11 @@ no model required for the default path. See [AI_ADVISOR.md](AI_ADVISOR.md).
 
 ## Known limitations (current)
 
-- **DR data-plane unverified**: RBD-mirroring catalog, failover API, and jobs are complete and
-  fake-mode-tested, but the real `rbd mirror` CLI paths need a live second Ceph cluster to be
-  production-verified (`dataplane_verified` is hard-coded `false` until that drill runs). See
-  [DR.md](DR.md).
+- **DR data plane verified on a lab, not per deployment**: the real `rbd mirror` paths, including
+  two-way mirroring and clean failback, were drilled between two Rook clusters on 2026-10-04 and
+  2026-10-06. `dataplane_verified` stays a per-deployment flag (`ATLAS_DR_DATAPLANE_VERIFIED`) that
+  an operator sets after drilling their own sites. Journal-mode and pool-mode mirroring are
+  unverified. See [DR.md](DR.md).
 - **RustFS removed**: Atlas's first-party RustFS integration (driver, admin proxy, Helm chart,
   console pages, drive/instance install jobs) was later discarded in favor of Ceph RGW as the
   default object backend, with any S3-compatible endpoint usable as a bring-your-own backend via

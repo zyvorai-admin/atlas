@@ -162,6 +162,17 @@ async fn dr_peer_mirror_and_failover() {
         202
     );
     assert_eq!(mirror(&c).await["role"], "secondary");
+    let st: Value = c
+        .get(format!("{base}/dr/mirrors/{mirror_id}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["role"], "secondary");
+    assert_eq!(st["promote_ready"], true);
+    assert!(st["live"].is_null(), "fake mode has no live rbd status");
     // Demoting again is a conflict.
     assert_eq!(
         c.post(format!("{base}/dr/mirrors/{mirror_id}/demote"))
@@ -181,6 +192,16 @@ async fn dr_peer_mirror_and_failover() {
         202
     );
     assert_eq!(mirror(&c).await["role"], "primary");
+    let st: Value = c
+        .get(format!("{base}/dr/mirrors/{mirror_id}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["promote_ready"], false);
+    assert_eq!(st["promote_blocker"], "this site's copy is primary");
     // Promoting an already-primary without force → 409.
     assert_eq!(
         c.post(format!("{base}/dr/mirrors/{mirror_id}/promote"))

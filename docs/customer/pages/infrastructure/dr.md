@@ -21,7 +21,9 @@ Cross-cluster RBD mirroring — peers, mirrors, promote/demote/failover.
 
 1. Open `/dr` and read peers/mirrors + control-plane/dataplane readiness.
 2. Add peer; enable mirroring on images; Promote / Demote / Failover with confirms.
-3. Force promote only for split-brain recovery.
+3. Before failing back, demote the other site and wait until the mirror's status reports
+   `promote_ready`. Atlas refuses a normal promote until then. Force promote only for disasters
+   and split-brain recovery.
 4. **Empty / fail:** Dataplane unverified → need second Ceph site; peers=0 → add peer first.
 5. **Success:** Mirrors healthy; failover job succeeds when rehearsed.
 

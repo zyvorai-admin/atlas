@@ -426,6 +426,44 @@ pub async fn rbd_mirror_primary(pool: &str, image: &str) -> Result<Option<bool>,
         .and_then(|p| p.as_bool()))
 }
 
+/// This site's mirroring status for an image (`rbd mirror image status pool/image --format json`),
+/// as written by the local `rbd-mirror` daemon, plus what each peer site reports.
+pub async fn rbd_mirror_image_status(
+    pool: &str,
+    image: &str,
+) -> Result<serde_json::Value, DriverError> {
+    let spec = format!("{pool}/{image}");
+    rbd_cmd(&["mirror", "image", "status", &spec]).await
+}
+
+/// Why a non-forced promote of this site's non-primary copy would not be a clean failback, given
+/// its `rbd mirror image status` JSON; `None` when it is safe.
+///
+/// Ceph accepts a non-forced promote whenever the newest local mirror snapshot is a demotion,
+/// including when this site never ran `rbd-mirror` and so never replayed the peer's later writes
+/// (one-way topologies). Only the local daemon reporting `up` and "remote image demoted" shows
+/// that it has caught up with the peer's demotion.
+pub fn mirror_promote_blocker(status: &serde_json::Value) -> Option<String> {
+    let state = status.get("state").and_then(|s| s.as_str()).unwrap_or("");
+    let description = status
+        .get("description")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    if !state.starts_with("up+") {
+        return Some(format!(
+            "no rbd-mirror daemon is replaying this image here (state '{state}'); this site may \
+             be missing the peer's writes"
+        ));
+    }
+    if !description.contains("remote image demoted") {
+        return Some(format!(
+            "the peer has not demoted its copy, or this site has not replayed it yet \
+             (state '{state}', '{description}')"
+        ));
+    }
+    None
+}
+
 /// Actual used (allocated) bytes of every image in a pool (`rbd du pool --format json`), as
 /// `(image_name, used_size)` pairs. Used to enrich `rbd ls -l` (which has no `used_size` field).
 pub async fn rbd_du_pool(pool: &str) -> Result<Vec<(String, i64)>, DriverError> {
@@ -670,4 +708,28 @@ async fn run_json(bin: &str, args: &[&str]) -> Result<serde_json::Value, DriverE
 
     serde_json::from_slice(&output.stdout)
         .map_err(|e| DriverError::Parse(format!("`{bin}` json: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mirror_promote_blocker;
+    use serde_json::json;
+
+    #[test]
+    fn promote_is_clean_only_after_replaying_the_peer_demotion() {
+        let ready = json!({ "state": "up+unknown", "description": "remote image demoted" });
+        assert_eq!(mirror_promote_blocker(&ready), None);
+
+        let replaying = json!({ "state": "up+replaying", "description": "replaying, {}" });
+        assert!(mirror_promote_blocker(&replaying)
+            .unwrap()
+            .contains("not demoted"));
+
+        let no_daemon = json!({ "state": "down+unknown", "description": "remote image demoted" });
+        assert!(mirror_promote_blocker(&no_daemon)
+            .unwrap()
+            .contains("no rbd-mirror daemon"));
+
+        assert!(mirror_promote_blocker(&json!({})).is_some());
+    }
 }

@@ -432,6 +432,8 @@ enum Command {
     DrStatus,
     /// GET /api/atlas/v1/dr/mirrors
     DrMirrors,
+    /// GET /api/atlas/v1/dr/mirrors/{id}/status — live rbd status and whether a promote is clean
+    DrMirrorStatus { id: String },
     /// POST /api/atlas/v1/dr/mirrors/{id}/promote [--force]
     DrPromote {
         id: String,
@@ -991,6 +993,9 @@ async fn main() -> Result<()> {
         Command::DrPreflight => ("GET", "/api/atlas/v1/dr/preflight".to_string(), None),
         Command::DrStatus => ("GET", "/api/atlas/v1/dr/status".to_string(), None),
         Command::DrMirrors => ("GET", "/api/atlas/v1/dr/mirrors".to_string(), None),
+        Command::DrMirrorStatus { id } => {
+            ("GET", format!("/api/atlas/v1/dr/mirrors/{id}/status"), None)
+        }
         Command::DrPromote { id, force } => (
             "POST",
             format!("/api/atlas/v1/dr/mirrors/{id}/promote?force={force}"),

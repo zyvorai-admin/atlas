@@ -3,8 +3,8 @@
 # Cross-cluster DR (RBD mirroring)
 
 Atlas exposes a control-plane catalog and failover API for Ceph RBD mirroring. The real
-`rbd mirror` CLI paths run as jobs. They were verified live between two Rook Ceph clusters on
-2026-10-04 (see below). Fake mode (`ATLAS_CEPH_DRIVER_MODE=fake` / `make run`) exercises the full
+`rbd mirror` CLI paths run as jobs. One-way mirroring was verified live between two Rook Ceph
+clusters on 2026-10-04, and two-way mirroring with clean failback on 2026-10-06 (see below). Fake mode (`ATLAS_CEPH_DRIVER_MODE=fake` / `make run`) exercises the full
 API and catalog without calling `rbd`.
 
 For atlas-native filesystems, cross-cluster DR is asynchronous replication between two native
@@ -22,7 +22,8 @@ clusters instead: [`NATIVE_REPLICATION.md`](NATIVE_REPLICATION.md).
 | Live two-site `rbd mirror` peer bootstrap | **Verified** (2026-10-04, Rook `peers.secretNames`) |
 | Live enable / replicate / demote / failover through Atlas's API | **Verified** (2026-10-04) |
 | Secondary-site registration (`role=secondary`) + `resync` | **Verified** (2026-10-04) |
-| Two-way (`rx-tx`) replication, clean failback | Not run; the lab is one-way, see below |
+| Two-way (`rx-tx`) replication, clean failback | **Verified** (2026-10-06) |
+| Clean-failback guard on non-forced promote (`GET /dr/mirrors/{id}/status`) | **Verified** (2026-10-06) |
 
 `GET /dr/status` and `GET /dr/preflight` both expose `control_plane_ready` (catalog coherent) and
 `dataplane_verified`. The latter used to be a hard-coded `false`; it's now `Config::
@@ -30,6 +31,60 @@ dr_dataplane_verified` (env `ATLAS_DR_DATAPLANE_VERIFIED`, default `false`) — 
 toggle an operator sets only after *personally* completing the checklist below against their own
 real hardware, never a blanket product claim. Preflight `ready` means you can enqueue a failover
 **job**; it is not a claim that Ceph mirroring is live.
+
+### Clean-failback guard
+
+Ceph accepts a non-forced `rbd mirror image promote` whenever the image's newest mirror snapshot is
+a demotion. That includes a site that never replayed the peer's later writes, which is how the
+2026-10-04 one-way failback silently lost data (below). So in real mode Atlas reads
+`rbd mirror image status` before a non-forced promote and refuses it with 409 unless this site's
+`rbd-mirror` reports `up+…` and "remote image demoted". That status means the local daemon replayed
+the peer's demotion snapshot, so this copy holds everything the peer wrote.
+
+`GET /dr/mirrors/{id}/status` returns the live status plus `promote_ready` and `promote_blocker`.
+Poll it after demoting the peer. `?force=1` skips the check, for disasters where the peer is gone;
+resync the peer afterwards if it comes back.
+
+### 2026-10-06 two-way drill: verified
+
+This drill used two host-networked Rook clusters, `rook-ceph-dr` on each lab host (Squid 19.2.3,
+fsids `e03b3aca…` and `5fbcfa9a…`). Each cluster runs a `CephRBDMirror`, and each host's
+firewall opens the Ceph ports to the other host only. One Rook token import
+(`peers.secretNames` on the second site) registered an `rx-tx` peer on both sites. A
+real-Ceph Atlas gateway ran on each site. Everything below went through the `/dr/*` API, with
+`rbd bench` for writes and `rbd export | sha256sum` for checks.
+
+1. **Site A primary.** Peer, `POST /rbd-images`, and snapshot mirroring enabled on 1 GiB `tw-1`. Then
+   32 MiB of random 4K writes. Site B went `up+replaying`, and after the next 1-minute snapshot
+   both checksums matched. B was registered with `role=secondary`.
+2. **Guard, peer still primary.** A non-forced promote on B returned 409 (`up+replaying`, peer not
+   demoted).
+3. **Planned failover.** After `demote` on A, B reported `promote_ready` within 6 s
+   (`up+unknown`, "remote image demoted"), and a non-forced promote succeeded.
+4. **Writes on B replicate to A.** This is the step that one-way topology couldn't do. After 16 MiB
+   written on B, A replayed it and both checksums matched. A non-forced promote on A while B was
+   still primary returned 409.
+5. **Clean failback.** After `demote` on B, A was `promote_ready` in 7 s, and a non-forced promote
+   succeeded. A held all of B's writes, with no split-brain on either side. Then 8 MiB written on
+   A replicated back to B with matching checksums.
+6. **The 2026-10-04 failure, reproduced and blocked.** With A's `rbd-mirror` deleted, A was demoted,
+   B promoted, 4 MiB written on B, and B demoted. A's status was the stale `down+stopped` "local
+   image is primary", and Atlas refused the non-forced promote. Ceph itself would have accepted it
+   and lost the 4 MiB.
+
+Finding: a site whose daemon was down for the peer's whole primary period does **not** catch up
+after the peer demotes. Both images are then non-primary, both report `up+unknown` "remote image
+is not primary", and the guard blocks a non-forced promote on both sites. Atlas can't tell from
+status alone which copy is newer. The recovery that worked:
+
+- Force-promote the copy that took the last writes (`?force=1` on B).
+- A's daemon replayed B's writes without a resync, and the checksums matched.
+- Demote B again, then do a normal clean promote on A (ready in 18 s).
+
+The drill ended with A primary, B `up+replaying`, and identical checksums.
+
+Not covered: journal-mode and pool-mode mirroring, multi-image consistency groups, and RPO under
+sustained load. Both OSDs are 40 GB loop files on shared HDDs.
 
 ### 2026-10-04 live two-site drill: verified
 
@@ -78,8 +133,8 @@ Bugs found and fixed on the way:
   `rbd info` and returns 409, pointing at `role=secondary`.
 - There was no way to record the secondary side, and no `resync`. Both have been added.
 
-Not covered: two-way replication (it needs both clusters host-networked or otherwise mutually
-routable), journal-mode mirroring, and pool-mode mirroring. `rbd mirror image snapshot` (manual)
+Not covered then: two-way replication (it needs both clusters host-networked or otherwise mutually
+routable; done on 2026-10-06, above), journal-mode mirroring, and pool-mode mirroring. `rbd mirror image snapshot` (manual)
 segfaulted once in the gateway image's Squid client. Atlas doesn't call it; the pool's snapshot
 schedule takes the snapshots.
 
@@ -131,13 +186,16 @@ actually completed it.
 | `GET` | `/dr/mirrors` · `/dr/status` | Catalog + posture (`verified: false` until live) |
 | `GET` | `/dr/preflight` | Checklist before failover |
 | `POST` | `/dr/mirrors/{id}/demote` | Primary → secondary |
-| `POST` | `/dr/mirrors/{id}/promote?force=0\|1` | Secondary → primary (`force` = split-brain) |
+| `GET` | `/dr/mirrors/{id}/status` | Live `rbd mirror image status` + `promote_ready` / `promote_blocker` |
+| `POST` | `/dr/mirrors/{id}/promote?force=0\|1` | Secondary → primary; non-forced needs `promote_ready` in real mode (`force` = split-brain) |
 | `POST` | `/dr/mirrors/{id}/resync` | Discard this secondary copy and re-pull from the peer's primary |
 | `POST` | `/dr/failover` | `{ mirror_id, confirm: true, force? }` runbook |
 | `POST` | `/dr/mirrors/{id}/rpo` | `{ rpo_seconds }` observed RPO |
 
 Guards: promote of an already-primary mirror is **409** unless `?force=1`; demote of an already-secondary
-is **409**; resync of a primary is **409**; disabled mirrors cannot be promoted/demoted/resynced.
+is **409**; resync of a primary is **409**; disabled mirrors cannot be promoted/demoted/resynced; in
+real mode a non-forced promote is **409** until this site has replayed the peer's demotion (see
+"Clean-failback guard").
 
 ## Failover drill (fake)
 
@@ -157,8 +215,8 @@ curl -sS -X POST $B/dr/failover -H 'Content-Type: application/json' \
 ## Live two-site checklist (when a second cluster exists)
 
 1. Bootstrap RBD mirroring between sites (`rbd mirror pool peer bootstrap` / Rook CephRBDMirror).
-   The setup that worked (2026-10-04) is a host-networked primary plus Rook
-   `peers.secretNames` on the secondary; see `deploy/rook-ceph-dr-lab/`.
+   The setup that worked for two-way mirroring (2026-10-06) is two host-networked clusters, an
+   `rbd-mirror` on each, and one Rook `peers.secretNames` import; see `deploy/rook-ceph-dr-lab/`.
    **Gotcha (confirmed 2026-08-25):** the bootstrap token embeds the mon's address as whatever
    `mon_host` the local cluster resolves to — inside Kubernetes that's a ClusterIP, not routable
    from a genuinely separate cluster. Either NodePort/LoadBalancer-expose the mon (Rook won't do

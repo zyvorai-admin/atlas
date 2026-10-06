@@ -83,5 +83,6 @@ Delete the target VirtualMachine and its DataVolume. That is the rollback. There
 ## What not to say
 
 - Do not say the image was written by Atlas, resumed after a failure, or checksummed by Atlas.
-- Do not say the last DR drill passed. Two-site RBD mirroring is still unverified. See [DR.md](DR.md).
+- Do not say this demo's VM is protected by DR. Two-site RBD mirroring was verified on a lab pool,
+  not on the demo's disks. See [DR.md](DR.md).
 - Do not quote a savings percent. If someone asks about cost, use their cores, renewal, storage, support, and migration figures.
