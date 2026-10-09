@@ -3,8 +3,8 @@ sidebar_position: 1
 title: Quickstart
 ---
 
-{/* Copyright (c) 2026 ZyvorAI Labs Private Limited. */}
-{/* SPDX-License-Identifier: Apache-2.0 */}
+<!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Quickstart
 
@@ -26,6 +26,6 @@ Default console login is `admin` with the gateway password for your deployment
 # NodePort UI: http://<host>:30510
 ```
 
-See the repo [`README`](https://github.com/zyvorai/atlas#readme) and
-[`docs/DEPLOYMENT.md`](https://github.com/zyvorai/zyvor-atlas/blob/main/docs/DEPLOYMENT.md)
+See the repo [`README`](https://github.com/zyvorai/zyvor-atlas#readme) and
+[Deployment](./deployment.md)
 for Rook Ceph and real-Ceph gateway paths.

@@ -22,6 +22,8 @@ const config: Config = {
   onBrokenLinks: 'throw',
 
   markdown: {
+    // Synced engineering docs are plain CommonMark; render .md as such, .mdx as MDX.
+    format: 'detect',
     hooks: {
       onBrokenMarkdownLinks: 'warn',
     },
@@ -80,6 +82,11 @@ const config: Config = {
           position: 'right',
         },
         {
+          href: 'https://zyvor.dev/pricing?utm_source=github&utm_medium=atlas&utm_campaign=docs_site',
+          label: 'Pricing',
+          position: 'right',
+        },
+        {
           href: 'https://zyvor.dev',
           label: 'Enterprise',
           position: 'right',
@@ -92,6 +99,7 @@ const config: Config = {
         {
           title: 'Docs',
           items: [
+            {label: 'Overview', to: '/docs/'},
             {label: 'Quickstart', to: '/docs/getting-started/quickstart'},
             {label: 'Architecture', to: '/docs/core-concepts/architecture'},
             {label: 'API Reference', to: '/docs/api-reference'},

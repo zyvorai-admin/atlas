@@ -9,6 +9,7 @@ import Heading from '@theme/Heading';
 import FeatureHighlights from '@site/src/components/FeatureHighlights';
 import ScreenshotStrip from '@site/src/components/ScreenshotStrip';
 import Reveal from '@site/src/components/Reveal';
+import {AnimatedFeatures, Compare, PromoteDemo, StatsBand, TypedTerminal} from '@site/src/components/Landing';
 
 import styles from './index.module.css';
 
@@ -42,6 +43,7 @@ function HomepageHeader() {
             View on GitHub
           </Link>
         </div>
+        <TypedTerminal />
         <div className={styles.heroMedia}>
           <img
             src={heroShot}
@@ -121,8 +123,13 @@ function EnterpriseCTA() {
           </p>
           <Link
             className={clsx('button button--primary button--lg', styles.pill)}
-            to="https://zyvor.dev">
-            zyvor.dev
+            to="https://zyvor.dev/schedule?utm_source=github&utm_medium=atlas&utm_campaign=site_footer">
+            Book a demo
+          </Link>
+          <Link
+            className={clsx('button button--outline button--lg button--primary', styles.pill)}
+            to="https://zyvor.dev/pricing?utm_source=github&utm_medium=atlas&utm_campaign=site_footer">
+            Pricing
           </Link>
         </Reveal>
       </div>
@@ -137,7 +144,11 @@ export default function Home(): ReactNode {
       description="Apache-2.0 storage platform: an intent API over Ceph, NFS, ZFS and Longhorn, plus Atlas Native, a distributed filesystem with erasure coding, NFS, SMB, S3, replication and clean DR failback.">
       <HomepageHeader />
       <main>
+        <StatsBand />
         <ProblemStatement />
+        <AnimatedFeatures />
+        <PromoteDemo />
+        <Compare />
         <Reveal>
           <FeatureHighlights />
         </Reveal>
