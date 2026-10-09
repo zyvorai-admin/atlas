@@ -1,10 +1,12 @@
 {
   "name": "atlas-docs",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "license": "Apache-2.0",
   "scripts": {
     "docusaurus": "docusaurus",
+    "sync-docs": "node scripts/sync-docs.mjs",
+    "prebuild": "npm run sync-docs",
     "start": "docusaurus start",
     "build": "docusaurus build",
     "swizzle": "docusaurus swizzle",

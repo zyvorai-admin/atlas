@@ -65,10 +65,10 @@ to the raw-manifest gateway. `namespace.create: false` is used there because `--
 already creates the namespace. Cluster-scoped RBAC names include the release namespace, so two
 installs (or the raw manifest's `atlas-gateway-readonly`) do not collide.
 
-## Published images (0.4.0)
+## Published images (0.5.0)
 
 Lab quickstart above keeps `localhost/atlas-gateway:dev`. A tagged release is
-`ghcr.io/zyvorai/atlas:0.4.0` (fake/k8s image) and `ghcr.io/zyvorai/atlas-ceph:0.4.0` (real Ceph
+`ghcr.io/zyvorai/atlas:0.5.0` (fake/k8s image) and `ghcr.io/zyvorai/atlas-ceph:0.5.0` (real Ceph
 image). Pin the immutable version tag; do not deploy `:latest`.
 
 ```bash

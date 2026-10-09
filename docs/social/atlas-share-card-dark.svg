@@ -107,5 +107,5 @@
   <!-- footer -->
   <line x1="72" y1="560" x2="1128" y2="560" stroke="#2c2c2e" stroke-width="1"/>
   <text x="72" y="596" font-family="'Menlo','JetBrains Mono',monospace" font-size="16" fill="#a1a1a6">github.com/zyvorai/zyvor-atlas</text>
-  <text x="1128" y="596" text-anchor="end" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="16" fill="#a1a1a6">v0.4.0 · Apache License 2.0</text>
+  <text x="1128" y="596" text-anchor="end" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="16" fill="#a1a1a6">v0.5.0 · Apache License 2.0</text>
 </svg>

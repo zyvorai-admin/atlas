@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Status
 
-Short maturity matrix for Atlas 0.4.0. History and narrative live in [ROADMAP.md](ROADMAP.md).
+Short maturity matrix for Atlas 0.5.0. History and narrative live in [ROADMAP.md](ROADMAP.md).
 When the two disagree, this file wins.
 
 A cell is **yes** only for that column. Lab verification is not production support. Nothing
@@ -28,7 +28,7 @@ below is bank or enterprise GA.
 | eBPF storage I/O sensor (`atlas-io-agent`) | yes — fake source, histograms, attribution, RCA, fail-open leases, HTTP/Prom, `atlasctl io` | yes — aya/CO-RE block-layer attach, queue time and the Atlas Native maps against a real native cluster, on a kernel 7.0 lab host (`docs/IO_EBPF.md`) | no | live mode (`bpf` feature) | NFS/ZFS/uring probes, cgroup→volume map, Observatory heatmaps |
 | Product integrations beyond gRPC `Owner` | gRPC owner surface yes | | no | | Transiva import, Veyron, GuestKit, PacketWolf, then a small SDK |
 
-Transiva's owner id on the wire remains `hyper2kvm`. v0.4.0 does not rename it.
+Transiva's owner id on the wire remains `hyper2kvm`. v0.5.0 does not rename it.
 
 **Unresolved:** Zeus OS already has an `atlas` module ("Machine Finder") and a Storage Center
 UI. Atlas does not yet absorb, replace, or sit beside that UI. Do not treat the names as settled.

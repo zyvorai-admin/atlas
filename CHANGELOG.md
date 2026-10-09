@@ -9,6 +9,10 @@ before `0.2.0` were not tracked here — see `git log` for that history.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-09
+
+Documentation: a rewritten README with animated graphics, an animated landing page, and the full docs set published on the website.
+
 ### Added
 
 - **Observe-first storage I/O sensor** (`crates/atlas-io`, binary `atlas-io-agent`):

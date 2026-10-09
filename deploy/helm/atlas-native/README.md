@@ -9,7 +9,7 @@ shared by all pods (`${POD_NAME}` is expanded at startup).
 
 ```sh
 helm upgrade --install atlas-native deploy/helm/atlas-native -n atlas-native --create-namespace \
-  --set image.repository=ghcr.io/zyvorai/atlas-native-node --set image.tag=0.4.0
+  --set image.repository=ghcr.io/zyvorai/atlas-native-node --set image.tag=0.5.0
 kubectl -n atlas-native get secret atlas-native-api -o jsonpath='{.data.token}' | base64 -d
 ```
 

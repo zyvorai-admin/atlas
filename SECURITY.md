@@ -5,7 +5,7 @@
 
 ## Supported versions
 
-Atlas is pre-1.0: only the latest tagged release (currently `v0.4.0`) and `main` receive security
+Atlas is pre-1.0: only the latest tagged release (currently `v0.5.0`) and `main` receive security
 fixes. There is no long-term-support line yet — upgrade to the latest tag to stay covered. See
 [CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
